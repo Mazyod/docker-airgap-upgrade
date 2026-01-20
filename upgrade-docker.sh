@@ -310,8 +310,8 @@ echo "=== Phase 6: Configure containerd ==="
 echo "Generating containerd 2.x configuration..."
 containerd config default > /etc/containerd/config.toml
 
-# Get current containerd root from config
-CONTAINERD_ROOT=$(grep -E "^\s*root\s*=" /etc/containerd/config.toml | head -1 | sed 's/.*=\s*"\(.*\)"/\1/')
+# Get current containerd root from config (handles both single and double quotes)
+CONTAINERD_ROOT=$(grep -E "^root\s*=" /etc/containerd/config.toml | head -1 | sed "s/.*=\s*['\"]\\(.*\\)['\"]/\\1/")
 CONTAINERD_ROOT=${CONTAINERD_ROOT:-/var/lib/containerd}
 
 echo "containerd root directory: $CONTAINERD_ROOT"
@@ -368,13 +368,21 @@ if [[ "$FTYPE_CHECK" == bad:* ]]; then
         # Create the directory
         mkdir -p "$NEW_CONTAINERD_ROOT"
 
-        # Update containerd config
+        # Update containerd config (config uses single quotes)
         echo "Updating containerd configuration..."
-        sed -i "s|root = \"$CONTAINERD_ROOT\"|root = \"$NEW_CONTAINERD_ROOT\"|" /etc/containerd/config.toml
+        sed -i "s|^root = .*|root = '$NEW_CONTAINERD_ROOT'|" /etc/containerd/config.toml
 
-        # Verify the change
-        NEW_ROOT_CHECK=$(grep -E "^\s*root\s*=" /etc/containerd/config.toml | head -1)
+        # Verify the change was applied
+        NEW_ROOT_CHECK=$(grep -E "^root\s*=" /etc/containerd/config.toml | head -1)
         echo "Updated config: $NEW_ROOT_CHECK"
+
+        if ! echo "$NEW_ROOT_CHECK" | grep -q "$NEW_CONTAINERD_ROOT"; then
+            echo -e "${RED}ERROR: Failed to update containerd config!${NC}"
+            echo "Please manually edit /etc/containerd/config.toml"
+            echo "Change: root = '/var/lib/containerd'"
+            echo "To:     root = '$NEW_CONTAINERD_ROOT'"
+            exit 1
+        fi
 
         CONTAINERD_ROOT="$NEW_CONTAINERD_ROOT"
         break

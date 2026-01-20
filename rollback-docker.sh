@@ -1,7 +1,7 @@
 #!/bin/bash
 # rollback-docker.sh
 # Emergency rollback: Docker 29.1.5 → 28.5.1
-VERSION="1.1.0"
+VERSION="1.2.1"
 #
 # Use this script if:
 # - Services fail to start after upgrade

@@ -1,7 +1,7 @@
 #!/bin/bash
 # download-docker-packages.sh
 # Run on the ONLINE RHEL 8 server to collect all packages needed for air-gapped upgrade
-VERSION="1.1.0"
+VERSION="1.2.1"
 #
 # This script downloads:
 # - Docker 29.1.5 packages for RHEL 8 and RHEL 9

@@ -1,7 +1,7 @@
 #!/bin/bash
 # upgrade-docker.sh
 # Run on each AIR-GAPPED server to upgrade Docker 28.5.1 → 29.1.5
-VERSION="1.1.0"
+VERSION="1.2.1"
 #
 # Prerequisites:
 # - Extract docker-offline-packages.tar.gz to /opt/
@@ -462,9 +462,25 @@ echo "Starting containerd..."
 systemctl start containerd
 systemctl enable containerd
 
-# Wait for containerd to be ready
-echo "Waiting for containerd to initialize..."
-sleep 5
+# Wait for containerd to be fully ready (not just systemd "active")
+# This avoids race conditions where docker starts before containerd's snapshotter is ready
+echo "Waiting for containerd to be fully ready..."
+CONTAINERD_READY=false
+for i in {1..30}; do
+    if ctr version &>/dev/null; then
+        CONTAINERD_READY=true
+        echo "containerd API is responsive (attempt $i)"
+        break
+    fi
+    echo "  Waiting for containerd API... (attempt $i/30)"
+    sleep 2
+done
+
+if [ "$CONTAINERD_READY" = false ]; then
+    echo -e "${YELLOW}WARNING: containerd API not responding, forcing restart...${NC}"
+    systemctl restart containerd
+    sleep 5
+fi
 
 # Verify containerd is healthy
 if ! systemctl is-active containerd &>/dev/null; then
@@ -472,6 +488,16 @@ if ! systemctl is-active containerd &>/dev/null; then
     echo "Check logs with: journalctl -u containerd --no-pager -n 50"
     exit 1
 fi
+
+# Verify snapshotter is working (this catches root path issues)
+echo "Verifying containerd snapshotter..."
+if ! ctr snapshots --snapshotter overlayfs ls &>/dev/null; then
+    echo -e "${YELLOW}WARNING: Snapshotter not ready, restarting containerd...${NC}"
+    systemctl restart containerd
+    sleep 5
+fi
+
+echo -e "${GREEN}containerd is fully ready.${NC}"
 
 # Then start docker
 echo "Starting docker..."

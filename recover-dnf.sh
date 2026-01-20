@@ -1,7 +1,7 @@
 #!/bin/bash
 # recover-dnf.sh
 # Run if dnf reports dependency issues after a failed upgrade
-VERSION="1.1.0"
+VERSION="1.2.1"
 #
 # This script helps recover from:
 # - Broken package dependencies

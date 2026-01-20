@@ -62,10 +62,16 @@ prompt_yes_no() {
 
 check_xfs_ftype() {
     local path="$1"
-    local mount_point
+    local check_path="$path"
 
-    # Find the mount point for this path
-    mount_point=$(df "$path" 2>/dev/null | tail -1 | awk '{print $NF}')
+    # Find an existing path to check (walk up if needed)
+    while [ ! -e "$check_path" ] && [ "$check_path" != "/" ]; do
+        check_path=$(dirname "$check_path")
+    done
+
+    # Get mount point
+    local mount_point
+    mount_point=$(df "$check_path" 2>/dev/null | tail -1 | awk '{print $NF}')
 
     if [ -z "$mount_point" ]; then
         echo "unknown"
@@ -74,14 +80,14 @@ check_xfs_ftype() {
 
     # Check if it's XFS
     local fs_type
-    fs_type=$(df -T "$path" 2>/dev/null | tail -1 | awk '{print $2}')
+    fs_type=$(df -T "$check_path" 2>/dev/null | tail -1 | awk '{print $2}')
 
     if [ "$fs_type" != "xfs" ]; then
         echo "ok:$fs_type"
         return
     fi
 
-    # Check ftype for XFS
+    # Check ftype for XFS - must use mount point, not subdirectory
     local ftype
     ftype=$(xfs_info "$mount_point" 2>/dev/null | grep -o "ftype=[0-9]" | cut -d= -f2)
 

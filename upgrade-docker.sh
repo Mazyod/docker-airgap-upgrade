@@ -170,6 +170,7 @@ echo "=== Phase 1: Docker Swarm Check ==="
 SWARM_ACTIVE=false
 SWARM_NODE_ID=""
 SWARM_WAS_ACTIVE=false
+IS_MANAGER=false
 
 if docker info --format '{{.Swarm.LocalNodeState}}' 2>/dev/null | grep -q "active"; then
     SWARM_ACTIVE=true
@@ -177,44 +178,76 @@ if docker info --format '{{.Swarm.LocalNodeState}}' 2>/dev/null | grep -q "activ
     SWARM_ROLE=$(docker info --format '{{.Swarm.ControlAvailable}}' 2>/dev/null)
 
     if [ "$SWARM_ROLE" = "true" ]; then
+        IS_MANAGER=true
         echo "This node is a Swarm MANAGER (Node ID: $SWARM_NODE_ID)"
     else
         echo "This node is a Swarm WORKER (Node ID: $SWARM_NODE_ID)"
     fi
 
-    # Check current availability
-    NODE_AVAILABILITY=$(docker node inspect "$SWARM_NODE_ID" --format '{{.Spec.Availability}}' 2>/dev/null || echo "unknown")
-    echo "Current availability: $NODE_AVAILABILITY"
+    # Check current availability (only managers can inspect nodes)
+    if [ "$IS_MANAGER" = true ]; then
+        NODE_AVAILABILITY=$(docker node inspect "$SWARM_NODE_ID" --format '{{.Spec.Availability}}' 2>/dev/null || echo "unknown")
+        echo "Current availability: $NODE_AVAILABILITY"
+    else
+        # Workers cannot check their own status, assume active
+        NODE_AVAILABILITY="unknown"
+        echo "Current availability: unknown (worker nodes cannot self-inspect)"
+    fi
 
-    if [ "$NODE_AVAILABILITY" = "active" ]; then
+    if [ "$NODE_AVAILABILITY" = "active" ] || [ "$NODE_AVAILABILITY" = "unknown" ]; then
         SWARM_WAS_ACTIVE=true
-        echo ""
-        echo -e "${YELLOW}WARNING: This node is currently ACTIVE in the Swarm.${NC}"
-        echo "It should be drained before upgrading to avoid service disruption."
-        echo ""
 
-        if prompt_yes_no "Drain this node now? [Y/n]" "y"; then
-            echo "Draining node..."
-            docker node update --availability drain "$SWARM_NODE_ID"
+        if [ "$IS_MANAGER" = true ]; then
+            # Manager can drain itself
+            echo ""
+            echo -e "${YELLOW}WARNING: This node is currently ACTIVE in the Swarm.${NC}"
+            echo "It should be drained before upgrading to avoid service disruption."
+            echo ""
 
-            echo "Waiting for tasks to migrate..."
-            sleep 10
+            if prompt_yes_no "Drain this node now? [Y/n]" "y"; then
+                echo "Draining node..."
+                docker node update --availability drain "$SWARM_NODE_ID"
 
-            # Show remaining tasks
-            TASKS=$(docker node ps "$SWARM_NODE_ID" --filter "desired-state=running" --format '{{.Name}}' 2>/dev/null | wc -l)
-            if [ "$TASKS" -gt 0 ]; then
-                echo "Tasks still on this node: $TASKS"
-                docker node ps "$SWARM_NODE_ID" --filter "desired-state=running"
-                echo ""
-                if ! prompt_yes_no "Continue with upgrade anyway? [y/N]" "n"; then
-                    echo "Aborting. Please wait for tasks to migrate and re-run."
-                    exit 1
+                echo "Waiting for tasks to migrate..."
+                sleep 10
+
+                # Show remaining tasks
+                TASKS=$(docker node ps "$SWARM_NODE_ID" --filter "desired-state=running" --format '{{.Name}}' 2>/dev/null | wc -l)
+                if [ "$TASKS" -gt 0 ]; then
+                    echo "Tasks still on this node: $TASKS"
+                    docker node ps "$SWARM_NODE_ID" --filter "desired-state=running"
+                    echo ""
+                    if ! prompt_yes_no "Continue with upgrade anyway? [y/N]" "n"; then
+                        echo "Aborting. Please wait for tasks to migrate and re-run."
+                        exit 1
+                    fi
+                else
+                    echo "All tasks migrated successfully."
                 fi
             else
-                echo "All tasks migrated successfully."
+                echo -e "${YELLOW}Proceeding without draining. Services may be disrupted.${NC}"
             fi
         else
-            echo -e "${YELLOW}Proceeding without draining. Services may be disrupted.${NC}"
+            # Worker cannot drain itself
+            echo ""
+            echo -e "${RED}=========================================="
+            echo "WARNING: WORKER NODE CANNOT DRAIN ITSELF"
+            echo "==========================================${NC}"
+            echo ""
+            echo "This is a Swarm WORKER node. Workers cannot drain themselves."
+            echo "Please drain this node from a MANAGER node first:"
+            echo ""
+            echo -e "  ${YELLOW}docker node update --availability drain $SWARM_NODE_ID${NC}"
+            echo ""
+            echo "Or by hostname:"
+            echo ""
+            echo -e "  ${YELLOW}docker node update --availability drain $(hostname)${NC}"
+            echo ""
+
+            if ! prompt_yes_no "Has this node been drained from a manager? [y/N]" "n"; then
+                echo "Aborting. Please drain this node from a manager and re-run."
+                exit 1
+            fi
         fi
     else
         echo "Node is already drained/paused. Proceeding with upgrade."
@@ -499,33 +532,45 @@ if [ "$SWARM_ACTIVE" = true ]; then
     echo ""
     echo "=== Phase 10: Docker Swarm Reactivation ==="
 
-    # Re-check node status
-    CURRENT_AVAILABILITY=$(docker node inspect "$SWARM_NODE_ID" --format '{{.Spec.Availability}}' 2>/dev/null || echo "unknown")
-    echo "Current node availability: $CURRENT_AVAILABILITY"
+    if [ "$IS_MANAGER" = true ]; then
+        # Manager can reactivate itself
+        CURRENT_AVAILABILITY=$(docker node inspect "$SWARM_NODE_ID" --format '{{.Spec.Availability}}' 2>/dev/null || echo "unknown")
+        echo "Current node availability: $CURRENT_AVAILABILITY"
 
-    if [ "$CURRENT_AVAILABILITY" = "drain" ]; then
-        echo ""
-        if prompt_yes_no "Set this node back to ACTIVE? [Y/n]" "y"; then
-            echo "Activating node..."
-            docker node update --availability active "$SWARM_NODE_ID"
-
+        if [ "$CURRENT_AVAILABILITY" = "drain" ]; then
             echo ""
-            wait_for_services
+            if prompt_yes_no "Set this node back to ACTIVE? [Y/n]" "y"; then
+                echo "Activating node..."
+                docker node update --availability active "$SWARM_NODE_ID"
 
-            echo ""
-            echo "Node status:"
-            docker node ls
+                echo ""
+                wait_for_services
 
-            echo ""
-            echo "Services on this node:"
-            docker node ps "$SWARM_NODE_ID" | head -20
+                echo ""
+                echo "Node status:"
+                docker node ls
+
+                echo ""
+                echo "Services on this node:"
+                docker node ps "$SWARM_NODE_ID" | head -20
+            else
+                echo ""
+                echo "Node remains drained. To activate later, run:"
+                echo "  docker node update --availability active $SWARM_NODE_ID"
+            fi
         else
-            echo ""
-            echo "Node remains drained. To activate later, run:"
-            echo "  docker node update --availability active $SWARM_NODE_ID"
+            echo "Node is already active."
         fi
     else
-        echo "Node is already active."
+        # Worker cannot reactivate itself
+        echo ""
+        echo "This is a WORKER node. To reactivate, run from a MANAGER:"
+        echo ""
+        echo -e "  ${YELLOW}docker node update --availability active $SWARM_NODE_ID${NC}"
+        echo ""
+        echo "Or by hostname:"
+        echo ""
+        echo -e "  ${YELLOW}docker node update --availability active $(hostname)${NC}"
     fi
 fi
 

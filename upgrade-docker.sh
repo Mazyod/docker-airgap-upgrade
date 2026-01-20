@@ -1,6 +1,7 @@
 #!/bin/bash
-# /root/upgrade-docker.sh
+# upgrade-docker.sh
 # Run on each AIR-GAPPED server to upgrade Docker 28.5.1 → 29.1.5
+VERSION="1.1.0"
 #
 # Prerequisites:
 # - Extract docker-offline-packages.tar.gz to /opt/
@@ -36,6 +37,7 @@ exec > >(tee -a /var/log/docker-upgrade.log) 2>&1
 
 echo "=========================================="
 echo "Docker Upgrade: 28.5.1 → 29.1.5"
+echo "Script Version: $VERSION"
 echo "Server: $(hostname)"
 echo "Date: $(date)"
 echo "=========================================="

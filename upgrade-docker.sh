@@ -9,10 +9,14 @@
 # This script handles:
 # - Automatic RHEL version detection (8 or 9)
 # - Proper service stop/start order (containerd before docker)
-# - Two-phase package installation (install then distro-sync)
+# - Direct RPM installation (no network required)
 # - containerd config migration (1.7 → 2.2)
 # - NVIDIA toolkit upgrade (if already installed)
 # - Comprehensive verification
+#
+# NOTE: This script uses direct rpm installation instead of dnf/createrepo
+# to avoid SSL certificate issues with corporate satellite servers
+# (e.g., "SSL certificate problem: EE certificate key too weak")
 
 set -e
 exec > >(tee -a /var/log/docker-upgrade.log) 2>&1
@@ -85,36 +89,10 @@ rpm -qa | grep -E "(docker|containerd)" > "$BACKUP_DIR/packages.txt" 2>&1 || tru
 echo "Backup saved to: $BACKUP_DIR"
 
 #############################################
-# Phase 3: Create Local Repository
+# Phase 3: Stop Services (CORRECT ORDER)
 #############################################
 echo ""
-echo "=== Phase 3: Create Local Repository ==="
-
-# Ensure createrepo is available
-if ! command -v createrepo &>/dev/null; then
-    echo "Installing createrepo_c..."
-    dnf install -y createrepo_c 2>/dev/null || yum install -y createrepo
-fi
-
-cd "$PKG_DIR"
-createrepo . 2>/dev/null || createrepo .
-
-cat > /etc/yum.repos.d/docker-local.repo << EOF
-[docker-local]
-name=Docker Local Repo
-baseurl=file://${PKG_DIR}
-enabled=1
-gpgcheck=0
-priority=1
-EOF
-
-echo "Local repository created."
-
-#############################################
-# Phase 4: Stop Services (CORRECT ORDER)
-#############################################
-echo ""
-echo "=== Phase 4: Stop Services ==="
+echo "=== Phase 3: Stop Services ==="
 
 # Stop docker first
 echo "Stopping docker..."
@@ -129,32 +107,27 @@ sleep 2
 echo "Services stopped."
 
 #############################################
-# Phase 5: Upgrade Packages (TWO-PHASE)
+# Phase 4: Upgrade Packages (Direct RPM)
 #############################################
 echo ""
-echo "=== Phase 5: Upgrade Packages ==="
+echo "=== Phase 4: Upgrade Packages ==="
 
-dnf clean all
+# Use direct rpm installation - no network required, avoids SSL issues
+# with corporate satellite servers
+cd "$PKG_DIR"
+echo "Installing packages from: $PKG_DIR"
+ls -la *.rpm
 
-# PHASE 5a: Install (handles both fresh install and existing)
-echo "Phase 5a: Installing packages..."
-dnf install -y --disablerepo='*' --enablerepo=docker-local \
-    docker-ce docker-ce-cli containerd.io \
-    docker-buildx-plugin docker-compose-plugin 2>&1 || true
-
-# PHASE 5b: distro-sync with --allowerasing (handles version conflicts)
-echo "Phase 5b: Synchronizing versions..."
-dnf distro-sync -y --disablerepo='*' --enablerepo=docker-local --allowerasing \
-    docker-ce docker-ce-cli containerd.io \
-    docker-buildx-plugin docker-compose-plugin
+echo "Running rpm upgrade..."
+rpm -Uvh --force *.rpm
 
 echo "Packages upgraded."
 
 #############################################
-# Phase 6: Migrate containerd Config
+# Phase 5: Migrate containerd Config
 #############################################
 echo ""
-echo "=== Phase 6: Migrate containerd Config ==="
+echo "=== Phase 5: Migrate containerd Config ==="
 
 if [ -f "$BACKUP_DIR/config.toml" ]; then
     echo "Migrating config from 1.x to 2.x format..."
@@ -168,26 +141,16 @@ else
 fi
 
 #############################################
-# Phase 7: Handle NVIDIA Toolkit (if present)
+# Phase 6: Handle NVIDIA Toolkit (if present)
 #############################################
 if [ "$NVIDIA_INSTALLED" = true ]; then
     echo ""
-    echo "=== Phase 7: Upgrade NVIDIA Container Toolkit ==="
+    echo "=== Phase 6: Upgrade NVIDIA Container Toolkit ==="
 
     NVIDIA_DIR="/opt/docker-offline/nvidia"
     if [ -d "$NVIDIA_DIR" ] && ls "$NVIDIA_DIR"/*.rpm &>/dev/null; then
-        createrepo "$NVIDIA_DIR" 2>/dev/null || true
-
-        cat > /etc/yum.repos.d/nvidia-local.repo << EOF
-[nvidia-local]
-name=NVIDIA Local Repo
-baseurl=file://${NVIDIA_DIR}
-enabled=1
-gpgcheck=0
-EOF
-
-        dnf install -y --disablerepo='*' --enablerepo=nvidia-local nvidia-container-toolkit || true
-        dnf distro-sync -y --disablerepo='*' --enablerepo=nvidia-local --allowerasing nvidia-container-toolkit || true
+        cd "$NVIDIA_DIR"
+        rpm -Uvh --force *.rpm || true
 
         # Reconfigure NVIDIA runtime for Docker
         nvidia-ctk runtime configure --runtime=docker
@@ -200,10 +163,10 @@ EOF
 fi
 
 #############################################
-# Phase 8: Start Services (CORRECT ORDER)
+# Phase 7: Start Services (CORRECT ORDER)
 #############################################
 echo ""
-echo "=== Phase 8: Start Services ==="
+echo "=== Phase 7: Start Services ==="
 
 # Start containerd FIRST
 echo "Starting containerd..."
@@ -222,10 +185,10 @@ systemctl enable docker
 echo "Services started."
 
 #############################################
-# Phase 9: Verification
+# Phase 8: Verification
 #############################################
 echo ""
-echo "=== Phase 9: Verification ==="
+echo "=== Phase 8: Verification ==="
 
 echo "Docker version:"
 docker version

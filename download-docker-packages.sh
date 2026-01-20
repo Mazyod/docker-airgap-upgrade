@@ -86,24 +86,17 @@ echo ""
 echo "=== Downloading NVIDIA Container Toolkit ==="
 cd "$DEST_BASE/nvidia"
 
-# Add NVIDIA repo temporarily
+# Add NVIDIA repo (correct URL as of 2024+)
+# Note: Must disable repo_gpgcheck due to GPG signature issues
 echo "Adding NVIDIA repository..."
-curl -s -L https://nvidia.github.io/libnvidia-container/rhel8.10/libnvidia-container.repo | \
+curl -sL https://nvidia.github.io/libnvidia-container/stable/rpm/nvidia-container-toolkit.repo | \
+    sed 's/repo_gpgcheck=1/repo_gpgcheck=0/g' | \
     tee /etc/yum.repos.d/nvidia-container-toolkit.repo
 
-# Download with ALL dependencies
+# Download with dependencies
 echo "Downloading NVIDIA packages with dependencies..."
-dnf download --resolve --alldeps --destdir=. nvidia-container-toolkit || {
+dnf download --resolve --destdir=. nvidia-container-toolkit || {
     echo "WARNING: Failed to download NVIDIA packages (may not be needed if no GPU servers)"
-}
-
-# Also get RHEL 9 nvidia packages
-echo ""
-echo "Attempting RHEL 9 NVIDIA packages..."
-curl -s -L https://nvidia.github.io/libnvidia-container/rhel9.5/libnvidia-container.repo | \
-    tee /etc/yum.repos.d/nvidia-container-toolkit-el9.repo
-dnf download --resolve --alldeps --destdir=. nvidia-container-toolkit --releasever=9 2>/dev/null || {
-    echo "WARNING: Failed to download RHEL 9 NVIDIA packages"
 }
 
 echo ""

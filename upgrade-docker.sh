@@ -69,34 +69,47 @@ check_xfs_ftype() {
         check_path=$(dirname "$check_path")
     done
 
-    # Get mount point
+    # Get mount point using findmnt (more reliable than parsing df)
     local mount_point
-    mount_point=$(df "$check_path" 2>/dev/null | tail -1 | awk '{print $NF}')
+    mount_point=$(findmnt -n -o TARGET --target "$check_path" 2>/dev/null)
+
+    # Fallback to df if findmnt not available
+    if [ -z "$mount_point" ]; then
+        mount_point=$(df "$check_path" 2>/dev/null | tail -1 | awk '{print $NF}')
+    fi
 
     if [ -z "$mount_point" ]; then
-        echo "unknown"
+        echo "unknown:no_mount"
         return
     fi
 
-    # Check if it's XFS
+    # Check filesystem type
     local fs_type
-    fs_type=$(df -T "$check_path" 2>/dev/null | tail -1 | awk '{print $2}')
+    fs_type=$(findmnt -n -o FSTYPE --target "$check_path" 2>/dev/null)
+    if [ -z "$fs_type" ]; then
+        fs_type=$(df -T "$check_path" 2>/dev/null | tail -1 | awk '{print $2}')
+    fi
 
     if [ "$fs_type" != "xfs" ]; then
         echo "ok:$fs_type"
         return
     fi
 
-    # Check ftype for XFS - must use mount point, not subdirectory
+    # Check ftype for XFS - xfs_info ONLY works on mount point
     local ftype
-    ftype=$(xfs_info "$mount_point" 2>/dev/null | grep -o "ftype=[0-9]" | cut -d= -f2)
+    ftype=$(xfs_info "$mount_point" 2>/dev/null | grep -oP 'ftype=\K[0-9]')
+
+    # Fallback grep if -P not supported
+    if [ -z "$ftype" ]; then
+        ftype=$(xfs_info "$mount_point" 2>/dev/null | grep -o "ftype=[0-9]" | cut -d= -f2)
+    fi
 
     if [ "$ftype" = "1" ]; then
-        echo "ok:xfs:ftype=1"
+        echo "ok:xfs:ftype=1:$mount_point"
     elif [ "$ftype" = "0" ]; then
-        echo "bad:xfs:ftype=0"
+        echo "bad:xfs:ftype=0:$mount_point"
     else
-        echo "unknown:xfs"
+        echo "unknown:xfs:$mount_point"
     fi
 }
 

@@ -6,10 +6,15 @@
 # - Docker 29.1.5 packages for RHEL 8 and RHEL 9
 # - Rollback packages (28.5.1) for emergency recovery
 # - NVIDIA Container Toolkit packages (for GPU servers)
+# - All upgrade/rollback/recovery scripts
+#
+# Output: /opt/docker-upgrade-bundle.tar.gz (single artifact to transfer)
 
 set -e
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 DEST_BASE="/opt/docker-offline"
+rm -rf "$DEST_BASE"
 mkdir -p "$DEST_BASE"/{rhel8,rhel9,nvidia,rollback-rhel8,rollback-rhel9}
 
 echo "=========================================="
@@ -129,19 +134,43 @@ for dir in rhel8 rhel9 rollback-rhel8 rollback-rhel9; do
     done
 done
 
-# Create tarball
+# Copy scripts into bundle
 echo ""
-echo "=== Creating tarball ==="
+echo "=== Including scripts ==="
+for script in upgrade-docker.sh rollback-docker.sh recover-dnf.sh; do
+    if [ -f "$SCRIPT_DIR/$script" ]; then
+        cp "$SCRIPT_DIR/$script" "$DEST_BASE/"
+        chmod +x "$DEST_BASE/$script"
+        echo "  ✓ $script"
+    else
+        echo "  WARNING: $script not found in $SCRIPT_DIR"
+    fi
+done
+
+# Create final bundle
+echo ""
+echo "=== Creating bundle ==="
 cd /opt
-tar czvf docker-offline-packages.tar.gz docker-offline/
+rm -f docker-upgrade-bundle.tar.gz
+tar czvf docker-upgrade-bundle.tar.gz docker-offline/
 
 echo ""
 echo "=========================================="
 echo "DOWNLOAD COMPLETE"
 echo "=========================================="
 echo ""
-echo "Package ready: /opt/docker-offline-packages.tar.gz"
-echo "Size: $(du -h /opt/docker-offline-packages.tar.gz | cut -f1)"
+echo "Bundle ready: /opt/docker-upgrade-bundle.tar.gz"
+echo "Size: $(du -h /opt/docker-upgrade-bundle.tar.gz | cut -f1)"
 echo ""
-echo "Transfer this file to your air-gapped servers."
+echo "Contents:"
+echo "  - Docker 29.1.5 packages (RHEL 8 & 9)"
+echo "  - Rollback packages (28.5.1)"
+echo "  - NVIDIA Container Toolkit"
+echo "  - upgrade-docker.sh"
+echo "  - rollback-docker.sh"
+echo "  - recover-dnf.sh"
+echo ""
+echo "On air-gapped server:"
+echo "  tar xzf docker-upgrade-bundle.tar.gz -C /opt"
+echo "  cd /opt/docker-offline && ./upgrade-docker.sh"
 echo "=========================================="

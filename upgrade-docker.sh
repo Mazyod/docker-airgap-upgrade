@@ -1,7 +1,7 @@
 #!/bin/bash
 # upgrade-docker.sh
 # Run on each AIR-GAPPED server to upgrade Docker 28.5.1 → 29.1.5
-VERSION="1.2.1"
+VERSION="1.2.2"
 #
 # Prerequisites:
 # - Extract docker-offline-packages.tar.gz to /opt/
@@ -439,15 +439,38 @@ if [ "$NVIDIA_INSTALLED" = true ]; then
     NVIDIA_DIR="/opt/docker-offline/nvidia"
     if [ -d "$NVIDIA_DIR" ] && ls "$NVIDIA_DIR"/*.rpm &>/dev/null; then
         cd "$NVIDIA_DIR"
-        rpm -Uvh --force *.rpm || true
+
+        # Remove conflicting packages that block NVIDIA upgrade
+        # (devel and debuginfo packages may depend on old versions)
+        echo "Removing conflicting NVIDIA packages..."
+        rpm -e --nodeps libnvidia-container-devel 2>/dev/null || true
+        rpm -e --nodeps libnvidia-container1-debuginfo 2>/dev/null || true
+
+        # Install NVIDIA packages
+        echo "Installing NVIDIA packages..."
+        if rpm -Uvh --force *.rpm; then
+            echo -e "${GREEN}NVIDIA packages installed.${NC}"
+        else
+            echo -e "${YELLOW}WARNING: Some NVIDIA packages failed to install.${NC}"
+            echo "You may need to manually resolve dependencies."
+        fi
 
         # Reconfigure NVIDIA runtime for Docker
-        nvidia-ctk runtime configure --runtime=docker
-        nvidia-ctk runtime configure --runtime=containerd
+        # Note: nvidia-ctk doesn't support containerd config v3 yet, so skip containerd
+        echo "Configuring NVIDIA runtime for Docker..."
+        if nvidia-ctk runtime configure --runtime=docker 2>/dev/null; then
+            echo -e "${GREEN}NVIDIA Docker runtime configured.${NC}"
+        else
+            echo -e "${YELLOW}WARNING: nvidia-ctk docker config failed. Manual config may be needed.${NC}"
+        fi
 
-        echo "NVIDIA toolkit upgraded and configured."
+        # Skip containerd config - nvidia-ctk doesn't support config version 3
+        echo "Skipping containerd NVIDIA config (nvidia-ctk doesn't support config v3 yet)"
+
+        echo "NVIDIA toolkit upgrade complete."
     else
         echo -e "${YELLOW}WARNING: NVIDIA packages not found in $NVIDIA_DIR${NC}"
+        echo "GPU functionality may not work. Continuing anyway..."
     fi
 fi
 

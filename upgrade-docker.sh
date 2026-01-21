@@ -1,7 +1,7 @@
 #!/bin/bash
 # upgrade-docker.sh
 # Run on each AIR-GAPPED server to upgrade Docker 28.5.1 → 29.1.5
-VERSION="1.2.2"
+VERSION="1.2.3"
 #
 # Prerequisites:
 # - Extract docker-offline-packages.tar.gz to /opt/
@@ -11,6 +11,7 @@ VERSION="1.2.2"
 # - Automatic RHEL version detection (8 or 9)
 # - Proper service stop/start order (containerd before docker)
 # - Direct RPM installation (no network required)
+# - Orphaned VXLAN/network cleanup (prevents service binding errors)
 # - XFS ftype=1 validation for containerd (with interactive fix)
 # - containerd config migration (1.7 → 2.2)
 # - NVIDIA toolkit upgrade (if already installed)
@@ -317,6 +318,46 @@ systemctl stop containerd 2>/dev/null || true
 sleep 2
 
 echo "Services stopped."
+
+#############################################
+# Phase 4.5: Clean Orphaned Networks (Swarm)
+#############################################
+if [ "$SWARM_ACTIVE" = true ]; then
+    echo ""
+    echo "=== Phase 4.5: Clean Orphaned Networks ==="
+
+    # Detect Docker data root from daemon.json
+    DOCKER_DATA_ROOT="/var/lib/docker"
+    if [ -f /etc/docker/daemon.json ]; then
+        CUSTOM_ROOT=$(grep -oP '"data-root"\s*:\s*"\K[^"]+' /etc/docker/daemon.json 2>/dev/null || true)
+        if [ -n "$CUSTOM_ROOT" ]; then
+            DOCKER_DATA_ROOT="$CUSTOM_ROOT"
+            echo "Detected custom Docker data root: $DOCKER_DATA_ROOT"
+        fi
+    fi
+
+    # Remove orphaned VXLAN interfaces (they get recreated by swarm)
+    echo "Removing orphaned VXLAN interfaces..."
+    VXLAN_COUNT=0
+    for iface in $(ip -o link show type vxlan 2>/dev/null | awk -F': ' '{print $2}'); do
+        ip link del "$iface" 2>/dev/null && ((VXLAN_COUNT++)) || true
+    done
+    echo "  Removed $VXLAN_COUNT VXLAN interface(s)"
+
+    # Clean overlay network namespaces
+    echo "Cleaning Docker network namespaces..."
+    rm -rf /var/run/docker/netns/* 2>/dev/null || true
+
+    # Clean the local network database (prevents service binding errors)
+    echo "Cleaning local network database..."
+    rm -f "$DOCKER_DATA_ROOT/network/files/local-kv.db" 2>/dev/null || true
+
+    # Remove docker_gwbridge if it exists (will be recreated)
+    echo "Removing docker_gwbridge..."
+    ip link del docker_gwbridge 2>/dev/null || true
+
+    echo -e "${GREEN}Network cleanup complete.${NC}"
+fi
 
 #############################################
 # Phase 5: Upgrade Packages (Direct RPM)

@@ -84,6 +84,23 @@ Directory layout is assumed by path in several scripts: `/opt/docker-offline/rhe
 
 The bundle is `/opt/docker-upgrade-bundle.tar.gz` everywhere (this was previously inconsistent with README and the `upgrade-docker.sh` header; both are now fixed).
 
+## Releasing — every shipment gets a GitHub release
+
+Not optional, and not a per-upgrade decision. The deliverable is a ~330 MB bundle of
+RPMs that gets hand-carried onto disconnected servers; a git tag records which scripts
+shipped but says nothing about which packages an operator installed, and an air-gapped
+operator cannot rebuild the bundle. See `docs/RELEASING.md`.
+
+```bash
+tools/make-release.sh v29.6.2-1        # --draft to review first
+```
+
+Tag scheme is `v<TARGET_DOCKER_VERSION>-<BUNDLE_REVISION>`. The script refuses to run
+on a dirty tree, with unpushed commits, on an existing tag, or with failing static
+checks — and it **always rebuilds the bundle from the current checkout** rather than
+reusing whatever is in the VM. Release notes enumerate every package from RPM
+metadata, never filenames.
+
 ## Script versioning convention
 
 Every script except `simulate-upgrade.sh` declares `VERSION="x.y.z"` on ~line 4 and echoes it in its startup banner. Only the scripts actually changed get bumped — versions across scripts drift on purpose. Currently:
@@ -92,7 +109,7 @@ Every script except `simulate-upgrade.sh` declares `VERSION="x.y.z"` on ~line 4 
 |---|---|
 | `upgrade-docker.sh` | 2.0.0 |
 | `rollback-docker.sh` | 2.0.0 |
-| `download-docker-packages.sh` | 2.0.0 |
+| `download-docker-packages.sh` | 2.1.0 |
 | `clean-swarm-networks.sh` | 1.0.0 |
 | `recover-dnf.sh` | 1.2.2 |
 

@@ -105,7 +105,7 @@ step "Generating the package manifest from RPM metadata"
 #############################################
 vm "cp $REPO_DIR/tools/vm-bundle-manifest.sh /tmp/ && chmod +x /tmp/vm-bundle-manifest.sh" \
     || die "failed to stage the manifest script"
-MANIFEST_MD=$(vm "/tmp/vm-bundle-manifest.sh $BUNDLE_VM") || die "manifest generation failed"
+MANIFEST_MD=$(vm "/tmp/vm-bundle-manifest.sh $BUNDLE_VM $(basename "$OUT_BUNDLE")") || die "manifest generation failed"
 [ -z "$MANIFEST_MD" ] && die "manifest came back empty"
 echo "  $(printf '%s' "$MANIFEST_MD" | grep -c '^|') table rows"
 
@@ -139,6 +139,7 @@ step "Composing release notes"
     echo "## Contents"
     echo ""
     printf '%s\n' "$MANIFEST_MD"
+    echo ""
     echo "## Verify before use"
     echo ""
     echo "\`\`\`bash"
@@ -156,7 +157,8 @@ step "Composing release notes"
     if [ -f docs/TEST-PLAN.md ]; then
         echo "## Testing"
         echo ""
-        sed -n '/^## Execution status/,/^## What each tier/p' docs/TEST-PLAN.md | sed '$d'
+        sed -n '/^## Execution status/,/^## What each tier/p' docs/TEST-PLAN.md \
+            | sed '$d' | sed '1s/^## Execution status/### Execution status/'
     fi
 } > "$NOTES"
 echo "  $NOTES ($(wc -l < "$NOTES" | tr -d ' ') lines)"

@@ -1,7 +1,7 @@
 #!/bin/bash
 # recover-dnf.sh
 # Run if dnf reports dependency issues after a failed upgrade
-VERSION="1.2.1"
+VERSION="1.2.2"
 #
 # This script helps recover from:
 # - Broken package dependencies
@@ -115,9 +115,19 @@ echo "- Always start containerd BEFORE docker"
 echo "- Backup /var/lib/docker before Option D"
 echo ""
 
-# Offer to run Option A automatically
+# Offer to run Option A automatically.
+#
+# `read` returns non-zero on EOF, and under `set -e` that killed this script
+# with a bare exit 1 and no message -- after `dnf clean all` and
+# `rpm --rebuilddb` had already run, leaving the operator with no indication
+# that the diagnostic steps above had completed successfully.
 echo "Would you like to run OPTION A now? (y/N)"
-read -r response
+if ! read -r response; then
+    echo ""
+    echo "No input available (stdin closed). Skipping Option A."
+    echo "The diagnostics above completed; run the commands manually if needed."
+    exit 0
+fi
 if [[ "$response" =~ ^[Yy]$ ]]; then
     echo ""
     echo "Running Option A..."

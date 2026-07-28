@@ -59,7 +59,7 @@ Three things the 1.7 → 2.x migration required have been removed, because insid
 | `upgrade-docker.sh` | 2.0.0 | Perform the upgrade | Air-gapped servers |
 | `rollback-docker.sh` | 2.0.0 | Roll back to 29.1.5 | Failed upgrade recovery |
 | `clean-swarm-networks.sh` | 1.0.0 | Reset orphaned overlay network state | Node that can't rejoin overlays |
-| `recover-dnf.sh` | 1.2.1 | Fix dependency issues | Servers with broken dnf |
+| `recover-dnf.sh` | 1.2.2 | Fix dependency issues | Servers with broken dnf |
 | `simulate-upgrade.sh` | — | Test the upgrade path in a VM | RHEL test VM |
 
 Script versions drift on purpose — only scripts that actually changed get bumped.

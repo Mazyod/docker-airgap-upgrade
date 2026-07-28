@@ -298,7 +298,13 @@ wait_for_services() {
             continue
         fi
 
-        pending=$(printf '%s' "$replicas" | awk -F/ 'NF == 2 && $1 != $2 { n++ } END { print n+0 }')
+        # Split the FIRST whitespace-delimited token, then on "/". A replicated
+        # job renders as "0/1 (0/3 completed)", which splitting the whole line
+        # on "/" turns into three fields -- so an NF==2 guard silently dropped
+        # unconverged jobs from the count. Taking $1 first handles both forms.
+        # A garbage row yields an empty second field and is skipped.
+        pending=$(printf '%s' "$replicas" |
+            awk '{ split($1, r, "/"); if (r[1] != "" && r[2] != "" && r[1] != r[2]) n++ } END { print n+0 }')
         pending=${pending:-0}
 
         if [ "$pending" = "0" ]; then

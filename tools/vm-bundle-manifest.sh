@@ -14,6 +14,10 @@
 set -euo pipefail
 
 BUNDLE="${1:-/opt/docker-upgrade-bundle.tar.gz}"
+# Optional: the name the artifact will carry on the release. The reader
+# downloads THAT name, so the Artifact table must show it -- not the
+# VM-internal build path.
+DISPLAY_NAME="${2:-$(basename "$BUNDLE")}"
 
 if [ ! -f "$BUNDLE" ]; then
     echo "ERROR: bundle not found: $BUNDLE" >&2
@@ -84,8 +88,8 @@ echo "### Artifact"
 echo ""
 echo "| | |"
 echo "|---|---|"
-echo "| File | \`$(basename "$BUNDLE")\` |"
-echo "| Size | $(du -h "$BUNDLE" | cut -f1) |"
+echo "| File | \`$DISPLAY_NAME\` |"
+echo "| Size | $(du -h "$BUNDLE" | cut -f1)iB ($(stat -c %s "$BUNDLE") bytes) |"
 echo "| SHA-256 | \`$(sha256sum "$BUNDLE" | cut -d' ' -f1)\` |"
 echo "| RPMs | $(find "$ROOT" -name '*.rpm' | wc -l | tr -d ' ') |"
 echo ""

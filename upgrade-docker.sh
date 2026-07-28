@@ -486,38 +486,72 @@ echo -e "${GREEN}Transaction dry run passed.${NC}"
 
 echo -e "${GREEN}Package payload validated.${NC}"
 
-# If the node is ALREADY fully at the target, offer to skip. All three core
-# packages must match: a previous attempt that got docker-ce to 29.6.2 but left
-# containerd.io at 2.2.1 is exactly the node that most needs this run to
-# proceed, and checking docker-ce alone would wave it through.
 CURRENT_DOCKER=$(rpm -q docker-ce --queryformat '%{VERSION}' 2>/dev/null || echo "")
 CURRENT_DOCKER_CLI=$(rpm -q docker-ce-cli --queryformat '%{VERSION}' 2>/dev/null || echo "")
 CURRENT_CONTAINERD=$(rpm -q containerd.io --queryformat '%{VERSION}' 2>/dev/null || echo "")
+CURRENT_BUILDX=$(rpm -q docker-buildx-plugin --queryformat '%{VERSION}' 2>/dev/null || echo "")
+CURRENT_COMPOSE=$(rpm -q docker-compose-plugin --queryformat '%{VERSION}' 2>/dev/null || echo "")
 
+# UNCONDITIONAL hard stop, evaluated before any of the branches below.
+#
+# This was previously nested inside the "unexpected starting version" branch,
+# which made it bypassable: a node with docker-ce already at 29.6.2 but
+# containerd still on 1.x took the partial-upgrade branch instead and never
+# reached this check -- letting the script attempt exactly the major migration
+# it no longer supports.
+case "$CURRENT_CONTAINERD" in
+    1.*)
+        echo ""
+        echo -e "${RED}=========================================="
+        echo "ERROR: containerd 1.x DETECTED"
+        echo "==========================================${NC}"
+        echo ""
+        echo "  this node has containerd.io $CURRENT_CONTAINERD"
+        echo ""
+        echo "This script version does NOT handle the containerd 1.7 -> 2.x"
+        echo "major migration. The config migration, XFS ftype check and"
+        echo "orphaned-network cleanup that migration requires were removed in"
+        echo "v2.0.0."
+        echo ""
+        echo "Use upgrade-docker.sh v1.2.3 (commit 974683a) for that path."
+        echo ""
+        echo "Aborting. Nothing has been changed."
+        exit 1
+        ;;
+esac
+
+# If the node is ALREADY fully at the target, offer to skip. ALL FIVE packages
+# must match, not just the core three: a partially applied transaction can leave
+# correct core packages beside stale plugins, and that node still needs this run.
 if [ "$CURRENT_DOCKER" = "$EXPECTED_DOCKER_VERSION" ] &&
    [ "$CURRENT_DOCKER_CLI" = "$EXPECTED_DOCKER_VERSION" ] &&
-   [ "$CURRENT_CONTAINERD" = "$EXPECTED_CONTAINERD_VERSION" ]; then
+   [ "$CURRENT_CONTAINERD" = "$EXPECTED_CONTAINERD_VERSION" ] &&
+   [ "$CURRENT_BUILDX" = "$EXPECTED_BUILDX_VERSION" ] &&
+   [ "$CURRENT_COMPOSE" = "$EXPECTED_COMPOSE_VERSION" ]; then
     echo ""
     echo -e "${YELLOW}NOTE: this node is already fully at the target versions:${NC}"
     echo "  docker-ce $CURRENT_DOCKER, docker-ce-cli $CURRENT_DOCKER_CLI,"
-    echo "  containerd.io $CURRENT_CONTAINERD"
+    echo "  containerd.io $CURRENT_CONTAINERD, buildx $CURRENT_BUILDX,"
+    echo "  compose $CURRENT_COMPOSE"
     if ! prompt_yes_no "Re-run the upgrade anyway? [y/N]" "n"; then
         echo "Nothing to do. Exiting without changes."
         exit 0
     fi
-elif [ -n "$CURRENT_DOCKER" ] && [ "$CURRENT_DOCKER" = "$EXPECTED_DOCKER_VERSION" ]; then
+elif [ "$CURRENT_DOCKER" = "$EXPECTED_DOCKER_VERSION" ] ||
+     [ "$CURRENT_CONTAINERD" = "$EXPECTED_CONTAINERD_VERSION" ]; then
     echo ""
-    echo -e "${YELLOW}NOTE: docker-ce is already $EXPECTED_DOCKER_VERSION but the other${NC}"
-    echo -e "${YELLOW}core packages are not - this looks like a partial upgrade.${NC}"
-    echo "  docker-ce-cli: ${CURRENT_DOCKER_CLI:-absent} (want $EXPECTED_DOCKER_VERSION)"
-    echo "  containerd.io: ${CURRENT_CONTAINERD:-absent} (want $EXPECTED_CONTAINERD_VERSION)"
+    echo -e "${YELLOW}NOTE: some packages are already at the target and some are${NC}"
+    echo -e "${YELLOW}not - this looks like a partial upgrade.${NC}"
+    echo "  docker-ce:             ${CURRENT_DOCKER:-absent} (want $EXPECTED_DOCKER_VERSION)"
+    echo "  docker-ce-cli:         ${CURRENT_DOCKER_CLI:-absent} (want $EXPECTED_DOCKER_VERSION)"
+    echo "  containerd.io:         ${CURRENT_CONTAINERD:-absent} (want $EXPECTED_CONTAINERD_VERSION)"
+    echo "  docker-buildx-plugin:  ${CURRENT_BUILDX:-absent} (want $EXPECTED_BUILDX_VERSION)"
+    echo "  docker-compose-plugin: ${CURRENT_COMPOSE:-absent} (want $EXPECTED_COMPOSE_VERSION)"
     echo "Proceeding to complete it."
 else
     # Confirm the node is on the baseline this upgrade was designed and tested
     # against. Not a hard failure -- an intermediate 29.x is probably fine --
-    # but it must not pass silently. Notably, a node still on 28.x/containerd
-    # 1.7 would be crossing the containerd MAJOR boundary, which this version
-    # of the script no longer handles.
+    # but it must not pass silently.
     if [ "$CURRENT_DOCKER" != "$SUPPORTED_FROM_DOCKER" ] ||
        [ "$CURRENT_CONTAINERD" != "$SUPPORTED_FROM_CONTAINERD" ]; then
         echo ""
@@ -528,18 +562,6 @@ else
         echo "  tested upgrade path: $SUPPORTED_FROM_DOCKER / containerd.io $SUPPORTED_FROM_CONTAINERD"
         echo "  this node has:       ${CURRENT_DOCKER:-absent} / containerd.io ${CURRENT_CONTAINERD:-absent}"
         echo ""
-        case "$CURRENT_CONTAINERD" in
-            1.*)
-                echo -e "${RED}containerd 1.x detected. This script version does NOT handle${NC}"
-                echo -e "${RED}the containerd 1.7 -> 2.x major migration -- the config${NC}"
-                echo -e "${RED}migration, XFS ftype check and network cleanup it needs were${NC}"
-                echo -e "${RED}removed in v2.0.0. Use upgrade-docker.sh v1.2.3 (commit${NC}"
-                echo -e "${RED}974683a) for that path instead.${NC}"
-                echo ""
-                echo "Aborting. Nothing has been changed."
-                exit 1
-                ;;
-        esac
         if ! prompt_yes_no "Continue from this unverified starting version? [y/N]" "n"; then
             echo "Aborting. Nothing has been changed."
             exit 0
@@ -841,7 +863,11 @@ if [ ! -d "$CONTAINERD_ROOT" ]; then
         echo "  findmnt --target $(dirname "$CONTAINERD_ROOT")"
         echo "  lsblk; cat /etc/fstab"
         echo ""
-        echo "Nothing has been changed on this node."
+        echo "Once the filesystem is mounted, re-run this script."
+        echo ""
+        echo -e "${YELLOW}NOTE: this is phase 6 -- packages have ALREADY been${NC}"
+        echo -e "${YELLOW}installed and services are stopped. See the state report${NC}"
+        echo -e "${YELLOW}below for exactly where this node stands.${NC}"
         exit 1
     fi
 elif [ "$CONTAINERD_ROOT" != "/var/lib/containerd" ]; then

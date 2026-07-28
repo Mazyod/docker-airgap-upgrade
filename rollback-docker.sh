@@ -169,7 +169,10 @@ start_services() {
     local i
 
     echo "Starting containerd..."
-    systemctl start containerd
+    if ! systemctl start containerd; then
+        echo -e "${RED}ERROR: systemctl start containerd failed${NC}" >&2
+        return 1
+    fi
 
     local ready=false
     for i in {1..30}; do
@@ -187,7 +190,8 @@ start_services() {
         systemctl restart containerd || true
         sleep 5
         if ! ctr version &>/dev/null; then
-            echo -e "${RED}ERROR: containerd API never became responsive${NC}"
+            echo -e "${RED}ERROR: containerd API never became responsive${NC}" >&2
+            echo "Check: journalctl -u containerd --no-pager -n 50" >&2
             return 1
         fi
     fi
@@ -198,17 +202,22 @@ start_services() {
         systemctl restart containerd || true
         sleep 5
         if ! ctr snapshots --snapshotter overlayfs ls &>/dev/null; then
-            echo -e "${RED}ERROR: overlayfs snapshotter is not usable${NC}"
+            echo -e "${RED}ERROR: overlayfs snapshotter is not usable${NC}" >&2
+            echo "Check: journalctl -u containerd --no-pager -n 50" >&2
             return 1
         fi
     fi
     echo "  containerd is fully ready."
 
     echo "Starting docker..."
-    systemctl start docker
+    if ! systemctl start docker; then
+        echo -e "${RED}ERROR: systemctl start docker failed${NC}" >&2
+        echo "Check: journalctl -u docker --no-pager -n 50" >&2
+        return 1
+    fi
 
     if ! systemctl is-active docker &>/dev/null; then
-        echo -e "${RED}ERROR: docker is not active after start${NC}"
+        echo -e "${RED}ERROR: docker is not active after start${NC}" >&2
         return 1
     fi
     echo "  docker is running."

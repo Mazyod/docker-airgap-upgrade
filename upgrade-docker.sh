@@ -826,11 +826,25 @@ if [ -f "${CONTAINERD_CONF}.rpmnew" ]; then
     echo "  diff -u $CONTAINERD_CONF ${CONTAINERD_CONF}.rpmnew"
 fi
 
-# Read the configured root, for reporting and to ensure the directory exists.
-# Generated configs single-quote paths, hand-edited ones may double-quote or
-# leave bare, so accept all three.
-CONTAINERD_ROOT=$(sed -n "s/^root[[:space:]]*=[[:space:]]*['\"]\{0,1\}\([^'\"]*\)['\"]\{0,1\}.*/\1/p" \
-    "$CONTAINERD_CONF" 2>/dev/null | head -1)
+# Read the configured root, for reporting, for the missing-mount check below,
+# and to ensure the directory exists.
+#
+# The awk stops at the first `[section]` header so only TOP-LEVEL keys are
+# considered. Both halves of that matter:
+#
+#   - Without it, a config whose only `root` key lives inside a
+#     [plugins."..."] section would yield that plugin's path as if it were
+#     containerd's root.
+#   - The sed tolerates leading whitespace, because an INDENTED top-level
+#     `root` previously parsed as empty and silently fell back to
+#     /var/lib/containerd -- which would defeat the relocated-root mount check
+#     below, since that only fires for a non-default root.
+#
+# Generated configs single-quote paths; hand-edited ones may double-quote or
+# leave bare, so accept all three, and ignore any trailing inline comment.
+CONTAINERD_ROOT=$(awk '/^[[:space:]]*\[/ { exit } { print }' "$CONTAINERD_CONF" 2>/dev/null \
+    | sed -n "s/^[[:space:]]*root[[:space:]]*=[[:space:]]*['\"]\{0,1\}\([^'\"]*\)['\"]\{0,1\}.*/\1/p" \
+    | head -1)
 CONTAINERD_ROOT=${CONTAINERD_ROOT:-/var/lib/containerd}
 
 echo "containerd root directory: $CONTAINERD_ROOT"

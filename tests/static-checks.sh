@@ -235,6 +235,40 @@ for s in upgrade-docker.sh rollback-docker.sh clean-swarm-networks.sh; do
 done
 
 #############################################
+head_ "1.11  Duplicated helpers have not drifted"
+#############################################
+# The three stateful scripts are standalone by design -- they get hand-carried
+# to air-gapped hosts individually -- so shared helpers are duplicated rather
+# than sourced. That makes silent divergence between the copies the standing
+# risk, and it has already happened once (rollback's start_services lost the
+# error handling its sibling had). Compare them ignoring blank lines.
+extract_fn() {
+    awk -v fn="$2" '$0 ~ "^"fn"\\(\\) \\{", /^\}/ { print }' "$1" | grep -v '^[[:space:]]*$'
+}
+
+cmp_fn() {
+    local fn="$1"; shift
+    local first="$1"; shift
+    local ref out ok=1
+    ref=$(extract_fn "$first" "$fn")
+    if [ -z "$ref" ]; then bad "$fn not found in $first"; return; fi
+    for other in "$@"; do
+        out=$(extract_fn "$other" "$fn")
+        if [ -z "$out" ]; then bad "$fn not found in $other"; ok=0; continue; fi
+        if [ "$ref" != "$out" ]; then
+            bad "$fn DRIFTED between $first and $other"
+            diff <(printf '%s\n' "$ref") <(printf '%s\n' "$out") | sed 's/^/       /'
+            ok=0
+        fi
+    done
+    [ "$ok" -eq 1 ] && ok "$fn identical across $(( $# + 1 )) scripts"
+}
+
+cmp_fn verify_unit_stopped upgrade-docker.sh rollback-docker.sh clean-swarm-networks.sh
+cmp_fn start_services      rollback-docker.sh clean-swarm-networks.sh
+cmp_fn prompt_yes_no       upgrade-docker.sh clean-swarm-networks.sh
+
+#############################################
 head_ "1.3  Upstream package availability"
 #############################################
 if [ "$ONLINE" = false ]; then

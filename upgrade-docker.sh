@@ -177,8 +177,20 @@ trap 'exit 143' TERM
 EXPECTED_DOCKER_VERSION="29.6.2"
 EXPECTED_CONTAINERD_VERSION="2.2.6"
 
-# Packages permitted in the upgrade directory. buildx and compose version
-# independently of docker-ce and are deliberately not pinned.
+# buildx and compose version INDEPENDENTLY of docker-ce -- these are their own
+# versions, not derived from the engine version, and must never be set to it.
+# They are still asserted: the bundle ships specific builds, and a bundle that
+# quietly carries last round's plugins should not report success.
+EXPECTED_BUILDX_VERSION="0.35.0"
+EXPECTED_COMPOSE_VERSION="5.3.1"
+
+# The baseline this upgrade was designed and tested against. Starting anywhere
+# else is a warning, except containerd 1.x which is a hard stop -- that crosses
+# the major boundary whose handling was removed in v2.0.0.
+SUPPORTED_FROM_DOCKER="29.1.5"
+SUPPORTED_FROM_CONTAINERD="2.2.1"
+
+# Packages permitted in the upgrade directory.
 ALLOWED_PKGS="docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin"
 
 #############################################
@@ -361,6 +373,8 @@ echo "  Package inventory:"
 FOUND_DOCKER_CE=""
 FOUND_DOCKER_CLI=""
 FOUND_CONTAINERD=""
+FOUND_BUILDX=""
+FOUND_COMPOSE=""
 HOST_ARCH=$(uname -m)
 SEEN_NAMES=""
 
@@ -416,9 +430,11 @@ for rpmfile in "${PKG_FILES[@]}"; do
     esac
 
     case "$p_name" in
-        docker-ce)      FOUND_DOCKER_CE="$p_ver" ;;
-        docker-ce-cli)  FOUND_DOCKER_CLI="$p_ver" ;;
-        containerd.io)  FOUND_CONTAINERD="$p_ver" ;;
+        docker-ce)             FOUND_DOCKER_CE="$p_ver" ;;
+        docker-ce-cli)         FOUND_DOCKER_CLI="$p_ver" ;;
+        containerd.io)         FOUND_CONTAINERD="$p_ver" ;;
+        docker-buildx-plugin)  FOUND_BUILDX="$p_ver" ;;
+        docker-compose-plugin) FOUND_COMPOSE="$p_ver" ;;
     esac
 done
 
@@ -437,9 +453,11 @@ check_version() {
 }
 
 echo ""
-check_version "docker-ce"     "$FOUND_DOCKER_CE"  "$EXPECTED_DOCKER_VERSION"
-check_version "docker-ce-cli" "$FOUND_DOCKER_CLI" "$EXPECTED_DOCKER_VERSION"
-check_version "containerd.io" "$FOUND_CONTAINERD" "$EXPECTED_CONTAINERD_VERSION"
+check_version "docker-ce"             "$FOUND_DOCKER_CE"  "$EXPECTED_DOCKER_VERSION"
+check_version "docker-ce-cli"         "$FOUND_DOCKER_CLI" "$EXPECTED_DOCKER_VERSION"
+check_version "containerd.io"         "$FOUND_CONTAINERD" "$EXPECTED_CONTAINERD_VERSION"
+check_version "docker-buildx-plugin"  "$FOUND_BUILDX"     "$EXPECTED_BUILDX_VERSION"
+check_version "docker-compose-plugin" "$FOUND_COMPOSE"    "$EXPECTED_COMPOSE_VERSION"
 
 if [ "$PKG_ERRORS" -gt 0 ]; then
     echo ""
@@ -494,6 +512,39 @@ elif [ -n "$CURRENT_DOCKER" ] && [ "$CURRENT_DOCKER" = "$EXPECTED_DOCKER_VERSION
     echo "  docker-ce-cli: ${CURRENT_DOCKER_CLI:-absent} (want $EXPECTED_DOCKER_VERSION)"
     echo "  containerd.io: ${CURRENT_CONTAINERD:-absent} (want $EXPECTED_CONTAINERD_VERSION)"
     echo "Proceeding to complete it."
+else
+    # Confirm the node is on the baseline this upgrade was designed and tested
+    # against. Not a hard failure -- an intermediate 29.x is probably fine --
+    # but it must not pass silently. Notably, a node still on 28.x/containerd
+    # 1.7 would be crossing the containerd MAJOR boundary, which this version
+    # of the script no longer handles.
+    if [ "$CURRENT_DOCKER" != "$SUPPORTED_FROM_DOCKER" ] ||
+       [ "$CURRENT_CONTAINERD" != "$SUPPORTED_FROM_CONTAINERD" ]; then
+        echo ""
+        echo -e "${YELLOW}=========================================="
+        echo "WARNING: UNEXPECTED STARTING VERSION"
+        echo "==========================================${NC}"
+        echo ""
+        echo "  tested upgrade path: $SUPPORTED_FROM_DOCKER / containerd.io $SUPPORTED_FROM_CONTAINERD"
+        echo "  this node has:       ${CURRENT_DOCKER:-absent} / containerd.io ${CURRENT_CONTAINERD:-absent}"
+        echo ""
+        case "$CURRENT_CONTAINERD" in
+            1.*)
+                echo -e "${RED}containerd 1.x detected. This script version does NOT handle${NC}"
+                echo -e "${RED}the containerd 1.7 -> 2.x major migration -- the config${NC}"
+                echo -e "${RED}migration, XFS ftype check and network cleanup it needs were${NC}"
+                echo -e "${RED}removed in v2.0.0. Use upgrade-docker.sh v1.2.3 (commit${NC}"
+                echo -e "${RED}974683a) for that path instead.${NC}"
+                echo ""
+                echo "Aborting. Nothing has been changed."
+                exit 1
+                ;;
+        esac
+        if ! prompt_yes_no "Continue from this unverified starting version? [y/N]" "n"; then
+            echo "Aborting. Nothing has been changed."
+            exit 0
+        fi
+    fi
 fi
 
 #############################################
@@ -763,8 +814,41 @@ CONTAINERD_ROOT=${CONTAINERD_ROOT:-/var/lib/containerd}
 echo "containerd root directory: $CONTAINERD_ROOT"
 
 if [ ! -d "$CONTAINERD_ROOT" ]; then
-    echo -e "${YELLOW}NOTE: $CONTAINERD_ROOT does not exist - creating it.${NC}"
-    mkdir -p "$CONTAINERD_ROOT"
+    if [ "$CONTAINERD_ROOT" = "/var/lib/containerd" ]; then
+        # The default root simply not existing yet is unremarkable.
+        echo -e "${YELLOW}NOTE: $CONTAINERD_ROOT does not exist - creating it.${NC}"
+        mkdir -p "$CONTAINERD_ROOT"
+    else
+        # A RELOCATED root that has gone missing is a different matter. The
+        # overwhelmingly likely cause is that its filesystem is not mounted.
+        # Blindly mkdir'ing it would create an empty directory on the root
+        # filesystem, containerd would start against it, and every existing
+        # image and snapshot would appear to have vanished -- while the script
+        # reported success.
+        echo ""
+        echo -e "${RED}=========================================="
+        echo "ERROR: RELOCATED containerd ROOT IS MISSING"
+        echo "==========================================${NC}"
+        echo ""
+        echo "  /etc/containerd/config.toml points at: $CONTAINERD_ROOT"
+        echo "  ...but that directory does not exist."
+        echo ""
+        echo "This usually means its filesystem is not mounted. Creating the"
+        echo "directory would hide that: containerd would start against an empty"
+        echo "root and this node's images and snapshots would look lost."
+        echo ""
+        echo "Check the mount first:"
+        echo "  findmnt --target $(dirname "$CONTAINERD_ROOT")"
+        echo "  lsblk; cat /etc/fstab"
+        echo ""
+        echo "Nothing has been changed on this node."
+        exit 1
+    fi
+elif [ "$CONTAINERD_ROOT" != "/var/lib/containerd" ]; then
+    # Relocated and present -- report the mount so an operator can eyeball that
+    # it is the real filesystem and not an empty stand-in on /.
+    echo "Relocated containerd root is present."
+    findmnt --target "$CONTAINERD_ROOT" 2>/dev/null | sed 's/^/  /' || true
 fi
 
 #############################################
@@ -861,10 +945,21 @@ for i in {1..30}; do
     sleep 2
 done
 
+# A restart is an escalation, not a resolution. Re-check after it: previously
+# this printed "containerd is fully ready" unconditionally and started docker
+# even when the API had never responded across all 30 attempts AND the restart
+# had not helped, which is exactly the race the polling exists to prevent.
 if [ "$CONTAINERD_READY" = false ]; then
     echo -e "${YELLOW}WARNING: containerd API not responding, forcing restart...${NC}"
     systemctl restart containerd
     sleep 5
+    if ! ctr version &>/dev/null; then
+        echo -e "${RED}ERROR: containerd API never became responsive.${NC}"
+        echo "Not starting docker against an unusable containerd."
+        echo "Check logs with: journalctl -u containerd --no-pager -n 100"
+        exit 1
+    fi
+    echo "containerd API responsive after restart."
 fi
 
 # Verify containerd is healthy
@@ -880,6 +975,16 @@ if ! ctr snapshots --snapshotter overlayfs ls &>/dev/null; then
     echo -e "${YELLOW}WARNING: Snapshotter not ready, restarting containerd...${NC}"
     systemctl restart containerd
     sleep 5
+    if ! ctr snapshots --snapshotter overlayfs ls &>/dev/null; then
+        echo -e "${RED}ERROR: the overlayfs snapshotter is not usable.${NC}"
+        echo "Containers will not start. Not proceeding to docker."
+        echo ""
+        echo "This most often means containerd's root is wrong or unwritable."
+        echo "  configured root: $CONTAINERD_ROOT"
+        echo "  check:           journalctl -u containerd --no-pager -n 100"
+        exit 1
+    fi
+    echo "Snapshotter usable after restart."
 fi
 
 echo -e "${GREEN}containerd is fully ready.${NC}"
@@ -937,9 +1042,11 @@ assert_installed() {
     fi
 }
 
-assert_installed docker-ce     "$EXPECTED_DOCKER_VERSION"
-assert_installed docker-ce-cli "$EXPECTED_DOCKER_VERSION"
-assert_installed containerd.io "$EXPECTED_CONTAINERD_VERSION"
+assert_installed docker-ce             "$EXPECTED_DOCKER_VERSION"
+assert_installed docker-ce-cli         "$EXPECTED_DOCKER_VERSION"
+assert_installed containerd.io         "$EXPECTED_CONTAINERD_VERSION"
+assert_installed docker-buildx-plugin  "$EXPECTED_BUILDX_VERSION"
+assert_installed docker-compose-plugin "$EXPECTED_COMPOSE_VERSION"
 
 if [ "$VERIFY_FAILED" -ne 0 ]; then
     echo ""

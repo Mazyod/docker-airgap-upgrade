@@ -478,7 +478,21 @@ shopt -u nullglob
 BACKUP_DIR=""
 if [ "${#BACKUP_DIRS[@]}" -gt 0 ]; then
     BACKUP_DIR="${BACKUP_DIRS[-1]%/}"
-    echo "Most recent backup: $BACKUP_DIR"
+    echo "Using most recent backup: $BACKUP_DIR"
+
+    # The newest backup is not necessarily the one belonging to the upgrade
+    # being rolled back -- several attempts leave several backups. Show them so
+    # the operator can stop and pick a different one if this is the wrong node
+    # state to restore.
+    if [ "${#BACKUP_DIRS[@]}" -gt 1 ]; then
+        echo -e "${YELLOW}NOTE: ${#BACKUP_DIRS[@]} backups exist:${NC}"
+        for d in "${BACKUP_DIRS[@]}"; do
+            echo "    ${d%/}"
+        done
+        echo "  Restoring config from the newest one shown above."
+        echo "  If that is the wrong one, abort now (Ctrl-C) and copy the"
+        echo "  correct config.toml into place manually."
+    fi
 fi
 
 if [ -n "$BACKUP_DIR" ] && [ -f "$BACKUP_DIR/config.toml" ]; then

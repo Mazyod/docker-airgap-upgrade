@@ -114,18 +114,41 @@ done
 head_ "1.5  No stale version literals"
 #############################################
 # Historical references are legitimate in comments and in "from" columns; only
-# flag them in live code. Strip comment lines before searching the scripts.
+# flag them in live code. Strip comment lines before searching.
+#
+# simulate-upgrade.sh is a special case: it deliberately INSTALLS the previous
+# versions as its simulated starting state, so 29.1.5 / 2.2.1 / 0.30.1 / 5.0.1
+# are correct there. Only the pre-previous round (28.5.1 / 1.7.29) would be
+# wrong, since this script no longer covers the containerd major migration.
 STALE_FOUND=0
 for s in "${SCRIPTS[@]}"; do
     [ -f "$s" ] || continue
-    hits=$(grep -vE '^\s*#' "$s" | grep -nE '28\.5\.1|1\.7\.29|0\.30\.1|5\.0\.1' || true)
+    if [ "$s" = "simulate-upgrade.sh" ]; then
+        pattern='28\.5\.1|1\.7\.29'
+        what="pre-baseline literal"
+    else
+        pattern='28\.5\.1|1\.7\.29|0\.30\.1|5\.0\.1'
+        what="stale literal"
+    fi
+    hits=$(grep -vE '^\s*#' "$s" | grep -nE "$pattern" || true)
     if [ -n "$hits" ]; then
-        bad "stale literal in live code of $s"
+        bad "$what in live code of $s"
         printf '       %s\n' "$hits"
         STALE_FOUND=1
     fi
 done
 [ "$STALE_FOUND" -eq 0 ] && ok "no stale version literals in live code"
+
+# The simulation's baseline must match the cluster's actual current state,
+# otherwise it is not simulating this upgrade.
+for spec in "docker-buildx-plugin-0.30.1" "docker-compose-plugin-5.0.1" \
+            "docker-ce-29.1.5" "containerd.io-2.2.1"; do
+    if grep -q "$spec" simulate-upgrade.sh; then
+        ok "simulation baseline pins $spec"
+    else
+        bad "simulation baseline does NOT pin $spec"
+    fi
+done
 
 #############################################
 head_ "1.6  Phase structure of upgrade-docker.sh"

@@ -1,7 +1,7 @@
 #!/bin/bash
 # download-docker-packages.sh
 # Run on the ONLINE RHEL 8 server to collect all packages needed for air-gapped upgrade
-VERSION="2.0.0"
+VERSION="2.1.0"
 #
 # This script downloads:
 # - Docker 29.6.2 packages for RHEL 8 and RHEL 9
@@ -191,6 +191,21 @@ if [ "$MISSING_SCRIPTS" -gt 0 ]; then
     echo "       Run this from a full checkout of the repo. Bundle not created." >&2
     exit 1
 fi
+
+# Operator documentation travels WITH the bundle. On an air-gapped server the
+# tarball is all there is -- there is no repo to read the runbook from, and no
+# internet to fetch it. Missing docs warn rather than abort: they do not affect
+# whether the upgrade works.
+echo ""
+echo "=== Including operator documentation ==="
+for doc in RUNBOOK.md README.md; do
+    if [ -f "$SCRIPT_DIR/$doc" ]; then
+        cp "$SCRIPT_DIR/$doc" "$DEST_BASE/"
+        echo "  ✓ $doc"
+    else
+        echo "  WARNING: $doc not found in $SCRIPT_DIR" >&2
+    fi
+done
 
 # Create final bundle
 echo ""

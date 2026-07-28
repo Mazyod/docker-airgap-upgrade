@@ -55,7 +55,7 @@ Three things the 1.7 → 2.x migration required have been removed, because insid
 
 | Script | Version | Purpose | Run On |
 |---|---|---|---|
-| `download-docker-packages.sh` | 2.0.0 | Download all packages, build the bundle | Online RHEL server |
+| `download-docker-packages.sh` | 2.1.0 | Download all packages, build the bundle | Online RHEL server |
 | `upgrade-docker.sh` | 2.0.0 | Perform the upgrade | Air-gapped servers |
 | `rollback-docker.sh` | 2.0.0 | Roll back to 29.1.5 | Failed upgrade recovery |
 | `clean-swarm-networks.sh` | 1.0.0 | Reset orphaned overlay network state | Node that can't rejoin overlays |
@@ -66,7 +66,19 @@ Script versions drift on purpose — only scripts that actually changed get bump
 
 ## Usage
 
-### Step 1: Download Packages (Online Server)
+### Step 1: Get the bundle
+
+**Preferred — download a published release** (no online RHEL server needed):
+
+```bash
+gh release download v29.6.2-1
+sha256sum -c <<< '<sha from the release notes>  docker-upgrade-bundle-v29.6.2-1.tar.gz'
+```
+
+Each release enumerates every package and version it contains, and ships one artifact
+holding all RPMs, the operator scripts and the runbook. See `docs/RELEASING.md`.
+
+**Or build it yourself on an online RHEL server:**
 
 ```bash
 chmod +x download-docker-packages.sh

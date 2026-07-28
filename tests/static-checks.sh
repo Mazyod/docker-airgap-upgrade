@@ -269,6 +269,99 @@ cmp_fn start_services      rollback-docker.sh clean-swarm-networks.sh
 cmp_fn prompt_yes_no       upgrade-docker.sh clean-swarm-networks.sh
 
 #############################################
+head_ "1.12  Every helper called is also defined"
+#############################################
+# A call to an undefined function is a RUNTIME failure that `bash -n` cannot
+# see and shellcheck does not flag. It already happened: rollback-docker.sh
+# called prompt_yes_no without defining it, and because the call sat in an
+# `if !` condition the missing command (127) inverted to "abort", exiting 0 --
+# a silent no-op rollback that reported success.
+#
+# Grepping for a helper NAME is not enough either: the call site itself
+# supplies the string, so a check like that passes even with the definition
+# deleted. Require the definition.
+for s in "${SCRIPTS[@]}"; do
+    [ -f "$s" ] || continue
+    for fn in prompt_yes_no verify_unit_stopped start_services stop_services; do
+        # Does the script reference it anywhere other than its own definition?
+        refs=$(grep -vE '^\s*#' "$s" | grep -cE "(^|[^[:alnum:]_])${fn}( |$|\")" || true)
+        defs=$(grep -cE "^${fn}\(\) \{" "$s" || true)
+        if [ "$refs" -gt 0 ] && [ "$defs" -eq 0 ]; then
+            bad "$s calls $fn but never defines it"
+        elif [ "$refs" -gt 0 ]; then
+            ok "$s defines the $fn it calls"
+        fi
+    done
+done
+
+#############################################
+head_ "1.13  Load-bearing invariants"
+#############################################
+# CLAUDE.md calls these non-negotiable, so assert them rather than trusting
+# that nobody reorders them.
+
+# Stop order: docker (with docker.socket) must precede containerd.
+for s in upgrade-docker.sh rollback-docker.sh clean-swarm-networks.sh; do
+    d=$(grep -n 'systemctl stop docker docker.socket' "$s" | head -1 | cut -d: -f1)
+    c=$(grep -n 'systemctl stop containerd' "$s" | head -1 | cut -d: -f1)
+    if [ -n "$d" ] && [ -n "$c" ] && [ "$d" -lt "$c" ]; then
+        ok "$s stops docker before containerd"
+    else
+        bad "$s stop order WRONG (docker@${d:-?}, containerd@${c:-?})"
+    fi
+done
+
+# Start order: containerd must precede docker, in every start path.
+for s in upgrade-docker.sh rollback-docker.sh clean-swarm-networks.sh; do
+    c=$(grep -n 'systemctl start containerd' "$s" | head -1 | cut -d: -f1)
+    d=$(grep -n 'systemctl start docker' "$s" | head -1 | cut -d: -f1)
+    if [ -n "$c" ] && [ -n "$d" ] && [ "$c" -lt "$d" ]; then
+        ok "$s starts containerd before docker"
+    else
+        bad "$s start order WRONG (containerd@${c:-?}, docker@${d:-?})"
+    fi
+done
+
+# Readiness gating: both the API poll and the snapshotter check must exist.
+for s in upgrade-docker.sh rollback-docker.sh clean-swarm-networks.sh; do
+    if grep -q 'ctr version' "$s" && grep -q 'ctr snapshots --snapshotter overlayfs ls' "$s"; then
+        ok "$s gates on both ctr version and the overlayfs snapshotter"
+    else
+        bad "$s is missing a containerd readiness gate"
+    fi
+done
+
+# Rollback resumability: --replacepkgs on both the dry run and the real call.
+rp=$(grep -vE '^\s*#' rollback-docker.sh | grep -c -- '--replacepkgs' || true)
+if [ "$rp" -eq 2 ]; then
+    ok "rollback-docker.sh uses --replacepkgs on dry run and real transaction"
+else
+    bad "rollback-docker.sh has $rp --replacepkgs occurrences in live code (want 2)"
+fi
+
+# One rpm transaction, not several: exactly one real `rpm -Uvh` that is not a
+# --test dry run, in each of upgrade (engine) and rollback.
+for s in upgrade-docker.sh rollback-docker.sh; do
+    real=$(grep -vE '^\s*#' "$s" | grep -E 'rpm -Uvh' | grep -vc -- '--test' || true)
+    want=1
+    [ "$s" = "upgrade-docker.sh" ] && want=2   # engine set + NVIDIA set
+    if [ "$real" -eq "$want" ]; then
+        ok "$s has $real real rpm -Uvh transaction(s)"
+    else
+        bad "$s has $real real rpm -Uvh transactions (want $want)"
+    fi
+done
+
+# Swarm state must be compared exactly -- `grep -q "active"` matches "inactive".
+for s in upgrade-docker.sh clean-swarm-networks.sh; do
+    if grep -vE '^\s*#' "$s" | grep -q 'grep -q "active"'; then
+        bad "$s uses grep -q \"active\" which also matches \"inactive\""
+    else
+        ok "$s compares Swarm state exactly"
+    fi
+done
+
+#############################################
 head_ "1.3  Upstream package availability"
 #############################################
 if [ "$ONLINE" = false ]; then

@@ -130,7 +130,10 @@ for s in "${SCRIPTS[@]}"; do
         pattern='28\.5\.1|1\.7\.29|0\.30\.1|5\.0\.1'
         what="stale literal"
     fi
-    hits=$(grep -vE '^\s*#' "$s" | grep -nE "$pattern" || true)
+    # grep -n on a FILTERED stream reports the filtered line numbers, which do
+    # not correspond to anything in the file. Number the file first, then
+    # filter, so the reported numbers are real.
+    hits=$(grep -nE "$pattern" "$s" | grep -vE '^[0-9]+:\s*#' || true)
     if [ -n "$hits" ]; then
         bad "$what in live code of $s"
         printf '       %s\n' "$hits"
@@ -226,9 +229,13 @@ for s in upgrade-docker.sh rollback-docker.sh clean-swarm-networks.sh; do
     else
         bad "$s does not use verify_unit_stopped"
     fi
-    # is-active must not be used as a stop check any more.
-    if grep -vE '^\s*#' "$s" | grep -q 'systemctl is-active docker.socket'; then
-        bad "$s still uses is-active as a stop check"
+    # `systemctl is-active` must not be used to decide a unit is STOPPED (it
+    # fails open). It is still legitimate for confirming a unit is RUNNING.
+    # Flag it only inside a stop-verification context: a `STILL_UP`/`still_up`
+    # accumulator, which is the shape the old fail-open code had.
+    if grep -nE 'systemctl is-active' "$s" | grep -vE '^[0-9]+:\s*#' \
+        | grep -qiE 'still_up'; then
+        bad "$s uses is-active to decide a unit is stopped (fails open)"
     else
         ok "$s does not use is-active as a stop check"
     fi

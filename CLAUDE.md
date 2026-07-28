@@ -82,7 +82,7 @@ Every script except `simulate-upgrade.sh` declares `VERSION="x.y.z"` on ~line 4 
 | `rollback-docker.sh` | 2.0.0 |
 | `download-docker-packages.sh` | 2.0.0 |
 | `clean-swarm-networks.sh` | 1.0.0 |
-| `recover-dnf.sh` | 1.2.1 |
+| `recover-dnf.sh` | 1.2.2 |
 
 Commit subjects carry the new version in parens, e.g. `Fix NVIDIA toolkit upgrade failures (v1.2.2)`, with a bullet list body.
 
@@ -118,6 +118,9 @@ Exits 2 when cleanup was incomplete, so a wrapper checking `$?` doesn't record a
 - `set -e` everywhere, so any command whose failure is acceptable needs an explicit `|| true`.
 - `exec > >(tee -a /var/log/docker-<action>.log) 2>&1` at the top of the long-running scripts.
 - `RED`/`GREEN`/`YELLOW`/`NC` color vars with `echo -e`.
-- Interactive prompts go through `prompt_yes_no "text [Y/n]" "y"`; the default is passed separately from the prompt string. Destructive prompts default to `n`.
+- Interactive prompts go through `prompt_yes_no "text [Y/n]" "y"`; the default is passed separately from the prompt string. Destructive prompts default to `n`. It **refuses EOF** rather than applying the default — otherwise a non-interactive run (ssh without `-t`, any wrapper) silently auto-answers every prompt, including the drain prompt, which defaults to yes.
+- **Every script that calls a helper must also define it.** These are standalone files; there is no shared library. `rollback-docker.sh` once called `prompt_yes_no` without defining it, and because the call sat in an `if !` condition the missing command's exit 127 inverted to "abort", exiting **0** — a silent no-op emergency rollback that reported success. `bash -n` cannot see this and shellcheck does not flag unresolved commands, so `tests/static-checks.sh` check 1.12 enforces it.
+- **Compare Swarm state exactly, never `grep -q "active"`** — a non-Swarm host reports `inactive`, which contains `active`.
+- **Any new harness check must be mutation-tested.** A check that greps for a function *name* passes even when the definition is deleted, because the call site supplies the string. Break the thing deliberately and confirm the harness fails and exits non-zero before trusting it.
 - EXIT traps do `local rc=$?` first, `[ "$rc" -eq 0 ] && exit 0`, and end with `exit "$rc"`. Paired with `trap 'exit 130' INT` / `trap 'exit 143' TERM` so signals route through the same reporting.
 - Scripts assume GNU userland (`grep -oP`, `findmnt`, `xfs_info`) with fallbacks where it mattered — don't test behavior against macOS tooling.

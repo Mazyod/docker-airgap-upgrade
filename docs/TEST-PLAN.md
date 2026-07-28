@@ -214,9 +214,11 @@ first, observe under real traffic for an agreed period, then proceed.
 
 ## Known gap
 
-`recover-dnf.sh` was unchanged in this work and has **no dynamic test**. It is
-production recovery code that stops services, changes packages, uses a bare readiness
-sleep, has no failure trap, and assumes a `docker-local` repo that does not exist on
-air-gapped hosts. Treat it as unverified: do not run it on a production node without
-first exercising it in a VM. Bringing it to the standard of the other scripts is
-follow-up work, deliberately out of scope here.
+`recover-dnf.sh` still has **no dynamic test**. It is production recovery code that
+stops services, changes packages, uses a bare readiness sleep (no `ctr` polling), has
+no failure trap, and assumes a `docker-local` repo that does not exist on air-gapped
+hosts. Only one defect was fixed (v1.2.2: a bare `read` under `set -e` killed the
+script with no message on EOF, after `dnf clean all` and `rpm --rebuilddb` had already
+run). Treat it as unverified: do not run it on a production node without first
+exercising it in a VM. Bringing it to the standard of the other scripts is follow-up
+work, deliberately out of scope here.

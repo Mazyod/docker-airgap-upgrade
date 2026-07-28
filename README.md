@@ -186,6 +186,25 @@ Phase 6 aborts if the config points at a **relocated** containerd root that does
 exist — that normally means its filesystem is unmounted, and creating the directory
 would silently orphan every image and snapshot on the node.
 
+## Testing
+
+| Tier | Status | How |
+|---|---|---|
+| Static | **122/122** | `./tests/static-checks.sh --online` |
+| VM (real execution) | **45/45** | `./tests/vm/bootstrap-vm.sh && ./tests/vm/build-bundle.sh && ./tests/vm/tier2-run.sh` |
+| Negative control | **3/3** | `./tests/vm/negative-control.sh` |
+| Swarm | **not run** | needs a multi-node cluster — see `docs/TEST-PLAN.md` Tier 3 |
+
+The VM tier runs the real scripts against Rocky Linux 9 (x86_64, systemd) via
+OrbStack, with containerd's root relocated to a separate XFS filesystem holding real
+images, containers and volume data. It covers the phase-0 rejections, the real
+upgrade, config preservation, idempotent re-run, and rollback.
+
+**Swarm behaviour is entirely untested** — drain, reactivation, overlay
+reconvergence, mixed-version operation and `clean-swarm-networks.sh`. Tier 3 in
+`docs/TEST-PLAN.md` is mandatory before a production rollout, and specifically 3.3/3.4
+are what authorize rolling node by node.
+
 ## Notes
 
 **cgroup v1 is deprecated** as of Docker 29.0.0, with support continuing through May

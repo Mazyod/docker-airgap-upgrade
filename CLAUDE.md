@@ -19,7 +19,19 @@ shellcheck upgrade-docker.sh              # available via homebrew
 
 All six scripts are currently `bash -n` clean and `shellcheck` clean. Keep them that way — where a suppression is genuinely warranted, use an inline `# shellcheck disable=SCxxxx` with a reason, not a blanket ignore.
 
-Real validation happens in a RHEL VM via `simulate-upgrade.sh`. It is **not** the same code path as `upgrade-docker.sh` (see below) — passing simulation does not prove the air-gapped path works. To test the real path, run `upgrade-docker.sh` itself against a populated `/opt/docker-offline` in the VM.
+**Real execution happens through `tests/vm/`** — an OrbStack-based harness that runs the actual scripts against Rocky Linux 9 (x86_64, systemd PID 1) on the dev Mac:
+
+```bash
+tests/vm/bootstrap-vm.sh      # build the S1 baseline
+tests/vm/build-bundle.sh      # real download-docker-packages.sh run
+tests/vm/tier2-run.sh         # Tier 2 cases: reject / upgrade / rollback
+tests/vm/negative-control.sh  # prove test 2.4 catches the regression
+tests/vm/reset-baseline.sh    # back to S1 between destructive runs
+```
+
+The S1 baseline deliberately puts containerd's root on a **separate XFS filesystem at `/data/containerd`** with real images, containers and volume data on it. That is the configuration the pre-v2.0.0 phase 6 destroyed, and it is the only way to test it. See `tests/vm/README.md` for what this proves and — importantly — what it does not (no Swarm, not real RHEL, no GPU, not bare metal).
+
+`simulate-upgrade.sh` remains a separate dnf-path smoke test. It is **not** the same code path as `upgrade-docker.sh` (see below), so passing it does not prove the air-gapped path works.
 
 ## Two different install strategies (important)
 

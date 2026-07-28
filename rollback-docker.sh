@@ -429,6 +429,7 @@ echo -e "${GREEN}Rollback payload validated.${NC}"
 # a wrong backup costs nothing.
 echo ""
 echo "=== Phase 0b: Select Config Backup ==="
+CURRENT_PHASE="phase 0b (select config backup)"
 
 # upgrade-docker.sh names backups docker-backup-YYYYmmdd-HHMMSS, so the glob's
 # lexical ordering is already chronological -- the last element is the newest.

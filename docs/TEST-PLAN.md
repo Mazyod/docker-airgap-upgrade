@@ -3,6 +3,27 @@
 **Date:** 2026-07-28
 **Scope:** the six scripts retargeted in `a65edd7`, `7df0355`, `a095c40` and later
 
+## Execution status (2026-07-28)
+
+| Tier | Status | Evidence |
+|---|---|---|
+| Tier 1 static | **PASSED 122/122** | `tests/static-checks.sh --online` |
+| Tier 2 VM | **PASSED 45/45** | `tests/vm/tier2-run.sh` on Rocky 9 / x86_64 / systemd |
+| Tier 2 negative control | **PASSED 3/3** | `tests/vm/negative-control.sh` — mutant loses the relocated root |
+| Tier 1b stubbed | not built | optional; Tier 2 covers most of its intent |
+| Tier 3 Swarm | **NOT RUN** | needs a real multi-node cluster |
+
+Tier 2 ran against a **relocated containerd root on a separate XFS filesystem** with
+real images, containers and volume data on it — the exact configuration the previous
+script version destroyed. The negative control confirms a one-line mutant restoring
+the old phase 6 loses that root (`/data/containerd` → `/var/lib/containerd`), so 2.4
+is a genuine regression test rather than a vacuous pass.
+
+**Tier 3 remains mandatory before production.** Nothing about Swarm — drain,
+reactivation, overlay reconvergence, mixed-version operation, or
+`clean-swarm-networks.sh` — has been executed. See `tests/vm/README.md` for the full
+list of what the VM tier does and does not prove.
+
 ## What each tier can and cannot prove
 
 - **Tier 1 — static.** macOS dev machine. Syntax, lint, internal consistency,

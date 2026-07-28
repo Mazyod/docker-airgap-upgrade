@@ -20,8 +20,14 @@
 set -e
 exec > >(tee -a /var/log/docker-upgrade-sim.log) 2>&1
 
+# Detect the RHEL major rather than hard-coding el8. Testing a hand-edited copy
+# of this script on RHEL 9 would not be testing the checked-in artifact.
+RHEL_VER=$(rpm -E %rhel)
+PKG_DIR="/opt/docker-offline/rhel${RHEL_VER}"
+
 echo "=========================================="
 echo "Docker Upgrade Simulation: 29.1.5 → 29.6.2"
+echo "RHEL major: $RHEL_VER"
 echo "Date: $(date)"
 echo "=========================================="
 
@@ -31,13 +37,17 @@ echo "=== Installing Docker 29.1.5 (simulating current cluster state) ==="
 
 dnf config-manager --add-repo https://download.docker.com/linux/rhel/docker-ce.repo
 
-# Note: buildx and compose have INDEPENDENT versions - don't pin them!
+# buildx and compose have INDEPENDENT versions - never derive them from the
+# docker-ce version. They ARE pinned here, to the versions the cluster actually
+# runs today: leaving them unpinned installs the latest, so the "29.1.5
+# baseline" would already contain the plugins the upgrade is supposed to
+# deliver, and the plugin transition would go untested.
 dnf install -y \
     docker-ce-29.1.5 \
     docker-ce-cli-29.1.5 \
     containerd.io-2.2.1 \
-    docker-buildx-plugin \
-    docker-compose-plugin
+    docker-buildx-plugin-0.30.1 \
+    docker-compose-plugin-5.0.1
 
 # Start containerd FIRST, then docker
 systemctl enable --now containerd
@@ -48,8 +58,9 @@ echo "Installed versions:"
 docker version
 containerd --version
 
-# Create test containers
-docker run -d --name test-nginx --network bridge nginx:alpine
+# Create test containers. nginx PUBLISHES a port -- without -p, `docker port`
+# returns nothing later and the connectivity check tests an empty URL.
+docker run -d --name test-nginx -p 18080:80 --network bridge nginx:alpine
 docker network create custom-bridge
 docker run -d --name test-dns --network custom-bridge alpine sleep 3600
 
@@ -62,20 +73,20 @@ cp /etc/containerd/config.toml /root/config.toml.before 2>/dev/null || true
 echo ""
 echo "=== Downloading upgrade packages ==="
 
-mkdir -p /opt/docker-offline/rhel8
-cd /opt/docker-offline/rhel8
+mkdir -p "$PKG_DIR"
+cd "$PKG_DIR"
 
 # Download with explicit versions. -f so a bad version fails here rather than
 # writing a 404 page into a .rpm.
 for pkg in \
-    docker-ce-29.6.2-1.el8.x86_64.rpm \
-    docker-ce-cli-29.6.2-1.el8.x86_64.rpm \
-    containerd.io-2.2.6-1.el8.x86_64.rpm \
-    docker-buildx-plugin-0.35.0-1.el8.x86_64.rpm \
-    docker-compose-plugin-5.3.1-1.el8.x86_64.rpm
+    "docker-ce-29.6.2-1.el${RHEL_VER}.x86_64.rpm" \
+    "docker-ce-cli-29.6.2-1.el${RHEL_VER}.x86_64.rpm" \
+    "containerd.io-2.2.6-1.el${RHEL_VER}.x86_64.rpm" \
+    "docker-buildx-plugin-0.35.0-1.el${RHEL_VER}.x86_64.rpm" \
+    "docker-compose-plugin-5.3.1-1.el${RHEL_VER}.x86_64.rpm"
 do
     echo "Downloading: $pkg"
-    curl -fsLO "https://download.docker.com/linux/rhel/8/x86_64/stable/Packages/$pkg"
+    curl -fsLO "https://download.docker.com/linux/rhel/${RHEL_VER}/x86_64/stable/Packages/$pkg"
 done
 
 ls -lh ./*.rpm
@@ -87,10 +98,10 @@ echo "=== Creating local repository ==="
 dnf install -y createrepo_c
 createrepo .
 
-cat > /etc/yum.repos.d/docker-local.repo << 'EOF'
+cat > /etc/yum.repos.d/docker-local.repo << EOF
 [docker-local]
 name=Docker Local Repo
-baseurl=file:///opt/docker-offline/rhel8
+baseurl=file://${PKG_DIR}
 enabled=1
 gpgcheck=0
 priority=1
@@ -192,21 +203,29 @@ assert_pkg() {
     fi
 }
 
-assert_pkg docker-ce     29.6.2
-assert_pkg docker-ce-cli 29.6.2
-assert_pkg containerd.io 2.2.6
+assert_pkg docker-ce             29.6.2
+assert_pkg docker-ce-cli         29.6.2
+assert_pkg containerd.io         2.2.6
+assert_pkg docker-buildx-plugin  0.35.0
+assert_pkg docker-compose-plugin 5.3.1
 
+# Config preservation is the single most important behavioural change in
+# upgrade-docker.sh v2.0.0, so it is a FAILURE here, not a note. (The dnf path
+# this script exercises does not rewrite the config either, so a diff means
+# something genuinely unexpected happened.)
 echo ""
 echo "containerd config preserved across upgrade:"
 if [ -f /root/config.toml.before ]; then
     if cmp -s /root/config.toml.before /etc/containerd/config.toml; then
         echo "  OK   config.toml is byte-identical to pre-upgrade"
     else
-        echo "  NOTE config.toml changed - diff follows"
+        echo "  FAIL config.toml changed - diff follows"
         diff -u /root/config.toml.before /etc/containerd/config.toml || true
+        FAILURES=$((FAILURES + 1))
     fi
 else
-    echo "  SKIP no pre-upgrade config captured"
+    echo "  FAIL no pre-upgrade config was captured - cannot verify preservation"
+    FAILURES=$((FAILURES + 1))
 fi
 
 echo ""
@@ -223,9 +242,11 @@ echo ""
 echo "Testing existing containers survived the upgrade:"
 docker ps -a
 docker start test-nginx 2>/dev/null || true
-sleep 2
-if curl -s "localhost:$(docker port test-nginx 80/tcp | cut -d: -f2)" | head -5; then
-    echo "  OK   nginx works"
+sleep 3
+# -f so an HTTP error is a failure, and no pipe: piping into `head` would make
+# this report head's exit status, so a completely failed request printed "OK".
+if curl -fsS -o /dev/null --max-time 10 http://localhost:18080/; then
+    echo "  OK   nginx responds on the published port"
 else
     echo "  FAIL nginx did not respond"
     FAILURES=$((FAILURES + 1))

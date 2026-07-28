@@ -385,6 +385,63 @@ echo "still fail there."
 echo -e "${GREEN}Rollback payload validated.${NC}"
 
 #############################################
+# Phase 0b: Select the containerd Config Backup
+#############################################
+# Chosen HERE, while the node is still up and nothing has been changed.
+#
+# This used to happen in phase 3, after the downgrade had already run with
+# services stopped -- so an operator who saw the wrong backup named could only
+# either accept it or interrupt a half-finished rollback. Deciding first means
+# a wrong backup costs nothing.
+echo ""
+echo "=== Phase 0b: Select Config Backup ==="
+
+# upgrade-docker.sh names backups docker-backup-YYYYmmdd-HHMMSS, so the glob's
+# lexical ordering is already chronological -- the last element is the newest.
+shopt -s nullglob
+BACKUP_DIRS=(/root/docker-backup-*/)
+shopt -u nullglob
+
+BACKUP_DIR=""
+if [ "${#BACKUP_DIRS[@]}" -eq 0 ]; then
+    echo "No /root/docker-backup-* directories found."
+    echo "The existing containerd config will be kept as-is (valid for 2.2.x)."
+else
+    BACKUP_DIR="${BACKUP_DIRS[-1]%/}"
+
+    if [ "${#BACKUP_DIRS[@]}" -gt 1 ]; then
+        echo -e "${YELLOW}${#BACKUP_DIRS[@]} backups exist:${NC}"
+        for d in "${BACKUP_DIRS[@]}"; do
+            if [ "${d%/}" = "$BACKUP_DIR" ]; then
+                echo "    ${d%/}   <-- will be used (newest)"
+            else
+                echo "    ${d%/}"
+            fi
+        done
+        echo ""
+        echo "The newest backup is not necessarily the one belonging to the"
+        echo "upgrade you are rolling back."
+        echo ""
+        if ! prompt_yes_no "Use the backup marked above? [Y/n]" "y"; then
+            echo ""
+            echo "Aborting. Nothing has been changed."
+            echo "To use a different backup, copy its config.toml into place"
+            echo "manually before re-running:"
+            echo "  cp <backup>/config.toml /etc/containerd/config.toml"
+            exit 0
+        fi
+    else
+        echo "Using backup: $BACKUP_DIR"
+    fi
+
+    if [ ! -f "$BACKUP_DIR/config.toml" ]; then
+        echo -e "${YELLOW}NOTE: $BACKUP_DIR has no config.toml.${NC}"
+        echo "The existing containerd config will be kept as-is."
+        BACKUP_DIR=""
+    fi
+fi
+
+#############################################
 # Phase 1: Stop Services
 #############################################
 echo ""
@@ -434,8 +491,6 @@ echo ""
 echo "=== Phase 2: Downgrade Packages ==="
 CURRENT_PHASE="phase 2 (downgrade packages)"
 
-# containerd.io first: docker-ce depends on it, and the engine must never be
-# left newer than the runtime it talks to.
 PKG_STATE="attempted"
 
 # ONE transaction, not two. Splitting containerd.io and docker-ce into separate
@@ -469,32 +524,7 @@ CURRENT_PHASE="phase 3 (containerd config)"
 # runtime configuration -- the same hazard phase 6 of upgrade-docker.sh avoids.
 # The existing file is correct; leave it alone.
 
-# upgrade-docker.sh names backups docker-backup-YYYYmmdd-HHMMSS, so the glob's
-# lexical ordering is already chronological -- the last element is the newest.
-shopt -s nullglob
-BACKUP_DIRS=(/root/docker-backup-*/)
-shopt -u nullglob
-
-BACKUP_DIR=""
-if [ "${#BACKUP_DIRS[@]}" -gt 0 ]; then
-    BACKUP_DIR="${BACKUP_DIRS[-1]%/}"
-    echo "Using most recent backup: $BACKUP_DIR"
-
-    # The newest backup is not necessarily the one belonging to the upgrade
-    # being rolled back -- several attempts leave several backups. Show them so
-    # the operator can stop and pick a different one if this is the wrong node
-    # state to restore.
-    if [ "${#BACKUP_DIRS[@]}" -gt 1 ]; then
-        echo -e "${YELLOW}NOTE: ${#BACKUP_DIRS[@]} backups exist:${NC}"
-        for d in "${BACKUP_DIRS[@]}"; do
-            echo "    ${d%/}"
-        done
-        echo "  Restoring config from the newest one shown above."
-        echo "  If that is the wrong one, abort now (Ctrl-C) and copy the"
-        echo "  correct config.toml into place manually."
-    fi
-fi
-
+# BACKUP_DIR was chosen and confirmed in phase 0b, before anything was touched.
 if [ -n "$BACKUP_DIR" ] && [ -f "$BACKUP_DIR/config.toml" ]; then
     if cmp -s "$BACKUP_DIR/config.toml" /etc/containerd/config.toml 2>/dev/null; then
         echo "Config matches the pre-upgrade backup; leaving it in place."

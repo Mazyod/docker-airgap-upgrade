@@ -91,20 +91,35 @@ What it will do, in order:
 
 | Phase | What happens | Safe to abort? |
 |---|---|---|
-| 0 | Validates packages: digests, metadata, versions, arch, release, duplicates, rpm dry run | **Yes — node untouched** |
+| 0 | Validates packages: digests, metadata, all five versions, arch, release, duplicates, `rpm --test` dry run; checks the starting version | **Yes — node untouched** |
 | 1 | Swarm detect; manager self-drain or worker attestation | Yes |
 | 2 | Pre-upgrade checks | Yes |
 | 3 | Backup to `/root/docker-backup-<timestamp>/` | Yes |
-| 4 | Stop docker → docker.socket → containerd, verify all stopped | Node is now down |
+| 4 | Stop docker → docker.socket → containerd, verify all conclusively stopped | Node is now down |
 | 5 | `rpm -Uvh` the validated set | **Point of no return** |
 | 6 | Verify containerd config (does **not** rewrite it) | — |
 | 7 | NVIDIA toolkit, if installed (best effort) | — |
-| 8 | Start containerd → poll readiness → start docker | — |
-| 9 | Verify, and assert installed versions | — |
+| 8 | Start containerd → poll API and snapshotter → start docker | — |
+| 9 | Verify, and assert all five installed versions | — |
 | 10 | Swarm reactivation | — |
 
 Everything that can fail without consequence fails in phase 0, while the node is
 still serving and still active in the Swarm.
+
+**Phase 0 will stop you, deliberately, if:**
+
+| Condition | Why |
+|---|---|
+| containerd 1.x installed | This script no longer handles the 1.7 → 2.x major migration. Use v1.2.3 (`974683a`). |
+| Starting version isn't 29.1.5 / 2.2.1 | Warns and asks. Untested path. |
+| Wrong, duplicate, corrupt, wrong-arch or wrong-release RPMs | Checked against RPM **metadata**, not filenames |
+| buildx / compose not at 0.35.0 / 5.3.1 | A bundle carrying last round's plugins shouldn't report success |
+| `rpm --test` refuses the transaction | Dependency or space problem, caught while the node is still up |
+
+**Phase 6 will stop you if** the config points at a relocated containerd root
+(e.g. `/data/containerd`) that does not exist. That almost always means its
+filesystem isn't mounted; creating the directory would start containerd against an
+empty root and make every image and snapshot look lost.
 
 ### 3.5 Verify
 

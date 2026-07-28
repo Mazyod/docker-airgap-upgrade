@@ -171,8 +171,20 @@ docker run --rm --network test-net alpine nslookup google.com
 docker network rm test-net
 ```
 
-`upgrade-docker.sh` asserts the installed versions itself in phase 9 and exits
-non-zero if they do not match, so "UPGRADE COMPLETE" means the versions were checked.
+`upgrade-docker.sh` asserts all five installed versions itself in phase 9 and exits
+non-zero if any do not match, so "UPGRADE COMPLETE" means the versions were checked.
+
+### What the script refuses to do
+
+Phase 0 aborts, with the node untouched, on: containerd 1.x installed (that is the
+major migration this version no longer handles — use v1.2.3, commit `974683a`);
+wrong, duplicate, corrupt, wrong-arch or wrong-release RPMs; plugins not at
+0.35.0 / 5.3.1; or an `rpm --test` dry run that the transaction fails. An unexpected
+starting version warns and asks.
+
+Phase 6 aborts if the config points at a **relocated** containerd root that does not
+exist — that normally means its filesystem is unmounted, and creating the directory
+would silently orphan every image and snapshot on the node.
 
 ## Notes
 

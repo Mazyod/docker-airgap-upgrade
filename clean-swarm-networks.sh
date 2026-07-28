@@ -64,7 +64,16 @@ prompt_yes_no() {
     local response
 
     while true; do
-        read -r -p "$prompt " response
+        # EOF is not an answer. Without this, a non-interactive run (ssh
+        # without -t, a wrapper, cron) makes `read` fail, leaves response
+        # empty, and silently applies the default to EVERY prompt -- including
+        # ones that default to yes.
+        if ! read -r -p "$prompt " response; then
+            echo "" >&2
+            echo "ERROR: stdin closed - cannot read an answer." >&2
+            echo "These scripts are interactive; run them on a terminal." >&2
+            exit 1
+        fi
         response=${response:-$default}
         case "$response" in
             [Yy]|[Yy][Ee][Ss]) return 0 ;;

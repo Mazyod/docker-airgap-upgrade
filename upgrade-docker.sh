@@ -203,7 +203,16 @@ prompt_yes_no() {
     local response
 
     while true; do
-        read -r -p "$prompt " response
+        # EOF is not an answer. Without this, a non-interactive run (ssh
+        # without -t, a wrapper, cron) makes `read` fail, leaves response
+        # empty, and silently applies the default to EVERY prompt -- including
+        # ones that default to yes.
+        if ! read -r -p "$prompt " response; then
+            echo "" >&2
+            echo "ERROR: stdin closed - cannot read an answer." >&2
+            echo "These scripts are interactive; run them on a terminal." >&2
+            exit 1
+        fi
         response=${response:-$default}
         case "$response" in
             [Yy]|[Yy][Ee][Ss]) return 0 ;;
@@ -303,7 +312,12 @@ wait_for_services() {
     done
 
     echo -e "${YELLOW}WARNING: Some services may still be starting.${NC}"
-    docker service ls
+    # `|| true`: this is the timeout path of a NON-fatal wait, reached at phase
+    # 10 when packages are installed, versions asserted, services up and the
+    # node reactivated. A failing `docker service ls` here would trip set -e and
+    # make the trap announce "UPGRADE FAILED during: phase 10" over a completely
+    # successful upgrade.
+    docker service ls || true
     return 0
 }
 
@@ -580,7 +594,17 @@ SWARM_ACTIVE=false
 SWARM_NODE_ID=""
 IS_MANAGER=false
 
-if docker info --format '{{.Swarm.LocalNodeState}}' 2>/dev/null | grep -q "active"; then
+# Exact compare, not `grep -q "active"`. A non-Swarm host reports "inactive",
+# which CONTAINS "active" -- the unanchored grep matched it and classified every
+# standalone Docker host as a Swarm worker. That node then got a drain
+# instruction with an empty node ID and a "has this been drained?" prompt
+# defaulting to No, so the upgrade could not proceed on a host that was never
+# in a Swarm. clean-swarm-networks.sh already compared exactly; this brings the
+# two into line.
+SWARM_STATE=$(docker info --format '{{.Swarm.LocalNodeState}}' 2>/dev/null || echo "unknown")
+echo "Swarm state: $SWARM_STATE"
+
+if [ "$SWARM_STATE" = "active" ]; then
     SWARM_ACTIVE=true
     SWARM_NODE_ID=$(docker info --format '{{.Swarm.NodeID}}' 2>/dev/null)
     SWARM_ROLE=$(docker info --format '{{.Swarm.ControlAvailable}}' 2>/dev/null)
@@ -618,10 +642,30 @@ if docker info --format '{{.Swarm.LocalNodeState}}' 2>/dev/null | grep -q "activ
                 sleep 10
 
                 # Show remaining tasks
-                TASKS=$(docker node ps "$SWARM_NODE_ID" --filter "desired-state=running" --format '{{.Name}}' 2>/dev/null | wc -l)
-                if [ "$TASKS" -gt 0 ]; then
+                # Run the query separately so its failure is distinguishable
+                # from "no tasks left". Piping straight into `wc -l` reports 0
+                # when docker errors, which reads as "all tasks migrated" and
+                # would wave the operator past a drain that never happened.
+                if TASK_LIST=$(docker node ps "$SWARM_NODE_ID" --filter "desired-state=running" --format '{{.Name}}' 2>/dev/null); then
+                    TASKS=$(printf '%s' "$TASK_LIST" | grep -c . || true)
+                else
+                    echo -e "${YELLOW}WARNING: could not query tasks on this node.${NC}"
+                    echo "Cannot confirm the drain completed. Check from a manager:"
+                    echo "  docker node ps $SWARM_NODE_ID"
+                    TASKS="unknown"
+                fi
+                # "unknown" must be handled before the numeric test: `[ unknown
+                # -gt 0 ]` errors with status 2, and inside an `if` that falls
+                # through to the success branch -- reporting "all tasks
+                # migrated" precisely when we could not tell.
+                if [ "$TASKS" = "unknown" ]; then
+                    if ! prompt_yes_no "Continue with upgrade anyway? [y/N]" "n"; then
+                        echo "Aborting. Confirm the drain from a manager and re-run."
+                        exit 1
+                    fi
+                elif [ "$TASKS" -gt 0 ]; then
                     echo "Tasks still on this node: $TASKS"
-                    docker node ps "$SWARM_NODE_ID" --filter "desired-state=running"
+                    docker node ps "$SWARM_NODE_ID" --filter "desired-state=running" || true
                     echo ""
                     if ! prompt_yes_no "Continue with upgrade anyway? [y/N]" "n"; then
                         echo "Aborting. Please wait for tasks to migrate and re-run."

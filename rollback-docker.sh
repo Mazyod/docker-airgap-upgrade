@@ -122,6 +122,31 @@ trap 'exit 143' TERM
 # Helper Functions
 #############################################
 
+prompt_yes_no() {
+    local prompt="$1"
+    local default="$2"
+    local response
+
+    while true; do
+        # EOF is not an answer. Without this, a non-interactive run (ssh
+        # without -t, a wrapper, cron) makes `read` fail, leaves response
+        # empty, and silently applies the default to EVERY prompt -- including
+        # ones that default to yes.
+        if ! read -r -p "$prompt " response; then
+            echo "" >&2
+            echo "ERROR: stdin closed - cannot read an answer." >&2
+            echo "These scripts are interactive; run them on a terminal." >&2
+            exit 1
+        fi
+        response=${response:-$default}
+        case "$response" in
+            [Yy]|[Yy][Ee][Ss]) return 0 ;;
+            [Nn]|[Nn][Oo]) return 1 ;;
+            *) echo "Please answer yes or no." ;;
+        esac
+    done
+}
+
 # Confirm a unit is CONCLUSIVELY stopped.
 #
 # `systemctl is-active` is not sufficient: it returns nonzero for `activating`,

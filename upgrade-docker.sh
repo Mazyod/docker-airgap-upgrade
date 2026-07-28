@@ -1,19 +1,16 @@
 #!/bin/bash
 # upgrade-docker.sh
-# Run on each AIR-GAPPED server to upgrade Docker 28.5.1 → 29.1.5
-VERSION="1.2.3"
+# Run on each AIR-GAPPED server to upgrade Docker 29.1.5 → 29.6.2
+VERSION="2.0.0"
 #
 # Prerequisites:
-# - Extract docker-offline-packages.tar.gz to /opt/
+# - Extract docker-upgrade-bundle.tar.gz to /opt/
 #
 # This script handles:
 # - Docker Swarm detection and node drain/activate
 # - Automatic RHEL version detection (8 or 9)
 # - Proper service stop/start order (containerd before docker)
 # - Direct RPM installation (no network required)
-# - Orphaned VXLAN/network cleanup (prevents service binding errors)
-# - XFS ftype=1 validation for containerd (with interactive fix)
-# - containerd config migration (1.7 → 2.2)
 # - NVIDIA toolkit upgrade (if already installed)
 # - Comprehensive verification
 #
@@ -21,9 +18,30 @@ VERSION="1.2.3"
 # to avoid SSL certificate issues with corporate satellite servers
 # (e.g., "SSL certificate problem: EE certificate key too weak")
 #
-# NOTE: containerd 2.x requires XFS filesystems to have ftype=1.
-# If /var/lib/containerd is on XFS with ftype=0, you will be prompted
-# to provide an alternative path on a compatible filesystem.
+# SCOPE OF THIS VERSION (2.0.0)
+#
+# This upgrade stays inside the containerd 2.2.x line (2.2.1 -> 2.2.6). It is
+# NOT the 28.5.1 -> 29.1.5 migration this script originally performed, which
+# crossed the containerd 1.7 -> 2.x major boundary. Three things that boundary
+# required have been removed, because inside 2.2.x they range from inert to
+# actively harmful:
+#
+#   - Phase 4.5, orphaned VXLAN/network cleanup. Extracted to the standalone
+#     clean-swarm-networks.sh. The daemon now stops cleanly, so there is no
+#     orphaned state to collect; running the wipe anyway just forces an
+#     unnecessary overlay reconvergence. Run that script on demand if a node
+#     comes back unable to attach to overlay networks.
+#
+#   - XFS ftype=1 validation and the interactive containerd-root relocation
+#     prompt. Any node already running containerd 2.x has satisfied the ftype
+#     requirement; the check cannot fire usefully here.
+#
+#   - containerd config regeneration. 2.2.1 and 2.2.6 share config v3, so there
+#     is nothing to migrate, and regenerating would DISCARD a relocated root
+#     path, registry mirrors, and runtime config. Phase 6 now verifies instead.
+#
+# All three are preserved in git history at upgrade-docker.sh v1.2.3 (commit
+# 974683a) should a future containerd MAJOR upgrade need them back.
 
 set -e
 
@@ -37,11 +55,131 @@ NC='\033[0m' # No Color
 exec > >(tee -a /var/log/docker-upgrade.log) 2>&1
 
 echo "=========================================="
-echo "Docker Upgrade: 28.5.1 → 29.1.5"
+echo "Docker Upgrade: 29.1.5 → 29.6.2"
 echo "Script Version: $VERSION"
 echo "Server: $(hostname)"
 echo "Date: $(date)"
 echo "=========================================="
+
+#############################################
+# Failure Handling
+#############################################
+# `set -e` means any unhandled failure exits immediately. From phase 4 onward
+# that leaves docker and containerd stopped, and the operator -- on a box with
+# no internet -- gets a bare shell prompt and no idea what state the node is in.
+#
+# This does NOT auto-restart services. Once the RPM transaction has run, whether
+# to retry or roll back is a judgement call that depends on why it failed, and
+# guessing wrong is worse than stopping. It tells the operator exactly where it
+# broke and what their options are.
+CURRENT_PHASE="startup"
+SERVICES_STOPPED=false
+
+# Service state and package state are tracked SEPARATELY. Conflating them
+# produces the two worst possible messages: telling an operator the node is
+# unchanged when packages were in fact replaced, or telling them the original
+# packages are intact when an rpm transaction died halfway through one.
+#
+#   untouched  - rpm has not been invoked
+#   attempted  - rpm was invoked; outcome unknown, host state may be partial
+#   installed  - rpm returned success
+PKG_STATE="untouched"
+
+# shellcheck disable=SC2329  # invoked indirectly by `trap on_exit EXIT` below
+on_exit() {
+    local rc=$?
+    [ "$rc" -eq 0 ] && exit 0
+
+    echo ""
+    echo -e "${RED}==========================================${NC}"
+    echo -e "${RED}UPGRADE FAILED during: $CURRENT_PHASE (exit $rc)${NC}"
+    echo -e "${RED}==========================================${NC}"
+    echo ""
+
+    if [ "$SERVICES_STOPPED" = true ]; then
+        echo "Services:  STOPPED - this node is DOWN"
+    else
+        echo "Services:  running (or never stopped by this script)"
+    fi
+
+    case "$PKG_STATE" in
+        untouched)
+            echo "Packages:  UNCHANGED - rpm was never run"
+            ;;
+        attempted)
+            echo -e "Packages:  ${RED}UNKNOWN - the rpm transaction did not complete cleanly${NC}"
+            ;;
+        installed)
+            echo "Packages:  NEW packages installed successfully"
+            ;;
+    esac
+
+    echo ""
+    echo "Check what is actually installed before doing anything:"
+    echo "  rpm -q docker-ce docker-ce-cli containerd.io"
+    echo "  journalctl -u containerd --no-pager -n 100"
+    echo "  journalctl -u docker --no-pager -n 100"
+    echo ""
+
+    if [ "$SERVICES_STOPPED" = true ]; then
+        case "$PKG_STATE" in
+            untouched)
+                echo "The node still has its original packages. Bring it back with:"
+                echo "  systemctl start containerd"
+                echo "  sleep 5"
+                echo "  systemctl start docker"
+                ;;
+            attempted)
+                echo -e "${YELLOW}Do NOT assume either version is fully installed.${NC}"
+                echo "Confirm the installed versions first, then choose:"
+                echo "  a) Re-run this script (it is safe to re-run from the top)"
+                echo "  b) Roll back:  /opt/docker-offline/rollback-docker.sh"
+                ;;
+            installed)
+                echo "Choose one:"
+                echo "  a) Start services:  systemctl start containerd && sleep 5 && systemctl start docker"
+                echo "  b) Roll back:       /opt/docker-offline/rollback-docker.sh"
+                ;;
+        esac
+    elif [ "$PKG_STATE" != "untouched" ]; then
+        echo "Services are up but the upgrade did not finish cleanly."
+        echo "Verify the versions above match what you expect before returning"
+        echo "this node to service."
+    fi
+
+    echo ""
+    echo "Backup: ${BACKUP_DIR:-<none created yet>}"
+    echo "Log:    /var/log/docker-upgrade.log"
+
+    if [ "$SWARM_ACTIVE" = true ] && [ -n "$SWARM_NODE_ID" ]; then
+        echo ""
+        echo -e "${YELLOW}This node may still be DRAINED in the Swarm.${NC}"
+        echo "Once it is healthy, reactivate it from a manager:"
+        echo "  docker node update --availability active $SWARM_NODE_ID"
+    fi
+    echo "=========================================="
+    exit "$rc"
+}
+trap on_exit EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
+#############################################
+# Expected package versions
+#############################################
+# Asserted against RPM metadata in phase 0, not against filenames. Renaming a
+# file, or extracting the PREVIOUS bundle (which has an identical directory
+# layout), must not be able to reach "UPGRADE COMPLETE" without these versions
+# actually being installed.
+#
+# Keep in sync with download-docker-packages.sh, rollback-docker.sh,
+# simulate-upgrade.sh and README.md -- see CLAUDE.md.
+EXPECTED_DOCKER_VERSION="29.6.2"
+EXPECTED_CONTAINERD_VERSION="2.2.6"
+
+# Packages permitted in the upgrade directory. buildx and compose version
+# independently of docker-ce and are deliberately not pinned.
+ALLOWED_PKGS="docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin"
 
 #############################################
 # Helper Functions
@@ -53,7 +191,7 @@ prompt_yes_no() {
     local response
 
     while true; do
-        read -p "$prompt " response
+        read -r -p "$prompt " response
         response=${response:-$default}
         case "$response" in
             [Yy]|[Yy][Ee][Ss]) return 0 ;;
@@ -63,58 +201,12 @@ prompt_yes_no() {
     done
 }
 
-check_xfs_ftype() {
-    local path="$1"
-    local check_path="$path"
-
-    # Find an existing path to check (walk up if needed)
-    while [ ! -e "$check_path" ] && [ "$check_path" != "/" ]; do
-        check_path=$(dirname "$check_path")
-    done
-
-    # Get mount point using findmnt (more reliable than parsing df)
-    local mount_point
-    mount_point=$(findmnt -n -o TARGET --target "$check_path" 2>/dev/null)
-
-    # Fallback to df if findmnt not available
-    if [ -z "$mount_point" ]; then
-        mount_point=$(df "$check_path" 2>/dev/null | tail -1 | awk '{print $NF}')
-    fi
-
-    if [ -z "$mount_point" ]; then
-        echo "unknown:no_mount"
-        return
-    fi
-
-    # Check filesystem type
-    local fs_type
-    fs_type=$(findmnt -n -o FSTYPE --target "$check_path" 2>/dev/null)
-    if [ -z "$fs_type" ]; then
-        fs_type=$(df -T "$check_path" 2>/dev/null | tail -1 | awk '{print $2}')
-    fi
-
-    if [ "$fs_type" != "xfs" ]; then
-        echo "ok:$fs_type"
-        return
-    fi
-
-    # Check ftype for XFS - xfs_info ONLY works on mount point
-    local ftype
-    ftype=$(xfs_info "$mount_point" 2>/dev/null | grep -oP 'ftype=\K[0-9]')
-
-    # Fallback grep if -P not supported
-    if [ -z "$ftype" ]; then
-        ftype=$(xfs_info "$mount_point" 2>/dev/null | grep -o "ftype=[0-9]" | cut -d= -f2)
-    fi
-
-    if [ "$ftype" = "1" ]; then
-        echo "ok:xfs:ftype=1:$mount_point"
-    elif [ "$ftype" = "0" ]; then
-        echo "bad:xfs:ftype=0:$mount_point"
-    else
-        echo "unknown:xfs:$mount_point"
-    fi
-}
+# NOTE: check_xfs_ftype() lived here. It validated that containerd's root was
+# on a filesystem with XFS ftype=1 and offered an interactive relocation when
+# it was not. That requirement arrives with containerd 2.x, so it mattered when
+# this script crossed 1.7 -> 2.x. Any node running 2.2.1 today has already
+# satisfied it. Recover it from upgrade-docker.sh v1.2.3 (commit 974683a) if a
+# future containerd major upgrade needs it again.
 
 wait_for_services() {
     local max_wait=60
@@ -123,7 +215,30 @@ wait_for_services() {
     echo "Waiting for Swarm services to stabilize..."
     while [ $waited -lt $max_wait ]; do
         local pending
-        pending=$(docker service ls --format '{{.Replicas}}' 2>/dev/null | grep -v "0/0" | grep -c "/0" || echo "0")
+        # `docker service ls` renders .Replicas as running/desired, so a service
+        # that has not converged looks like 0/1 or 1/3. The previous
+        # `grep -v "0/0" | grep -c "/0"` counted services whose DESIRED count
+        # was zero, which is not the question being asked and matched nothing in
+        # practice; a second bug (`|| echo "0"` appending a duplicate zero when
+        # grep found no match) masked it by forcing the full 60s wait.
+        #
+        # Count rows where running != desired -- the actual definition of
+        # "not yet converged".
+        #
+        # `docker service ls` is run on its own first: piping it straight into
+        # awk without pipefail means a FAILED docker command feeds awk nothing,
+        # awk prints 0, and "no services" becomes indistinguishable from "all
+        # converged". Keep waiting instead of declaring victory blindly.
+        local replicas
+        if ! replicas=$(docker service ls --format '{{.Replicas}}' 2>/dev/null); then
+            echo "  Waiting: 'docker service ls' not answering yet... ($waited/$max_wait seconds)"
+            sleep 5
+            waited=$((waited + 5))
+            continue
+        fi
+
+        pending=$(printf '%s' "$replicas" | awk -F/ 'NF == 2 && $1 != $2 { n++ } END { print n+0 }')
+        pending=${pending:-0}
 
         if [ "$pending" = "0" ]; then
             echo "All services are running."
@@ -150,7 +265,7 @@ PKG_DIR="/opt/docker-offline/rhel${RHEL_VER}"
 
 if [ ! -d "$PKG_DIR" ]; then
     echo -e "${RED}ERROR: Package directory not found: $PKG_DIR${NC}"
-    echo "Please extract docker-offline-packages.tar.gz to /opt/"
+    echo "Please extract docker-upgrade-bundle.tar.gz to /opt/"
     exit 1
 fi
 
@@ -165,14 +280,191 @@ if rpm -q nvidia-container-toolkit &>/dev/null; then
 fi
 
 #############################################
+# Phase 0: Validate Package Payload
+#############################################
+# Runs BEFORE the Swarm drain in phase 1 and before services stop in phase 4.
+# Everything that can be checked without touching the node is checked here, so
+# a bad bundle fails while the node is still serving traffic AND still active
+# in the Swarm. A failure below leaves the node genuinely untouched.
+echo ""
+echo "=== Phase 0: Validate Package Payload ==="
+CURRENT_PHASE="phase 0 (validate packages)"
+
+echo "Validating packages in $PKG_DIR..."
+
+shopt -s nullglob
+PKG_FILES=("$PKG_DIR"/*.rpm)
+shopt -u nullglob
+
+if [ "${#PKG_FILES[@]}" -eq 0 ]; then
+    echo -e "${RED}ERROR: No .rpm files found in $PKG_DIR${NC}"
+    echo "The bundle is empty or was extracted to the wrong location."
+    exit 1
+fi
+echo "  Found ${#PKG_FILES[@]} package(s)"
+
+# Digest check (--nosignature): a NOKEY signature result on a host that never
+# imported Docker's GPG key is not corruption, but a bad digest is.
+PKG_ERRORS=0
+for rpmfile in "${PKG_FILES[@]}"; do
+    if ! rpm -K --nosignature "$rpmfile" >/dev/null 2>&1; then
+        echo -e "${RED}  ERROR: ${rpmfile##*/} failed digest verification${NC}"
+        PKG_ERRORS=$((PKG_ERRORS + 1))
+    fi
+done
+
+# Assert on RPM METADATA, never on filenames. The previous bundle has the same
+# directory layout and the same filename shapes, so a filename check would let
+# an operator "upgrade" 29.1.5 -> 29.1.5 and be told it succeeded.
+echo ""
+echo "  Package inventory:"
+FOUND_DOCKER_CE=""
+FOUND_DOCKER_CLI=""
+FOUND_CONTAINERD=""
+HOST_ARCH=$(uname -m)
+SEEN_NAMES=""
+
+for rpmfile in "${PKG_FILES[@]}"; do
+    meta=$(rpm -qp --queryformat '%{NAME} %{VERSION} %{RELEASE} %{ARCH}' "$rpmfile" 2>/dev/null || true)
+    if [ -z "$meta" ]; then
+        echo -e "${RED}    ERROR: ${rpmfile##*/} is not a readable RPM${NC}"
+        PKG_ERRORS=$((PKG_ERRORS + 1))
+        continue
+    fi
+
+    read -r p_name p_ver p_rel p_arch <<< "$meta"
+    echo "    $p_name $p_ver-$p_rel.$p_arch"
+
+    case " $ALLOWED_PKGS " in
+        *" $p_name "*) ;;
+        *)
+            echo -e "${RED}    ERROR: unexpected package '$p_name' in upgrade dir${NC}"
+            PKG_ERRORS=$((PKG_ERRORS + 1))
+            continue
+            ;;
+    esac
+
+    # Two copies of the same package is the failure mode you get by extracting
+    # a new bundle OVER an old /opt/docker-offline. Both would be handed to
+    # rpm, and the version assertion below -- being a scalar -- would only
+    # remember whichever was seen last. Reject it outright.
+    case " $SEEN_NAMES " in
+        *" $p_name "*)
+            echo -e "${RED}    ERROR: duplicate $p_name in $PKG_DIR${NC}"
+            echo "           Remove the directory and re-extract the bundle cleanly."
+            PKG_ERRORS=$((PKG_ERRORS + 1))
+            continue
+            ;;
+    esac
+    SEEN_NAMES="$SEEN_NAMES $p_name"
+
+    if [ "$p_arch" != "$HOST_ARCH" ] && [ "$p_arch" != "noarch" ]; then
+        echo -e "${RED}    ERROR: $p_name is $p_arch, host is $HOST_ARCH${NC}"
+        PKG_ERRORS=$((PKG_ERRORS + 1))
+        continue
+    fi
+
+    # RELEASE carries the RHEL major (e.g. "1.el9"). Without this, an el8 RPM
+    # sitting in the rhel9 directory passes name/version/arch checks cleanly.
+    case "$p_rel" in
+        *".el${RHEL_VER}"*) ;;
+        *)
+            echo -e "${RED}    ERROR: $p_name release '$p_rel' is not el${RHEL_VER}${NC}"
+            PKG_ERRORS=$((PKG_ERRORS + 1))
+            continue
+            ;;
+    esac
+
+    case "$p_name" in
+        docker-ce)      FOUND_DOCKER_CE="$p_ver" ;;
+        docker-ce-cli)  FOUND_DOCKER_CLI="$p_ver" ;;
+        containerd.io)  FOUND_CONTAINERD="$p_ver" ;;
+    esac
+done
+
+check_version() {
+    local label="$1" found="$2" want="$3"
+    if [ -z "$found" ]; then
+        echo -e "${RED}  ERROR: no $label package found in $PKG_DIR${NC}"
+        PKG_ERRORS=$((PKG_ERRORS + 1))
+    elif [ "$found" != "$want" ]; then
+        echo -e "${RED}  ERROR: $label is $found, expected $want${NC}"
+        echo "         This looks like the wrong bundle for this upgrade."
+        PKG_ERRORS=$((PKG_ERRORS + 1))
+    else
+        echo -e "  ${GREEN}✓ $label $found${NC}"
+    fi
+}
+
+echo ""
+check_version "docker-ce"     "$FOUND_DOCKER_CE"  "$EXPECTED_DOCKER_VERSION"
+check_version "docker-ce-cli" "$FOUND_DOCKER_CLI" "$EXPECTED_DOCKER_VERSION"
+check_version "containerd.io" "$FOUND_CONTAINERD" "$EXPECTED_CONTAINERD_VERSION"
+
+if [ "$PKG_ERRORS" -gt 0 ]; then
+    echo ""
+    echo -e "${RED}ERROR: $PKG_ERRORS problem(s) with the package payload.${NC}"
+    echo "Nothing on this node has been changed. Re-transfer the correct bundle:"
+    echo "  expected docker-ce $EXPECTED_DOCKER_VERSION, containerd.io $EXPECTED_CONTAINERD_VERSION"
+    exit 1
+fi
+
+# Dry-run the exact transaction phase 5 will perform, while services are still
+# running and the node is still in the Swarm. rpm refusing the set -- for an
+# unsatisfiable dependency, a conflict, a disk-space shortfall -- is something
+# to discover now, not after phase 4 has taken the node down.
+echo ""
+echo "Dry-running the upgrade transaction..."
+if ! rpm -Uvh --test --force "${PKG_FILES[@]}" 2>&1; then
+    echo ""
+    echo -e "${RED}ERROR: rpm rejected the upgrade transaction (dry run).${NC}"
+    echo "Nothing on this node has been changed. The output above says why."
+    echo ""
+    echo "Common causes: unsatisfied dependency, or insufficient space in /var."
+    echo "  df -h /var /usr"
+    exit 1
+fi
+echo -e "${GREEN}Transaction dry run passed.${NC}"
+
+echo -e "${GREEN}Package payload validated.${NC}"
+
+# If the node is ALREADY fully at the target, offer to skip. All three core
+# packages must match: a previous attempt that got docker-ce to 29.6.2 but left
+# containerd.io at 2.2.1 is exactly the node that most needs this run to
+# proceed, and checking docker-ce alone would wave it through.
+CURRENT_DOCKER=$(rpm -q docker-ce --queryformat '%{VERSION}' 2>/dev/null || echo "")
+CURRENT_DOCKER_CLI=$(rpm -q docker-ce-cli --queryformat '%{VERSION}' 2>/dev/null || echo "")
+CURRENT_CONTAINERD=$(rpm -q containerd.io --queryformat '%{VERSION}' 2>/dev/null || echo "")
+
+if [ "$CURRENT_DOCKER" = "$EXPECTED_DOCKER_VERSION" ] &&
+   [ "$CURRENT_DOCKER_CLI" = "$EXPECTED_DOCKER_VERSION" ] &&
+   [ "$CURRENT_CONTAINERD" = "$EXPECTED_CONTAINERD_VERSION" ]; then
+    echo ""
+    echo -e "${YELLOW}NOTE: this node is already fully at the target versions:${NC}"
+    echo "  docker-ce $CURRENT_DOCKER, docker-ce-cli $CURRENT_DOCKER_CLI,"
+    echo "  containerd.io $CURRENT_CONTAINERD"
+    if ! prompt_yes_no "Re-run the upgrade anyway? [y/N]" "n"; then
+        echo "Nothing to do. Exiting without changes."
+        exit 0
+    fi
+elif [ -n "$CURRENT_DOCKER" ] && [ "$CURRENT_DOCKER" = "$EXPECTED_DOCKER_VERSION" ]; then
+    echo ""
+    echo -e "${YELLOW}NOTE: docker-ce is already $EXPECTED_DOCKER_VERSION but the other${NC}"
+    echo -e "${YELLOW}core packages are not - this looks like a partial upgrade.${NC}"
+    echo "  docker-ce-cli: ${CURRENT_DOCKER_CLI:-absent} (want $EXPECTED_DOCKER_VERSION)"
+    echo "  containerd.io: ${CURRENT_CONTAINERD:-absent} (want $EXPECTED_CONTAINERD_VERSION)"
+    echo "Proceeding to complete it."
+fi
+
+#############################################
 # Phase 1: Docker Swarm Detection & Drain
 #############################################
 echo ""
 echo "=== Phase 1: Docker Swarm Check ==="
+CURRENT_PHASE="phase 1 (swarm drain)"
 
 SWARM_ACTIVE=false
 SWARM_NODE_ID=""
-SWARM_WAS_ACTIVE=false
 IS_MANAGER=false
 
 if docker info --format '{{.Swarm.LocalNodeState}}' 2>/dev/null | grep -q "active"; then
@@ -198,8 +490,6 @@ if docker info --format '{{.Swarm.LocalNodeState}}' 2>/dev/null | grep -q "activ
     fi
 
     if [ "$NODE_AVAILABILITY" = "active" ] || [ "$NODE_AVAILABILITY" = "unknown" ]; then
-        SWARM_WAS_ACTIVE=true
-
         if [ "$IS_MANAGER" = true ]; then
             # Manager can drain itself
             echo ""
@@ -264,6 +554,7 @@ fi
 #############################################
 echo ""
 echo "=== Phase 2: Pre-upgrade Verification ==="
+CURRENT_PHASE="phase 2 (pre-upgrade checks)"
 
 # Check dnf state for corruption
 echo "Checking dnf state..."
@@ -282,11 +573,13 @@ echo "Service status:"
 systemctl is-active docker 2>/dev/null && echo "  docker: running" || echo "  docker: not running"
 systemctl is-active containerd 2>/dev/null && echo "  containerd: running" || echo "  containerd: not running"
 
+
 #############################################
 # Phase 3: Backup
 #############################################
 echo ""
 echo "=== Phase 3: Backup ==="
+CURRENT_PHASE="phase 3 (backup)"
 BACKUP_DIR="/root/docker-backup-$(date +%Y%m%d-%H%M%S)"
 mkdir -p "$BACKUP_DIR"
 
@@ -306,6 +599,11 @@ echo "Backup saved to: $BACKUP_DIR"
 #############################################
 echo ""
 echo "=== Phase 4: Stop Services ==="
+CURRENT_PHASE="phase 4 (stop services)"
+
+# Armed before the first stop so the EXIT trap reports accurate state if
+# anything below fails.
+SERVICES_STOPPED=true
 
 # Stop docker first
 echo "Stopping docker..."
@@ -317,158 +615,111 @@ echo "Stopping containerd..."
 systemctl stop containerd 2>/dev/null || true
 sleep 2
 
-echo "Services stopped."
+# Verify rather than assume. Replacing packages under a live daemon turns a
+# routine upgrade into an unrecoverable one. docker.socket is checked too: if
+# it survives while dockerd is down, anything that touches the socket
+# socket-activates dockerd again, mid-transaction.
+STILL_UP=""
+systemctl is-active docker        &>/dev/null && STILL_UP="$STILL_UP docker"
+systemctl is-active docker.socket &>/dev/null && STILL_UP="$STILL_UP docker.socket"
+systemctl is-active containerd    &>/dev/null && STILL_UP="$STILL_UP containerd"
 
-#############################################
-# Phase 4.5: Clean Orphaned Networks (Swarm)
-#############################################
-if [ "$SWARM_ACTIVE" = true ]; then
-    echo ""
-    echo "=== Phase 4.5: Clean Orphaned Networks ==="
-
-    # Detect Docker data root from daemon.json
-    DOCKER_DATA_ROOT="/var/lib/docker"
-    if [ -f /etc/docker/daemon.json ]; then
-        CUSTOM_ROOT=$(grep -oP '"data-root"\s*:\s*"\K[^"]+' /etc/docker/daemon.json 2>/dev/null || true)
-        if [ -n "$CUSTOM_ROOT" ]; then
-            DOCKER_DATA_ROOT="$CUSTOM_ROOT"
-            echo "Detected custom Docker data root: $DOCKER_DATA_ROOT"
-        fi
-    fi
-
-    # Remove orphaned VXLAN interfaces (they get recreated by swarm)
-    echo "Removing orphaned VXLAN interfaces..."
-    VXLAN_COUNT=0
-    for iface in $(ip -o link show type vxlan 2>/dev/null | awk -F': ' '{print $2}'); do
-        ip link del "$iface" 2>/dev/null && ((VXLAN_COUNT++)) || true
-    done
-    echo "  Removed $VXLAN_COUNT VXLAN interface(s)"
-
-    # Clean overlay network namespaces
-    echo "Cleaning Docker network namespaces..."
-    rm -rf /var/run/docker/netns/* 2>/dev/null || true
-
-    # Clean the local network database (prevents service binding errors)
-    echo "Cleaning local network database..."
-    rm -f "$DOCKER_DATA_ROOT/network/files/local-kv.db" 2>/dev/null || true
-
-    # Remove docker_gwbridge if it exists (will be recreated)
-    echo "Removing docker_gwbridge..."
-    ip link del docker_gwbridge 2>/dev/null || true
-
-    echo -e "${GREEN}Network cleanup complete.${NC}"
+if [ -n "$STILL_UP" ]; then
+    echo -e "${RED}ERROR: still active after stop:$STILL_UP${NC}"
+    echo "Refusing to replace packages under a running daemon."
+    echo "Investigate with: systemctl status$STILL_UP"
+    exit 1
 fi
+
+echo "Services confirmed stopped."
+
+# NOTE: Phase 4.5, orphaned VXLAN/network cleanup, lived here and ran on every
+# Swarm node. It is now the standalone clean-swarm-networks.sh, run on demand.
+# The phase number is intentionally left vacant so phases 5-10 keep the
+# identities they have in the runbook and in the logs of prior upgrades.
 
 #############################################
 # Phase 5: Upgrade Packages (Direct RPM)
 #############################################
 echo ""
 echo "=== Phase 5: Upgrade Packages ==="
+CURRENT_PHASE="phase 5 (rpm upgrade)"
 
 # Use direct rpm installation - no network required, avoids SSL issues
-# with corporate satellite servers
-cd "$PKG_DIR"
+# with corporate satellite servers.
+#
+# PKG_FILES was populated and digest-verified in phase 2. Using the array
+# rather than re-globbing means this cannot silently install a different set
+# than the one that was validated, and cannot pass a literal "*.rpm" to rpm if
+# the directory turns up empty.
 echo "Installing packages from: $PKG_DIR"
-ls -la *.rpm
+printf '  %s\n' "${PKG_FILES[@]##*/}"
 
 echo "Running rpm upgrade..."
-rpm -Uvh --force *.rpm
+
+# Marked BEFORE the call, not after. An rpm transaction that fails partway --
+# a scriptlet error, or a SIGINT mid-transaction -- can leave the host changed
+# while still returning nonzero. Setting this afterwards would have the trap
+# confidently report "original packages intact" over a half-migrated node.
+PKG_STATE="attempted"
+rpm -Uvh --force "${PKG_FILES[@]}"
+PKG_STATE="installed"
 
 echo -e "${GREEN}Packages upgraded.${NC}"
 
 #############################################
-# Phase 6: Configure containerd
+# Phase 6: Verify containerd Config
 #############################################
 echo ""
-echo "=== Phase 6: Configure containerd ==="
+echo "=== Phase 6: Verify containerd Config ==="
+CURRENT_PHASE="phase 6 (containerd config)"
 
-# Generate default config for containerd 2.x
-echo "Generating containerd 2.x configuration..."
-containerd config default > /etc/containerd/config.toml
+# containerd 2.2.1 and 2.2.6 share config v3 -- there is nothing to migrate.
+#
+# This phase deliberately does NOT run `containerd config default`. Doing so
+# overwrites the file, discarding a relocated `root` path, registry mirrors,
+# and runtime configuration. A node whose containerd root was moved during the
+# 1.7 -> 2.x upgrade would be silently repointed at an empty
+# /var/lib/containerd, orphaning every image and snapshot it holds.
+#
+# Config validity is proven downstream rather than here: phase 8 polls
+# `ctr version` and the overlayfs snapshotter, and neither responds if the
+# config is malformed.
 
-# Get current containerd root from config (handles both single and double quotes)
-CONTAINERD_ROOT=$(grep -E "^root\s*=" /etc/containerd/config.toml | head -1 | sed "s/.*=\s*['\"]\\(.*\\)['\"]/\\1/")
+CONTAINERD_CONF="/etc/containerd/config.toml"
+
+if [ ! -f "$CONTAINERD_CONF" ]; then
+    echo -e "${YELLOW}No $CONTAINERD_CONF found - generating a default.${NC}"
+    mkdir -p /etc/containerd
+    containerd config default > "$CONTAINERD_CONF"
+    echo "Default configuration written."
+else
+    echo "Existing configuration preserved (backed up in $BACKUP_DIR)."
+fi
+
+# rpm keeps %config(noreplace) files in place and drops the package's version
+# alongside as .rpmnew. Surface it -- an operator with no internet needs to be
+# told the new default exists rather than discovering it months later.
+if [ -f "${CONTAINERD_CONF}.rpmnew" ]; then
+    echo ""
+    echo -e "${YELLOW}NOTE: ${CONTAINERD_CONF}.rpmnew exists.${NC}"
+    echo "The package shipped a new default config; yours was kept. Compare later with:"
+    echo "  diff -u $CONTAINERD_CONF ${CONTAINERD_CONF}.rpmnew"
+fi
+
+# Read the configured root, for reporting and to ensure the directory exists.
+# Generated configs single-quote paths, hand-edited ones may double-quote or
+# leave bare, so accept all three.
+CONTAINERD_ROOT=$(sed -n "s/^root[[:space:]]*=[[:space:]]*['\"]\{0,1\}\([^'\"]*\)['\"]\{0,1\}.*/\1/p" \
+    "$CONTAINERD_CONF" 2>/dev/null | head -1)
 CONTAINERD_ROOT=${CONTAINERD_ROOT:-/var/lib/containerd}
 
 echo "containerd root directory: $CONTAINERD_ROOT"
 
-# Check XFS ftype for containerd root
-echo "Checking filesystem compatibility..."
-FTYPE_CHECK=$(check_xfs_ftype "$CONTAINERD_ROOT")
-
-if [[ "$FTYPE_CHECK" == bad:* ]]; then
-    echo ""
-    echo -e "${RED}=========================================="
-    echo "WARNING: XFS FILESYSTEM ISSUE DETECTED"
-    echo "==========================================${NC}"
-    echo ""
-    echo "The containerd root directory ($CONTAINERD_ROOT) is on an XFS"
-    echo "filesystem with ftype=0. containerd 2.x requires ftype=1."
-    echo ""
-    echo "This will cause container startup failures!"
-    echo ""
-
-    # Find filesystems with ftype=1
-    echo "Scanning for compatible filesystems..."
-    echo ""
-
-    while true; do
-        read -p "Enter an alternative path for containerd root (e.g., /data/containerd): " NEW_CONTAINERD_ROOT
-
-        if [ -z "$NEW_CONTAINERD_ROOT" ]; then
-            echo "Path cannot be empty."
-            continue
-        fi
-
-        # Check if parent directory exists or can be created
-        PARENT_DIR=$(dirname "$NEW_CONTAINERD_ROOT")
-        if [ ! -d "$PARENT_DIR" ]; then
-            echo -e "${YELLOW}Parent directory $PARENT_DIR does not exist.${NC}"
-            if ! prompt_yes_no "Create it? [Y/n]" "y"; then
-                continue
-            fi
-            mkdir -p "$PARENT_DIR"
-        fi
-
-        # Check ftype of new path
-        NEW_FTYPE_CHECK=$(check_xfs_ftype "$PARENT_DIR")
-
-        if [[ "$NEW_FTYPE_CHECK" == bad:* ]]; then
-            echo -e "${RED}ERROR: $NEW_CONTAINERD_ROOT is also on XFS with ftype=0.${NC}"
-            echo "Please choose a different path."
-            continue
-        fi
-
-        echo -e "${GREEN}Filesystem check passed: $NEW_FTYPE_CHECK${NC}"
-
-        # Create the directory
-        mkdir -p "$NEW_CONTAINERD_ROOT"
-
-        # Update containerd config (config uses single quotes)
-        echo "Updating containerd configuration..."
-        sed -i "s|^root = .*|root = '$NEW_CONTAINERD_ROOT'|" /etc/containerd/config.toml
-
-        # Verify the change was applied
-        NEW_ROOT_CHECK=$(grep -E "^root\s*=" /etc/containerd/config.toml | head -1)
-        echo "Updated config: $NEW_ROOT_CHECK"
-
-        if ! echo "$NEW_ROOT_CHECK" | grep -q "$NEW_CONTAINERD_ROOT"; then
-            echo -e "${RED}ERROR: Failed to update containerd config!${NC}"
-            echo "Please manually edit /etc/containerd/config.toml"
-            echo "Change: root = '/var/lib/containerd'"
-            echo "To:     root = '$NEW_CONTAINERD_ROOT'"
-            exit 1
-        fi
-
-        CONTAINERD_ROOT="$NEW_CONTAINERD_ROOT"
-        break
-    done
-else
-    echo -e "${GREEN}Filesystem check passed: $FTYPE_CHECK${NC}"
+if [ ! -d "$CONTAINERD_ROOT" ]; then
+    echo -e "${YELLOW}NOTE: $CONTAINERD_ROOT does not exist - creating it.${NC}"
+    mkdir -p "$CONTAINERD_ROOT"
 fi
-
-# Ensure containerd root exists
-mkdir -p "$CONTAINERD_ROOT"
 
 #############################################
 # Phase 7: Handle NVIDIA Toolkit (if present)
@@ -476,11 +727,34 @@ mkdir -p "$CONTAINERD_ROOT"
 if [ "$NVIDIA_INSTALLED" = true ]; then
     echo ""
     echo "=== Phase 7: Upgrade NVIDIA Container Toolkit ==="
+CURRENT_PHASE="phase 7 (nvidia toolkit)"
 
     NVIDIA_DIR="/opt/docker-offline/nvidia"
-    if [ -d "$NVIDIA_DIR" ] && ls "$NVIDIA_DIR"/*.rpm &>/dev/null; then
-        cd "$NVIDIA_DIR"
 
+    shopt -s nullglob
+    NVIDIA_FILES=("$NVIDIA_DIR"/*.rpm)
+    shopt -u nullglob
+
+    if [ "${#NVIDIA_FILES[@]}" -gt 0 ]; then
+        # These were not covered by phase 0 (that validates the engine payload
+        # only). Check digests here so a truncated NVIDIA RPM is named rather
+        # than surfacing as an opaque rpm failure. NVIDIA is best-effort, so a
+        # corrupt package skips the toolkit upgrade instead of aborting the run.
+        NVIDIA_CORRUPT=0
+        for nv in "${NVIDIA_FILES[@]}"; do
+            if ! rpm -K --nosignature "$nv" >/dev/null 2>&1; then
+                echo -e "${YELLOW}  WARNING: ${nv##*/} failed digest verification${NC}"
+                NVIDIA_CORRUPT=$((NVIDIA_CORRUPT + 1))
+            fi
+        done
+        if [ "$NVIDIA_CORRUPT" -gt 0 ]; then
+            echo -e "${YELLOW}Skipping NVIDIA upgrade: $NVIDIA_CORRUPT corrupt package(s).${NC}"
+            echo "GPU workloads will keep using the currently installed toolkit."
+            NVIDIA_FILES=()
+        fi
+    fi
+
+    if [ "${#NVIDIA_FILES[@]}" -gt 0 ]; then
         # Remove conflicting packages that block NVIDIA upgrade
         # (devel and debuginfo packages may depend on old versions)
         echo "Removing conflicting NVIDIA packages..."
@@ -488,8 +762,8 @@ if [ "$NVIDIA_INSTALLED" = true ]; then
         rpm -e --nodeps libnvidia-container1-debuginfo 2>/dev/null || true
 
         # Install NVIDIA packages
-        echo "Installing NVIDIA packages..."
-        if rpm -Uvh --force *.rpm; then
+        echo "Installing ${#NVIDIA_FILES[@]} NVIDIA package(s)..."
+        if rpm -Uvh --force "${NVIDIA_FILES[@]}"; then
             echo -e "${GREEN}NVIDIA packages installed.${NC}"
         else
             echo -e "${YELLOW}WARNING: Some NVIDIA packages failed to install.${NC}"
@@ -520,6 +794,7 @@ fi
 #############################################
 echo ""
 echo "=== Phase 8: Start Services ==="
+CURRENT_PHASE="phase 8 (start services)"
 
 # Start containerd FIRST
 echo "Starting containerd..."
@@ -575,6 +850,9 @@ if ! systemctl is-active docker &>/dev/null; then
     exit 1
 fi
 
+# Both services verified up; a later failure no longer means "node is down".
+SERVICES_STOPPED=false
+
 echo -e "${GREEN}Services started successfully.${NC}"
 
 #############################################
@@ -582,6 +860,7 @@ echo -e "${GREEN}Services started successfully.${NC}"
 #############################################
 echo ""
 echo "=== Phase 9: Verification ==="
+CURRENT_PHASE="phase 9 (verification)"
 
 echo "Docker version:"
 docker version
@@ -593,6 +872,36 @@ containerd --version
 echo ""
 echo "Installed packages:"
 rpm -q docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
+
+# Assert the upgrade actually landed. Without this, a node can reach
+# "UPGRADE COMPLETE" while still running the old engine -- rpm can decline a
+# transaction, or a scriptlet can fail, without the run aborting.
+echo ""
+echo "Asserting installed versions..."
+VERIFY_FAILED=0
+
+assert_installed() {
+    local pkg="$1" want="$2" got
+    got=$(rpm -q "$pkg" --queryformat '%{VERSION}' 2>/dev/null || echo "absent")
+    if [ "$got" != "$want" ]; then
+        echo -e "${RED}  ✗ $pkg is $got, expected $want${NC}"
+        VERIFY_FAILED=1
+    else
+        echo -e "  ${GREEN}✓ $pkg $got${NC}"
+    fi
+}
+
+assert_installed docker-ce     "$EXPECTED_DOCKER_VERSION"
+assert_installed docker-ce-cli "$EXPECTED_DOCKER_VERSION"
+assert_installed containerd.io "$EXPECTED_CONTAINERD_VERSION"
+
+if [ "$VERIFY_FAILED" -ne 0 ]; then
+    echo ""
+    echo -e "${RED}ERROR: installed versions do not match the upgrade target.${NC}"
+    echo "Services are running, but this node was NOT upgraded as intended."
+    echo "Inspect: rpm -qa | grep -E '(docker|containerd)'"
+    exit 1
+fi
 
 echo ""
 echo "Service status:"
@@ -623,6 +932,7 @@ fi
 if [ "$SWARM_ACTIVE" = true ]; then
     echo ""
     echo "=== Phase 10: Docker Swarm Reactivation ==="
+CURRENT_PHASE="phase 10 (swarm reactivation)"
 
     if [ "$IS_MANAGER" = true ]; then
         # Manager can reactivate itself

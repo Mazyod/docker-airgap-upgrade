@@ -1,0 +1,119 @@
+# CLAUDE.md
+
+This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+
+## What this repo is
+
+Six standalone Bash scripts for upgrading Docker Engine 29.1.5 → 29.6.2 (and containerd.io 2.2.1 → 2.2.6) on **air-gapped RHEL 8/9 servers**. There is no application code, no build system, no package manager, and no test framework — the deliverable is the scripts themselves, bundled into a tarball and hand-carried to disconnected servers.
+
+The scripts run as root on RHEL. They cannot be executed on the macOS dev machine.
+
+## Working on this repo
+
+There is no lint/test tooling configured. The practical checks:
+
+```bash
+bash -n upgrade-docker.sh                 # syntax check (works on macOS)
+shellcheck upgrade-docker.sh              # available via homebrew
+```
+
+All six scripts are currently `bash -n` clean and `shellcheck` clean. Keep them that way — where a suppression is genuinely warranted, use an inline `# shellcheck disable=SCxxxx` with a reason, not a blanket ignore.
+
+Real validation happens in a RHEL VM via `simulate-upgrade.sh`. It is **not** the same code path as `upgrade-docker.sh` (see below) — passing simulation does not prove the air-gapped path works. To test the real path, run `upgrade-docker.sh` itself against a populated `/opt/docker-offline` in the VM.
+
+## Two different install strategies (important)
+
+The repo deliberately contains two incompatible ways of installing the same packages:
+
+| Script | Strategy | Why |
+|--------|----------|-----|
+| `simulate-upgrade.sh` | `createrepo` + `dnf install` then `dnf distro-sync --allowerasing` | Two-phase dnf; plain `dnf upgrade` is a no-op here |
+| `upgrade-docker.sh` | `rpm -Uvh --force` on a validated file list | Corporate satellite servers break dnf with `SSL certificate problem: EE certificate key too weak` |
+
+`recover-dnf.sh` prints recovery commands that reference an `--enablerepo=docker-local` repo. That repo only exists on machines that ran the simulation path; on production air-gapped hosts it must be created first or the commands will fail.
+
+## Current upgrade scope (read this before changing phase logic)
+
+The cluster is on 29.1.5 / containerd.io 2.2.1. This upgrade stays **inside the containerd 2.2.x line**. That is why several things the previous round required are gone:
+
+- **No containerd config migration or regeneration.** 2.2.1 and 2.2.6 share config v3. Regenerating would discard a relocated `root` path, registry mirrors and runtime config — silently repointing a node at an empty `/var/lib/containerd`. Phase 6 verifies; it does not rewrite.
+- **No XFS `ftype=1` check.** Any node running containerd 2.x has already satisfied it.
+- **No automatic orphaned-network cleanup.** Extracted to `clean-swarm-networks.sh`, run on demand.
+
+All three are recoverable from git history at `upgrade-docker.sh` v1.2.3 (commit `974683a`) if a future containerd **major** upgrade needs them back. Do not resurrect them for a point release.
+
+**The whole-cluster-together rule does not apply here.** 29.1.5 and 29.6.2 both speak containerd 2.2.x gRPC, so a mixed 29.1.5/29.6.2 Swarm is fine and nodes roll one at a time. The rule still holds across the 1.7 ↔ 2.x boundary.
+
+## Invariants the scripts depend on
+
+- **Service order is not optional.** Stop `docker` → `docker.socket` → `containerd`. Start `containerd` → wait for readiness → `docker`. Readiness means polling `ctr version` (up to 30×2s) **and** `ctr snapshots --snapshotter overlayfs ls`, because systemd reports containerd active before its snapshotter is usable. A bare `sleep` is not readiness.
+- **Verify the stop, don't assume it.** After stopping, confirm `docker`, `docker.socket` and `containerd` are all inactive before touching packages or network state. `docker.socket` specifically: if it survives while dockerd is down, anything touching the socket socket-activates dockerd again, mid-transaction.
+- **The package is `containerd.io`, never `containerd`.** The standalone `containerd` package is a different, wrong thing.
+- **Validate before destroying.** Everything checkable runs before the node is touched: `upgrade-docker.sh` phase 0 and `rollback-docker.sh` phase 0 verify digests, RPM metadata, expected versions, `el${RHEL_VER}` release, arch, and duplicates, then `rpm -Uvh --test` dry-runs the exact transaction — all while services are still up and the node is still in the Swarm.
+- **Assert on RPM metadata, never on filenames.** The previous bundle has an identical directory layout, so a filename check would let an operator "upgrade" 29.1.5 → 29.1.5 and be told it succeeded.
+- **One rpm transaction, not several.** Splitting containerd.io and docker-ce into separate invocations can leave a downgraded runtime under a newer engine. rpm applies a set atomically; use that.
+- **Whole clusters upgrade together across a containerd major.** containerd 2.x's gRPC API is incompatible with 1.7.x; mixed-version Swarm clusters produce ALPN handshake errors. Does not apply within 2.2.x.
+- **`docker-buildx-plugin` and `docker-compose-plugin` version independently** of docker-ce. Don't pin them to the docker-ce version.
+
+## Version constants are duplicated — change all of them together
+
+Package versions (`29.6.2`, `2.2.6`, `0.35.0`, `5.3.1`, rollback `29.1.5`/`2.2.1`) appear in:
+
+- `download-docker-packages.sh` — four download loops (rhel8, rhel9, rollback-rhel8, rollback-rhel9)
+- `upgrade-docker.sh` — `EXPECTED_DOCKER_VERSION` / `EXPECTED_CONTAINERD_VERSION` constants, plus the header and banner
+- `rollback-docker.sh` — `ROLLBACK_DOCKER_VERSION` / `ROLLBACK_CONTAINERD_VERSION` constants, plus the header and banner
+- `simulate-upgrade.sh` — its own download loop, the `dnf install` pins, and the `assert_pkg` calls
+- `README.md` — the version table and verification section
+
+The two upgrade/rollback scripts now hold their versions in named constants at the top rather than scattered through the body — change the constant, not the occurrences.
+
+Directory layout is assumed by path in several scripts: `/opt/docker-offline/rhel${RHEL_VER}`, `rollback-rhel${RHEL_VER}`, `nvidia`. RHEL version comes from `rpm -E %rhel`.
+
+The bundle is `/opt/docker-upgrade-bundle.tar.gz` everywhere (this was previously inconsistent with README and the `upgrade-docker.sh` header; both are now fixed).
+
+## Script versioning convention
+
+Every script except `simulate-upgrade.sh` declares `VERSION="x.y.z"` on ~line 4 and echoes it in its startup banner. Only the scripts actually changed get bumped — versions across scripts drift on purpose. Currently:
+
+| Script | Version |
+|---|---|
+| `upgrade-docker.sh` | 2.0.0 |
+| `rollback-docker.sh` | 2.0.0 |
+| `download-docker-packages.sh` | 2.0.0 |
+| `clean-swarm-networks.sh` | 1.0.0 |
+| `recover-dnf.sh` | 1.2.1 |
+
+Commit subjects carry the new version in parens, e.g. `Fix NVIDIA toolkit upgrade failures (v1.2.2)`, with a bullet list body.
+
+## upgrade-docker.sh structure
+
+Numbered phase blocks, each fenced by a `####` comment banner: **0 validate payload** → 1 Swarm detect/drain → 2 pre-upgrade checks → 3 backup to `/root/docker-backup-<timestamp>/` → 4 stop services (+ verify stopped) → 5 rpm upgrade → 6 verify containerd config → 7 NVIDIA toolkit → 8 start services → 9 verification + version assertion → 10 Swarm reactivation. Add new work as a new numbered phase rather than inlining it elsewhere.
+
+**Phase 4.5 is intentionally vacant.** It held the orphaned-network cleanup. The number is left unused so phases 5–10 keep the identities they have in the runbook and in logs from prior upgrades.
+
+Things the phase structure encodes:
+
+- **Phase 0 runs before anything mutates the node** — including before the Swarm drain. A payload problem must not leave a node drained.
+- **Swarm workers cannot drain or inspect themselves** — only managers can run `docker node` commands. Workers get printed instructions and a "has this been drained?" prompt; managers drain themselves interactively. `IS_MANAGER` comes from `.Swarm.ControlAvailable`.
+- **Failure is reported, not guessed at.** An EXIT trap tracks `CURRENT_PHASE`, `SERVICES_STOPPED`, and a tri-state `PKG_STATE` (`untouched`/`attempted`/`installed`). It deliberately does **not** auto-restart services: after an rpm transaction, retry-vs-rollback is an operator judgement call. `PKG_STATE` is set to `attempted` *before* the rpm call, because a transaction can change host state and still fail.
+- **NVIDIA is best-effort.** `libnvidia-container-devel` and `libnvidia-container1-debuginfo` are force-removed first because they pin old versions; failures warn instead of aborting. A corrupt NVIDIA RPM skips the toolkit upgrade rather than aborting the run. `nvidia-ctk runtime configure --runtime=containerd` is deliberately skipped — nvidia-ctk doesn't understand containerd config v3 yet.
+
+## clean-swarm-networks.sh
+
+Standalone remedy for a node that returns from an upgrade unable to attach to overlay networks (`failed adding service binding`). Deletes VXLAN interfaces, `/var/run/docker/netns/*`, `<data-root>/network/files/local-kv.db`, and `docker_gwbridge`. The data root is scraped out of `/etc/docker/daemon.json`.
+
+Two things are load-bearing and must not be "simplified":
+
+- **The inventory is enumerated after services stop, and deletion iterates exactly that captured list.** Enumerating before the stop, or re-globbing at deletion time, means the confirmation prompt can describe something different from what actually gets deleted.
+- **Enumeration failure is not treated as an empty inventory.** `mapfile < <(cmd || true)` cannot see the command's exit status, so a failing `ip` would silently read as "nothing to clean". Output and status are captured separately, and a failed enumeration aborts.
+
+Exits 2 when cleanup was incomplete, so a wrapper checking `$?` doesn't record a partial remedy as success.
+
+## Bash conventions used here
+
+- `set -e` everywhere, so any command whose failure is acceptable needs an explicit `|| true`.
+- `exec > >(tee -a /var/log/docker-<action>.log) 2>&1` at the top of the long-running scripts.
+- `RED`/`GREEN`/`YELLOW`/`NC` color vars with `echo -e`.
+- Interactive prompts go through `prompt_yes_no "text [Y/n]" "y"`; the default is passed separately from the prompt string. Destructive prompts default to `n`.
+- EXIT traps do `local rc=$?` first, `[ "$rc" -eq 0 ] && exit 0`, and end with `exit "$rc"`. Paired with `trap 'exit 130' INT` / `trap 'exit 143' TERM` so signals route through the same reporting.
+- Scripts assume GNU userland (`grep -oP`, `findmnt`, `xfs_info`) with fallbacks where it mattered — don't test behavior against macOS tooling.

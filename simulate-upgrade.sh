@@ -2,28 +2,40 @@
 # /root/simulate-upgrade.sh
 # Run on a fresh RHEL 8 VM to test the full upgrade process
 #
-# This script simulates the complete Docker 28.5.1 → 29.1.5 upgrade path
+# This script simulates the complete Docker 29.1.5 → 29.6.2 upgrade path
 # in a controlled environment before deploying to production.
+#
+# WHAT THIS DOES AND DOES NOT PROVE
+#
+# This uses createrepo + dnf, which is NOT the code path upgrade-docker.sh
+# takes. That script uses `rpm -Uvh --force` directly, because corporate
+# satellite servers break dnf with "SSL certificate problem: EE certificate key
+# too weak". Passing this simulation therefore does NOT prove the air-gapped
+# path works -- it proves the PACKAGES upgrade cleanly and the services come
+# back.
+#
+# To exercise the real air-gapped path, run upgrade-docker.sh itself against a
+# populated /opt/docker-offline in the same VM. See the test plan.
 
 set -e
 exec > >(tee -a /var/log/docker-upgrade-sim.log) 2>&1
 
 echo "=========================================="
-echo "Docker Upgrade Simulation: 28.5.1 → 29.1.5"
+echo "Docker Upgrade Simulation: 29.1.5 → 29.6.2"
 echo "Date: $(date)"
 echo "=========================================="
 
-# Phase A: Install Docker 28.5.1 (simulate current state)
+# Phase A: Install Docker 29.1.5 (simulate current state)
 echo ""
-echo "=== Installing Docker 28.5.1 (simulating current state) ==="
+echo "=== Installing Docker 29.1.5 (simulating current cluster state) ==="
 
 dnf config-manager --add-repo https://download.docker.com/linux/rhel/docker-ce.repo
 
 # Note: buildx and compose have INDEPENDENT versions - don't pin them!
 dnf install -y \
-    docker-ce-28.5.1 \
-    docker-ce-cli-28.5.1 \
-    containerd.io-1.7.29 \
+    docker-ce-29.1.5 \
+    docker-ce-cli-29.1.5 \
+    containerd.io-2.2.1 \
     docker-buildx-plugin \
     docker-compose-plugin
 
@@ -41,6 +53,11 @@ docker run -d --name test-nginx --network bridge nginx:alpine
 docker network create custom-bridge
 docker run -d --name test-dns --network custom-bridge alpine sleep 3600
 
+# Capture the containerd config so the upgrade can be checked against it.
+# Preserving this file across the upgrade is the single most important
+# behavioural change in upgrade-docker.sh v2.0.0.
+cp /etc/containerd/config.toml /root/config.toml.before 2>/dev/null || true
+
 # Phase B: Download upgrade packages (simulating online server)
 echo ""
 echo "=== Downloading upgrade packages ==="
@@ -48,19 +65,20 @@ echo "=== Downloading upgrade packages ==="
 mkdir -p /opt/docker-offline/rhel8
 cd /opt/docker-offline/rhel8
 
-# Download with explicit versions
+# Download with explicit versions. -f so a bad version fails here rather than
+# writing a 404 page into a .rpm.
 for pkg in \
-    docker-ce-29.1.5-1.el8.x86_64.rpm \
-    docker-ce-cli-29.1.5-1.el8.x86_64.rpm \
-    containerd.io-2.2.1-1.el8.x86_64.rpm \
-    docker-buildx-plugin-0.30.1-1.el8.x86_64.rpm \
-    docker-compose-plugin-5.0.1-1.el8.x86_64.rpm
+    docker-ce-29.6.2-1.el8.x86_64.rpm \
+    docker-ce-cli-29.6.2-1.el8.x86_64.rpm \
+    containerd.io-2.2.6-1.el8.x86_64.rpm \
+    docker-buildx-plugin-0.35.0-1.el8.x86_64.rpm \
+    docker-compose-plugin-5.3.1-1.el8.x86_64.rpm
 do
     echo "Downloading: $pkg"
-    curl -sLO "https://download.docker.com/linux/rhel/8/x86_64/stable/Packages/$pkg"
+    curl -fsLO "https://download.docker.com/linux/rhel/8/x86_64/stable/Packages/$pkg"
 done
 
-ls -lh *.rpm
+ls -lh ./*.rpm
 
 # Phase C: Create local repository
 echo ""
@@ -123,25 +141,35 @@ dnf distro-sync -y --disablerepo='*' --enablerepo=docker-local --allowerasing \
     docker-ce docker-ce-cli containerd.io \
     docker-buildx-plugin docker-compose-plugin
 
-# Migrate containerd config (REQUIRED for 1.7→2.2)
-echo ""
-echo "=== Migrating containerd config ==="
-if [ -f /root/docker-backup/config.toml.bak ]; then
-    containerd config migrate /root/docker-backup/config.toml.bak > /etc/containerd/config.toml 2>/dev/null || \
-        echo "Config migration skipped (using defaults)"
-fi
+# NOTE: `containerd config migrate` used to run here. It was required for the
+# 1.7 -> 2.x config format change. 2.2.1 and 2.2.6 both use config v3, so there
+# is nothing to migrate and the existing config is carried across untouched.
 
 # Start services in correct order: containerd FIRST
 echo ""
 echo "=== Starting services ==="
 systemctl start containerd
-sleep 3  # Wait for containerd to fully initialize
+
+# Poll rather than sleeping blindly: systemd reports containerd active before
+# its snapshotter is usable.
+for i in {1..30}; do
+    if ctr version &>/dev/null; then
+        echo "containerd API responsive (attempt $i)"
+        break
+    fi
+    echo "  Waiting for containerd API... (attempt $i/30)"
+    sleep 2
+done
+ctr snapshots --snapshotter overlayfs ls >/dev/null || echo "WARNING: snapshotter not ready"
+
 systemctl start docker
 systemctl enable docker containerd
 
 # Phase G: Verification
 echo ""
 echo "=== Verification ==="
+
+FAILURES=0
 
 echo "New versions:"
 docker version
@@ -152,16 +180,56 @@ echo "Package verification:"
 rpm -q docker-ce docker-ce-cli containerd.io
 
 echo ""
-echo "Testing DNS resolution on custom bridge (the fix we need):"
-docker start test-dns 2>/dev/null || true
-docker exec test-dns nslookup google.com && echo "SUCCESS: DNS resolution works!" || echo "FAILED: DNS issue"
+echo "Asserting expected versions:"
+assert_pkg() {
+    local pkg="$1" want="$2" got
+    got=$(rpm -q "$pkg" --queryformat '%{VERSION}' 2>/dev/null || echo absent)
+    if [ "$got" = "$want" ]; then
+        echo "  OK   $pkg $got"
+    else
+        echo "  FAIL $pkg is $got, expected $want"
+        FAILURES=$((FAILURES + 1))
+    fi
+}
+
+assert_pkg docker-ce     29.6.2
+assert_pkg docker-ce-cli 29.6.2
+assert_pkg containerd.io 2.2.6
 
 echo ""
-echo "Testing existing containers:"
+echo "containerd config preserved across upgrade:"
+if [ -f /root/config.toml.before ]; then
+    if cmp -s /root/config.toml.before /etc/containerd/config.toml; then
+        echo "  OK   config.toml is byte-identical to pre-upgrade"
+    else
+        echo "  NOTE config.toml changed - diff follows"
+        diff -u /root/config.toml.before /etc/containerd/config.toml || true
+    fi
+else
+    echo "  SKIP no pre-upgrade config captured"
+fi
+
+echo ""
+echo "Testing DNS resolution on custom bridge:"
+docker start test-dns 2>/dev/null || true
+if docker exec test-dns nslookup google.com; then
+    echo "  OK   DNS resolution works"
+else
+    echo "  FAIL DNS issue on custom bridge"
+    FAILURES=$((FAILURES + 1))
+fi
+
+echo ""
+echo "Testing existing containers survived the upgrade:"
 docker ps -a
 docker start test-nginx 2>/dev/null || true
 sleep 2
-curl -s localhost:$(docker port test-nginx 80/tcp | cut -d: -f2) | head -5 && echo "SUCCESS: nginx works!"
+if curl -s "localhost:$(docker port test-nginx 80/tcp | cut -d: -f2)" | head -5; then
+    echo "  OK   nginx works"
+else
+    echo "  FAIL nginx did not respond"
+    FAILURES=$((FAILURES + 1))
+fi
 
 # Cleanup
 docker rm -f test-nginx test-dns 2>/dev/null || true
@@ -169,5 +237,15 @@ docker network rm custom-bridge 2>/dev/null || true
 
 echo ""
 echo "=========================================="
-echo "SIMULATION COMPLETE"
+if [ "$FAILURES" -eq 0 ]; then
+    echo "SIMULATION PASSED"
+else
+    echo "SIMULATION FAILED: $FAILURES check(s) failed"
+fi
 echo "=========================================="
+echo ""
+echo "REMINDER: this exercised the dnf path, not upgrade-docker.sh's"
+echo "rpm -Uvh path. Run upgrade-docker.sh separately to test that."
+echo "=========================================="
+
+exit "$FAILURES"

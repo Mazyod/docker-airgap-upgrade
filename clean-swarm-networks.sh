@@ -74,6 +74,45 @@ prompt_yes_no() {
     done
 }
 
+# Confirm a unit is CONCLUSIVELY stopped.
+#
+# `systemctl is-active` is not sufficient: it returns nonzero for `activating`,
+# `deactivating`, and for a failure to reach systemd at all. Treating any
+# nonzero as "safely stopped" fails open -- a stop that timed out and left the
+# unit `deactivating` would sail through and network state would be deleted
+# under a live daemon.
+verify_unit_stopped() {
+    local unit="$1" out state mainpid
+
+    if ! out=$(systemctl show "$unit" --property=ActiveState --property=MainPID 2>/dev/null); then
+        echo "    $unit: cannot query systemd"
+        return 1
+    fi
+
+    state=$(printf '%s\n' "$out" | sed -n 's/^ActiveState=//p')
+    mainpid=$(printf '%s\n' "$out" | sed -n 's/^MainPID=//p')
+
+    if [ -z "$state" ]; then
+        echo "    $unit: systemd reported no ActiveState"
+        return 1
+    fi
+
+    case "$state" in
+        inactive|failed) ;;
+        *)
+            echo "    $unit: ActiveState=$state (not conclusively stopped)"
+            return 1
+            ;;
+    esac
+
+    if [ -n "$mainpid" ] && [ "$mainpid" != "0" ]; then
+        echo "    $unit: still running as PID $mainpid"
+        return 1
+    fi
+
+    return 0
+}
+
 stop_services() {
     echo "Stopping docker..."
     systemctl stop docker docker.socket 2>/dev/null || true
@@ -90,15 +129,20 @@ stop_services() {
     # survives while dockerd is down, anything that connects to it -- a
     # monitoring agent, an operator's `docker ps` -- socket-activates dockerd
     # again, mid-deletion.
-    local still_up=""
-    systemctl is-active docker        &>/dev/null && still_up="$still_up docker"
-    systemctl is-active docker.socket &>/dev/null && still_up="$still_up docker.socket"
-    systemctl is-active containerd    &>/dev/null && still_up="$still_up containerd"
+    echo "Confirming services are stopped..."
+    local failed=0 unit
+    for unit in docker docker.socket containerd; do
+        if verify_unit_stopped "$unit"; then
+            echo "    $unit: stopped"
+        else
+            failed=$((failed + 1))
+        fi
+    done
 
-    if [ -n "$still_up" ]; then
-        echo -e "${RED}ERROR: still active after stop:$still_up${NC}" >&2
+    if [ "$failed" -gt 0 ]; then
+        echo -e "${RED}ERROR: $failed unit(s) not conclusively stopped.${NC}" >&2
         echo "Refusing to modify network state while a daemon can be reached." >&2
-        echo "Investigate with: systemctl status$still_up" >&2
+        echo "Investigate with: systemctl status docker docker.socket containerd" >&2
         return 1
     fi
 

@@ -201,6 +201,46 @@ prompt_yes_no() {
     done
 }
 
+# Confirm a unit is CONCLUSIVELY stopped.
+#
+# `systemctl is-active` is not sufficient: it returns nonzero for `activating`,
+# `deactivating`, and for a failure to reach systemd at all. Treating any
+# nonzero as "safely stopped" fails open -- a stop that timed out and left the
+# unit `deactivating` would sail through and rpm would run against a live
+# daemon. Require a successful query, a conclusively stopped ActiveState, and
+# no live MainPID.
+verify_unit_stopped() {
+    local unit="$1" out state mainpid
+
+    if ! out=$(systemctl show "$unit" --property=ActiveState --property=MainPID 2>/dev/null); then
+        echo "    $unit: cannot query systemd"
+        return 1
+    fi
+
+    state=$(printf '%s\n' "$out" | sed -n 's/^ActiveState=//p')
+    mainpid=$(printf '%s\n' "$out" | sed -n 's/^MainPID=//p')
+
+    if [ -z "$state" ]; then
+        echo "    $unit: systemd reported no ActiveState"
+        return 1
+    fi
+
+    case "$state" in
+        inactive|failed) ;;
+        *)
+            echo "    $unit: ActiveState=$state (not conclusively stopped)"
+            return 1
+            ;;
+    esac
+
+    if [ -n "$mainpid" ] && [ "$mainpid" != "0" ]; then
+        echo "    $unit: still running as PID $mainpid"
+        return 1
+    fi
+
+    return 0
+}
+
 # NOTE: check_xfs_ftype() lived here. It validated that containerd's root was
 # on a filesystem with XFS ftype=1 and offered an interactive relocation when
 # it was not. That requirement arrives with containerd 2.x, so it mattered when
@@ -619,15 +659,21 @@ sleep 2
 # routine upgrade into an unrecoverable one. docker.socket is checked too: if
 # it survives while dockerd is down, anything that touches the socket
 # socket-activates dockerd again, mid-transaction.
-STILL_UP=""
-systemctl is-active docker        &>/dev/null && STILL_UP="$STILL_UP docker"
-systemctl is-active docker.socket &>/dev/null && STILL_UP="$STILL_UP docker.socket"
-systemctl is-active containerd    &>/dev/null && STILL_UP="$STILL_UP containerd"
+echo "Confirming services are stopped..."
+STOP_FAILED=0
+for unit in docker docker.socket containerd; do
+    if verify_unit_stopped "$unit"; then
+        echo "    $unit: stopped"
+    else
+        STOP_FAILED=$((STOP_FAILED + 1))
+    fi
+done
 
-if [ -n "$STILL_UP" ]; then
-    echo -e "${RED}ERROR: still active after stop:$STILL_UP${NC}"
+if [ "$STOP_FAILED" -gt 0 ]; then
+    echo ""
+    echo -e "${RED}ERROR: $STOP_FAILED unit(s) not conclusively stopped.${NC}"
     echo "Refusing to replace packages under a running daemon."
-    echo "Investigate with: systemctl status$STILL_UP"
+    echo "Investigate with: systemctl status docker docker.socket containerd"
     exit 1
 fi
 

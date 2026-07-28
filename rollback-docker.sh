@@ -122,6 +122,46 @@ trap 'exit 143' TERM
 # Helper Functions
 #############################################
 
+# Confirm a unit is CONCLUSIVELY stopped.
+#
+# `systemctl is-active` is not sufficient: it returns nonzero for `activating`,
+# `deactivating`, and for a failure to reach systemd at all. Treating any
+# nonzero as "safely stopped" fails open -- a stop that timed out and left the
+# unit `deactivating` would sail through and rpm would run against a live
+# daemon. Require a successful query, a conclusively stopped ActiveState, and
+# no live MainPID.
+verify_unit_stopped() {
+    local unit="$1" out state mainpid
+
+    if ! out=$(systemctl show "$unit" --property=ActiveState --property=MainPID 2>/dev/null); then
+        echo "    $unit: cannot query systemd"
+        return 1
+    fi
+
+    state=$(printf '%s\n' "$out" | sed -n 's/^ActiveState=//p')
+    mainpid=$(printf '%s\n' "$out" | sed -n 's/^MainPID=//p')
+
+    if [ -z "$state" ]; then
+        echo "    $unit: systemd reported no ActiveState"
+        return 1
+    fi
+
+    case "$state" in
+        inactive|failed) ;;
+        *)
+            echo "    $unit: ActiveState=$state (not conclusively stopped)"
+            return 1
+            ;;
+    esac
+
+    if [ -n "$mainpid" ] && [ "$mainpid" != "0" ]; then
+        echo "    $unit: still running as PID $mainpid"
+        return 1
+    fi
+
+    return 0
+}
+
 # Start containerd, wait for it to be genuinely usable, then start docker.
 # systemd reports containerd active before its snapshotter is ready -- a bare
 # `sleep` here is what produced the race this project already had to fix once.
@@ -323,7 +363,12 @@ fi
 # without finding out after the node is already down.
 echo ""
 echo "Dry-running the downgrade transaction..."
-if ! rpm -Uvh --test --oldpackage "$CONTAINERD_RPM" "${DOCKER_RPMS[@]}" 2>&1; then
+# --replacepkgs matters for RESUMABILITY. --oldpackage permits installing a
+# lower EVR, but not reinstalling an identical one. If a previous run failed
+# after containerd.io had already reached 2.2.1, a rerun without this would be
+# rejected with "package is already installed" -- making the trap's "re-run
+# this script" advice impossible to follow on exactly the node that needs it.
+if ! rpm -Uvh --test --oldpackage --replacepkgs "$CONTAINERD_RPM" "${DOCKER_RPMS[@]}" 2>&1; then
     echo ""
     echo -e "${RED}ERROR: rpm rejected the downgrade transaction (dry run).${NC}"
     echo "Nothing on this node has been changed. The output above says why."
@@ -333,6 +378,9 @@ if ! rpm -Uvh --test --oldpackage "$CONTAINERD_RPM" "${DOCKER_RPMS[@]}" 2>&1; th
     exit 1
 fi
 echo -e "${GREEN}Transaction dry run passed.${NC}"
+echo -e "${YELLOW}NOTE: the dry run validates rpm's planned transaction only.${NC}"
+echo "Package scriptlets and the actual file writes run in phase 2 and can"
+echo "still fail there."
 
 echo -e "${GREEN}Rollback payload validated.${NC}"
 
@@ -359,15 +407,21 @@ sleep 2
 #
 # docker.socket is included deliberately: if it survives, anything touching the
 # socket socket-activates dockerd again, mid-transaction.
-STILL_UP=""
-systemctl is-active docker        &>/dev/null && STILL_UP="$STILL_UP docker"
-systemctl is-active docker.socket &>/dev/null && STILL_UP="$STILL_UP docker.socket"
-systemctl is-active containerd    &>/dev/null && STILL_UP="$STILL_UP containerd"
+echo "Confirming services are stopped..."
+STOP_FAILED=0
+for unit in docker docker.socket containerd; do
+    if verify_unit_stopped "$unit"; then
+        echo "    $unit: stopped"
+    else
+        STOP_FAILED=$((STOP_FAILED + 1))
+    fi
+done
 
-if [ -n "$STILL_UP" ]; then
-    echo -e "${RED}ERROR: still active after stop:$STILL_UP${NC}"
+if [ "$STOP_FAILED" -gt 0 ]; then
+    echo ""
+    echo -e "${RED}ERROR: $STOP_FAILED unit(s) not conclusively stopped.${NC}"
     echo "Refusing to downgrade packages under a running daemon."
-    echo "Investigate with: systemctl status$STILL_UP"
+    echo "Investigate with: systemctl status docker docker.socket containerd"
     exit 1
 fi
 
@@ -386,12 +440,16 @@ PKG_STATE="attempted"
 
 # ONE transaction, not two. Splitting containerd.io and docker-ce into separate
 # rpm invocations means a failure in the second leaves the node with a
-# downgraded runtime under a newer engine -- a mixed state that is worse than
-# either endpoint. rpm resolves the whole set together and either applies all
-# of it or none of it. This is the same set the phase-0 dry run approved.
+# downgraded runtime under a newer engine. Resolving the whole set together
+# closes that deterministic gap, and rpm -- not the argument order here --
+# decides the actual install ordering from package dependencies.
+#
+# This is NOT atomic. rpm has no general rollback once execution begins: a
+# failing scriptlet or an interruption can still leave partial state. That is
+# what PKG_STATE="attempted" exists to communicate.
 echo "Downgrading containerd.io to $ROLLBACK_CONTAINERD_VERSION and"
 echo "docker-ce / docker-ce-cli to $ROLLBACK_DOCKER_VERSION (single transaction)..."
-rpm -Uvh --oldpackage "$CONTAINERD_RPM" "${DOCKER_RPMS[@]}"
+rpm -Uvh --oldpackage --replacepkgs "$CONTAINERD_RPM" "${DOCKER_RPMS[@]}"
 
 PKG_STATE="installed"
 echo "Packages downgraded."

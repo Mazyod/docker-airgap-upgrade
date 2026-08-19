@@ -1,7 +1,7 @@
 #!/bin/bash
 # rollback-docker.sh
-# Emergency rollback: Docker 29.6.2 → 29.1.5
-VERSION="2.0.0"
+# Emergency rollback: Docker 29.7.2 → 29.1.5
+VERSION="2.1.0"
 #
 # Use this script if:
 # - Services fail to start after upgrade
@@ -15,8 +15,21 @@ VERSION="2.0.0"
 # SCOPE
 #
 # This rolls back to 29.1.5 / containerd.io 2.2.1 -- the state the cluster ran
-# before this upgrade. It stays inside the containerd 2.2.x line, so there is
-# no config-format migration and no network-state reset involved.
+# before this upgrade. No network-state reset is involved.
+#
+# It DOES step containerd back across a config-version boundary: 2.3.3 supports
+# config version 4, 2.2.1 supports at most 3. The upgrade never writes a v4
+# file, so in the normal case the config on disk is still the v3 one 2.2.1
+# wrote and nothing needs to change. But if something did write a v4 config --
+# most plausibly an operator running `containerd config default >
+# /etc/containerd/config.toml` -- then downgrading would leave containerd
+# unable to start at all:
+#
+#   containerd: failed to load TOML from /etc/containerd/config.toml:
+#   expected containerd config version equal to or less than `3`, got `4`
+#
+# Phase 0c detects that while the node is still up and running, and refuses to
+# proceed rather than producing a node with a dead runtime.
 #
 # It does NOT roll back to 28.5.1 / containerd 1.7.x. That would cross the
 # containerd major boundary in reverse and would have to be done on every node
@@ -34,7 +47,7 @@ NC='\033[0m' # No Color
 exec > >(tee -a /var/log/docker-rollback.log) 2>&1
 
 echo "=========================================="
-echo "Docker Rollback: 29.6.2 → 29.1.5"
+echo "Docker Rollback: 29.7.2 → 29.1.5"
 echo "Script Version: $VERSION"
 echo "Server: $(hostname)"
 echo "Date: $(date)"
@@ -440,7 +453,8 @@ shopt -u nullglob
 BACKUP_DIR=""
 if [ "${#BACKUP_DIRS[@]}" -eq 0 ]; then
     echo "No /root/docker-backup-* directories found."
-    echo "The existing containerd config will be kept as-is (valid for 2.2.x)."
+    echo "The existing containerd config will be kept as-is."
+    echo "Phase 0c checks whether containerd $ROLLBACK_CONTAINERD_VERSION can actually load it."
 else
     BACKUP_DIR="${BACKUP_DIRS[-1]%/}"
 
@@ -474,6 +488,173 @@ else
         echo "The existing containerd config will be kept as-is."
         BACKUP_DIR=""
     fi
+fi
+
+#############################################
+# Phase 0c: containerd Config Version Guard
+#############################################
+echo ""
+echo "=== Phase 0c: containerd Config Version ==="
+CURRENT_PHASE="phase 0c (containerd config version)"
+
+# containerd $ROLLBACK_CONTAINERD_VERSION loads config version 3 at most.
+# containerd 2.3.3 -- what this node is being rolled back FROM -- generates
+# version 4, and 2.2.1 refuses such a file outright:
+#
+#   containerd: failed to load TOML from /etc/containerd/config.toml:
+#   expected containerd config version equal to or less than `3`, got `4`
+#
+# upgrade-docker.sh never writes a v4 file, but an operator who ran
+# `containerd config default > /etc/containerd/config.toml` at any point after
+# the upgrade has one. Left undetected, the downgrade succeeds and containerd
+# then fails to start -- on the node that is already in trouble.
+#
+# So this is checked HERE, in phase 0c: docker and containerd are still running,
+# nothing has been touched, and aborting costs nothing.
+ROLLBACK_MAX_CONFIG_VERSION=3
+CONTAINERD_CONF="/etc/containerd/config.toml"
+
+# Read the top-level `version` key. The awk stops at the first [section] header
+# so only top-level keys count. Prints nothing when the key is absent, which
+# containerd treats as a legacy config and still loads.
+read_config_version() {
+    # Tolerate an optionally quoted value. containerd wants an integer here, so
+    # `version = "4"` is not a config it would accept anyway -- but reading it
+    # as 4 makes this guard FIRE, whereas failing to match would silently read
+    # as "no version key" and wave the file through. Err toward firing.
+    awk '/^[[:space:]]*\[/ { exit } { print }' "$1" 2>/dev/null \
+        | sed -n "s/^[[:space:]]*version[[:space:]]*=[[:space:]]*['\"]\{0,1\}\([0-9][0-9]*\)['\"]\{0,1\}.*/\1/p" \
+        | head -1
+}
+
+# A config is loadable by the rollback containerd when it has no version key at
+# all, or a version at or below ROLLBACK_MAX_CONFIG_VERSION.
+config_is_loadable() {
+    local v
+    # A missing file is not a loadable config. Without this, read_config_version
+    # would return empty for it and the "no version key" case below would report
+    # it as fine.
+    [ -f "$1" ] || return 1
+    v=$(read_config_version "$1")
+    # An explicit `if` rather than `[ -z "$v" ] && return 0` -- readability only,
+    # the two forms behave identically. Worth stating the real constraint though:
+    # this is a PREDICATE, so it returns 1 for "not loadable", and under `set -e`
+    # that aborts the script unless the call sits in a condition. Every call site
+    # below is an if/elif, which is what makes it safe. Keep it that way.
+    if [ -z "$v" ]; then
+        return 0
+    fi
+    # A version wider than four digits is not a containerd config version, it is
+    # a corrupt file. It also cannot be compared: bash's `[` handles 64-bit
+    # integers only and prints "integer expression expected" on anything larger,
+    # which would land a raw shell error in the middle of a rollback refusal.
+    # Treat it as unreadable -- and for a rollback, unreadable means NOT
+    # loadable, so the guard still fires.
+    if [ "${#v}" -gt 4 ]; then
+        return 1
+    fi
+    [ "$v" -le "$ROLLBACK_MAX_CONFIG_VERSION" ]
+}
+
+# Check the config containerd will ACTUALLY be asked to load after phase 3 --
+# not simply whatever is on disk right now. Phase 3's logic is: restore the
+# selected backup if there is one, otherwise keep the on-disk file, otherwise
+# generate a default. Those are different files, and the guard has to follow the
+# same branch phase 3 will.
+#
+# Checking only the on-disk file leaves a hole exactly where this guard claims
+# cover: an absent or hand-moved config plus a backup that itself holds a v4
+# file. Phase 3 would restore that backup and containerd would refuse it -- the
+# precise outcome this phase exists to prevent.
+#
+# The generate-a-default case needs no check: it runs AFTER the phase 2
+# downgrade, so it is the rollback containerd's own binary emitting its own
+# version.
+if [ -n "$BACKUP_DIR" ] && [ -f "$BACKUP_DIR/config.toml" ]; then
+    EFFECTIVE_CONF="$BACKUP_DIR/config.toml"
+    EFFECTIVE_DESC="the backup phase 3 will restore, $EFFECTIVE_CONF"
+elif [ -f "$CONTAINERD_CONF" ]; then
+    EFFECTIVE_CONF="$CONTAINERD_CONF"
+    EFFECTIVE_DESC="$CONTAINERD_CONF"
+else
+    EFFECTIVE_CONF=""
+    EFFECTIVE_DESC=""
+fi
+
+if [ -z "$EFFECTIVE_CONF" ]; then
+    echo "No config and no backup. Phase 3 generates a default after the"
+    echo "downgrade, so it will carry containerd $ROLLBACK_CONTAINERD_VERSION's own version."
+elif config_is_loadable "$EFFECTIVE_CONF"; then
+    echo "Will load: $EFFECTIVE_DESC"
+    echo "Config version $(read_config_version "$EFFECTIVE_CONF" | grep . || echo unset) -- containerd $ROLLBACK_CONTAINERD_VERSION can load it."
+else
+    # Name a different backup that WOULD work, if one exists. Phase 0b only ever
+    # selects the newest, so "the selected backup is bad" and "no usable config
+    # exists anywhere" are different statements, and telling an operator the
+    # second when the first is true sends them looking for a file they have.
+    ALT_CONF=""
+    shopt -s nullglob
+    for d in /root/docker-backup-*/; do
+        if [ -f "${d}config.toml" ] && config_is_loadable "${d}config.toml"; then
+            ALT_CONF="${d}config.toml"
+        fi
+    done
+    shopt -u nullglob
+
+    BAD_VERSION=$(read_config_version "$EFFECTIVE_CONF" | grep . || echo "unreadable")
+
+    echo ""
+    echo -e "${RED}=========================================="
+    echo "ERROR: CONFIG VERSION BLOCKS THIS ROLLBACK"
+    echo -e "==========================================${NC}"
+    echo ""
+    echo "  Config that would be loaded: $EFFECTIVE_DESC"
+    echo "  Its version:                 $BAD_VERSION"
+    echo "  containerd $ROLLBACK_CONTAINERD_VERSION loads at most version $ROLLBACK_MAX_CONFIG_VERSION"
+    echo ""
+    echo "Downgrading now would succeed, and containerd would then refuse to"
+    echo "start with:"
+    echo ""
+    echo "  failed to load TOML from $CONTAINERD_CONF: expected containerd"
+    echo "  config version equal to or less than \`$ROLLBACK_MAX_CONFIG_VERSION\`, got \`$BAD_VERSION\`"
+    echo ""
+    echo -e "${GREEN}Nothing has been changed. This node is still running.${NC}"
+    echo ""
+
+    if [ -n "$ALT_CONF" ]; then
+        echo "A DIFFERENT backup on this node does hold a usable config:"
+        echo ""
+        echo "  $ALT_CONF"
+        echo ""
+        echo "Put it in place and re-run:"
+        echo "  cp $ALT_CONF $CONTAINERD_CONF"
+        if [ -n "$BACKUP_DIR" ] && [ -f "$BACKUP_DIR/config.toml" ]; then
+            echo ""
+            echo "Phase 0b selects the NEWEST backup, which is the unusable one."
+            echo "Move it aside so the copy above is what phase 3 restores:"
+            echo "  mv $BACKUP_DIR/config.toml $BACKUP_DIR/config.toml.rejected"
+        fi
+    else
+        echo "No usable config was found in any /root/docker-backup-* directory,"
+        echo "so this script cannot fix it for you. To proceed, put a config that"
+        echo "containerd $ROLLBACK_CONTAINERD_VERSION can read at $CONTAINERD_CONF, then re-run:"
+        echo ""
+        echo "  - restore a pre-upgrade copy, if you have one off this node, or"
+        echo ""
+        echo "  - hand-edit the file: set 'version = $ROLLBACK_MAX_CONFIG_VERSION' and remove any keys"
+        echo "    that only exist in version 4. KEEP the top-level 'root' and"
+        echo "    'state' values exactly as they are -- changing 'root' repoints"
+        echo "    this node at a different containerd data directory."
+    fi
+
+    if [ -f "$EFFECTIVE_CONF" ]; then
+        echo ""
+        echo "  Top-level root currently configured:"
+        awk '/^[[:space:]]*\[/ { exit } { print }' "$EFFECTIVE_CONF" 2>/dev/null \
+            | sed -n 's/^[[:space:]]*root[[:space:]]*=/      root =/p' | head -1
+    fi
+    echo ""
+    exit 1
 fi
 
 #############################################
@@ -551,8 +732,14 @@ echo ""
 echo "=== Phase 3: containerd Config ==="
 CURRENT_PHASE="phase 3 (containerd config)"
 
-# 2.2.6 and 2.2.1 share config v3, so a config written under 2.2.6 is valid
-# under 2.2.1. There is nothing to migrate and nothing to restore.
+# containerd 2.3.3 reads a version = 3 config and never rewrites it, so the
+# file on disk after an upgrade is normally still the v3 file 2.2.1 wrote --
+# valid here, nothing to migrate, nothing to restore.
+#
+# Phase 0c already proved this node's config is one containerd
+# $ROLLBACK_CONTAINERD_VERSION can load, or that the backup selected below
+# supplies one. That check ran before anything stopped; by the time control
+# reaches here the question is settled.
 #
 # This deliberately does NOT regenerate a default config when no backup exists.
 # Regenerating would discard a relocated `root` path, registry mirrors and
@@ -571,8 +758,13 @@ if [ -n "$BACKUP_DIR" ] && [ -f "$BACKUP_DIR/config.toml" ]; then
     fi
 elif [ -f /etc/containerd/config.toml ]; then
     echo "No pre-upgrade backup found."
-    echo "Keeping the existing config -- it is valid for containerd 2.2.x."
+    echo "Keeping the existing config -- phase 0c confirmed containerd"
+    echo "$ROLLBACK_CONTAINERD_VERSION can load it."
 else
+    # Safe to generate here specifically because the downgrade in phase 2 has
+    # already happened: this is the ROLLBACK containerd's binary, so it emits a
+    # config at its own version, not the newer one. Generating this before the
+    # downgrade would write a version the downgraded binary cannot read.
     echo -e "${YELLOW}No config and no backup; generating a default.${NC}"
     mkdir -p /etc/containerd
     containerd config default > /etc/containerd/config.toml
@@ -654,8 +846,9 @@ echo "  - docker-ce: $ROLLBACK_DOCKER_VERSION"
 echo "  - containerd.io: $ROLLBACK_CONTAINERD_VERSION"
 echo ""
 echo "This node is back on the version the cluster ran before the upgrade."
-echo "It can coexist with nodes already on 29.6.2 -- both speak containerd"
-echo "2.2.x gRPC, so a mixed 29.1.5/29.6.2 Swarm is supported."
+echo "It can coexist with nodes already on 29.7.2: both are Docker 29.x engines"
+echo "and speak the same Swarm protocol. The containerd difference (2.2.1 here"
+echo "vs 2.3.3 there) is local to each node and does not cross the wire."
 echo ""
 echo "Investigate what went wrong before retrying the upgrade:"
 echo "  /var/log/docker-upgrade.log"

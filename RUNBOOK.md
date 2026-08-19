@@ -1,11 +1,19 @@
-# Runbook — Docker 29.1.5 → 29.6.2 on Air-Gapped RHEL 8/9 Swarm
+# Runbook — Docker 29.1.5 → 29.7.2 on Air-Gapped RHEL 8/9 Swarm
 
-**Target:** docker-ce 29.6.2, containerd.io 2.2.6, buildx 0.35.0, compose 5.3.1
+**Target:** docker-ce 29.7.2, containerd.io 2.3.3, buildx 0.36.1, compose 5.5.0
 **From:** docker-ce 29.1.5, containerd.io 2.2.1
 **Rollback:** 29.1.5 / 2.2.1 (bundled)
 
-This upgrade stays inside the containerd 2.2.x line. It is substantially lower risk
-than the 28.5.1 → 29.1.5 round, and **nodes can be rolled one at a time**.
+This crosses containerd 2.2 → 2.3, a minor bump onto containerd's first annual LTS.
+It is substantially lower risk than the 28.5.1 → 29.1.5 round, and **nodes can be
+rolled one at a time**.
+
+⚠️ **One new thing to know before you roll back.** containerd 2.3.3 supports config
+version 4; 2.2.1 supports at most 3. The upgrade never writes a v4 config, so a
+normal rollback is unaffected. But if anyone runs
+`containerd config default > /etc/containerd/config.toml` on an upgraded node, that
+node can no longer be rolled back until the config is reverted — `rollback-docker.sh`
+phase 0c detects this and stops before touching anything. Don't run that command.
 
 ---
 
@@ -62,7 +70,7 @@ cd /opt/docker-offline
 ```
 
 `rm -rf` first is not optional. Extracting over a previous bundle leaves 29.1.5 and
-29.6.2 RPMs side by side; the script now rejects that, but avoiding it is cleaner.
+29.7.2 RPMs side by side; the script now rejects that, but avoiding it is cleaner.
 
 ### 3.2 Record the starting state
 
@@ -113,7 +121,7 @@ still serving and still active in the Swarm.
 | containerd 1.x installed | This script no longer handles the 1.7 → 2.x major migration. Use v1.2.3 (`974683a`). |
 | Starting version isn't 29.1.5 / 2.2.1 | Warns and asks. Untested path. |
 | Wrong, duplicate, corrupt, wrong-arch or wrong-release RPMs | Checked against RPM **metadata**, not filenames |
-| buildx / compose not at 0.35.0 / 5.3.1 | A bundle carrying last round's plugins shouldn't report success |
+| buildx / compose not at 0.36.1 / 5.5.0 | A bundle carrying last round's plugins shouldn't report success |
 | `rpm --test` refuses the transaction | Dependency or space problem, caught while the node is still up |
 
 **Phase 6 will stop you if** the config points at a relocated containerd root
@@ -124,8 +132,8 @@ empty root and make every image and snapshot look lost.
 ### 3.5 Verify
 
 ```bash
-docker version | grep -A2 Server        # 29.6.2
-containerd --version                    # 2.2.6
+docker version | grep -A2 Server        # 29.7.2
+containerd --version                    # 2.3.3
 rpm -q docker-ce docker-ce-cli containerd.io
 
 # containerd config was preserved, not regenerated
@@ -196,8 +204,14 @@ on failure and exits 2 if the cleanup was incomplete.
 Returns the node to 29.1.5 / 2.2.1. It validates and dry-runs before stopping
 anything, so a rollback that cannot succeed fails while the node is still up.
 
-A rolled-back node **can rejoin a cluster containing 29.6.2 nodes** — both speak
-containerd 2.2.x gRPC.
+A rolled-back node **can rejoin a cluster containing 29.7.2 nodes** — both are
+Docker 29.x engines speaking the same Swarm protocol. containerd's version is local
+to each node.
+
+If phase 0c refuses the rollback, it is telling you `/etc/containerd/config.toml` is
+a version containerd 2.2.1 cannot load. Restore the copy from
+`/root/docker-backup-<timestamp>/config.toml` and re-run. The node stays up
+throughout; nothing has been changed.
 
 ### dnf dependency problems
 
@@ -223,9 +237,12 @@ exist on production air-gapped hosts. Create it first or those commands will fai
 
 ## Things worth knowing
 
-**Mixed versions are fine here.** 29.1.5 and 29.6.2 both speak containerd 2.2.x
-gRPC. A partially upgraded cluster is a supported state, so you can stop between any
-two nodes. This is *not* true across the containerd 1.7 ↔ 2.x boundary.
+**Mixed versions are fine here.** 29.1.5 and 29.7.2 are both Docker 29.x engines
+speaking the same Swarm protocol; containerd runs locally on each node and its
+version does not cross the wire. A partially upgraded cluster is a supported state,
+so you can stop between any two nodes. This is *not* true across the containerd
+1.7 ↔ 2.x boundary. (Note: mixed-version clusters are Tier 3 and have not been
+executed on a real multi-node cluster — see `docs/TEST-PLAN.md`.)
 
 **containerd config is preserved.** The previous script regenerated
 `/etc/containerd/config.toml` from scratch. This one does not — if a node's

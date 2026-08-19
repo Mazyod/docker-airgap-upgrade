@@ -19,6 +19,7 @@ makes this possible on Apple Silicon.
 tests/vm/bootstrap-vm.sh      # build the S1 baseline (~5 min, downloads packages)
 tests/vm/build-bundle.sh      # run the real download script inside the VM (~333 MB)
 tests/vm/tier2-run.sh         # execute the Tier 2 cases
+tests/vm/config-version-check.sh  # containerd config v3/v4 boundary + rollback guard
 tests/vm/negative-control.sh  # prove test 2.4 would catch the regression
 tests/vm/teardown-vm.sh       # delete the machine
 ```
@@ -38,6 +39,7 @@ tests/vm/bootstrap-vm.sh --recreate   # nuke and rebuild, if state has drifted
 | `bootstrap-vm.sh` | Creates the machine and builds the **S1 baseline** (see below). |
 | `build-bundle.sh` | Runs the real `download-docker-packages.sh` in the VM and records the artifact SHA-256. |
 | `tier2-run.sh` | The Tier 2 cases: `reject`, `upgrade`, `rollback`, or all. |
+| `config-version-check.sh` | The containerd 2.2 → 2.3 config-version boundary, and `rollback-docker.sh` phase 0c. Destructive; reset afterwards. |
 | `negative-control.sh` | Builds a one-line mutant with the old phase 6 and proves it destroys the config. |
 | `reset-baseline.sh` | Reconstructs S1 without recreating the machine. |
 | `vm-write-manifest.sh` | Runs **inside** the VM; records the pre-upgrade truth. |
@@ -67,6 +69,15 @@ containerd readiness gating work; real rpm transactions apply and downgrade; pha
 rejects bad payloads with the node genuinely untouched; the relocated containerd root
 and `daemon.json` survive byte-identically; images, containers and volume data
 survive; rollback returns the node to 29.1.5 with data intact.
+
+`config-version-check.sh` additionally proves, by measurement rather than by reading
+release notes: that containerd 2.3.3 loads a `version = 3` config and leaves the file
+byte-identical; that the relocated root survives the in-memory migration; that
+`containerd config default` under 2.3.3 emits v4 while `containerd config migrate`
+writes only to stdout; that containerd 2.2.1 genuinely refuses a v4 config; and that
+`rollback-docker.sh` phase 0c catches that case with the node still running. Its
+section E is a negative control — if containerd 2.2.1 ever started on a v4 config,
+phase 0c would be guarding nothing and should be reconsidered, not kept.
 
 **Does NOT prove:**
 

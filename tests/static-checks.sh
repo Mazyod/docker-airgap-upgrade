@@ -41,10 +41,10 @@ SCRIPTS=(
 )
 
 # Target versions, kept here so a retarget that forgets a file gets caught.
-WANT_DOCKER="29.6.2"
-WANT_CONTAINERD="2.2.6"
-WANT_BUILDX="0.35.0"
-WANT_COMPOSE="5.3.1"
+WANT_DOCKER="29.7.2"
+WANT_CONTAINERD="2.3.3"
+WANT_BUILDX="0.36.1"
+WANT_COMPOSE="5.5.0"
 WANT_ROLLBACK_DOCKER="29.1.5"
 WANT_ROLLBACK_CONTAINERD="2.2.1"
 
@@ -274,6 +274,7 @@ cmp_fn() {
 cmp_fn verify_unit_stopped upgrade-docker.sh rollback-docker.sh clean-swarm-networks.sh
 cmp_fn start_services      rollback-docker.sh clean-swarm-networks.sh
 cmp_fn prompt_yes_no       upgrade-docker.sh clean-swarm-networks.sh
+cmp_fn read_config_version upgrade-docker.sh rollback-docker.sh
 
 #############################################
 head_ "1.12  Every helper called is also defined"
@@ -289,7 +290,8 @@ head_ "1.12  Every helper called is also defined"
 # deleted. Require the definition.
 for s in "${SCRIPTS[@]}"; do
     [ -f "$s" ] || continue
-    for fn in prompt_yes_no verify_unit_stopped start_services stop_services; do
+    for fn in prompt_yes_no verify_unit_stopped start_services stop_services \
+              read_config_version config_is_loadable; do
         # Does the script reference it anywhere other than its own definition?
         refs=$(grep -vE '^\s*#' "$s" | grep -cE "(^|[^[:alnum:]_])${fn}( |$|\")" || true)
         defs=$(grep -cE "^${fn}\(\) \{" "$s" || true)
@@ -337,6 +339,19 @@ for s in upgrade-docker.sh rollback-docker.sh clean-swarm-networks.sh; do
         bad "$s is missing a containerd readiness gate"
     fi
 done
+
+# The containerd config-version guard must run BEFORE anything stops.
+# containerd 2.2.1 refuses a version 4 config outright, so a rollback started
+# with one on disk downgrades successfully and then cannot start the runtime.
+# Detecting that after services are down is too late to be useful -- the whole
+# value of the check is that it costs nothing while the node is still healthy.
+cfg_guard_line=$(grep -n 'ROLLBACK_MAX_CONFIG_VERSION=' rollback-docker.sh | head -1 | cut -d: -f1)
+cfg_stop_line=$(grep -n 'systemctl stop docker docker.socket' rollback-docker.sh | head -1 | cut -d: -f1)
+if [ -n "$cfg_guard_line" ] && [ -n "$cfg_stop_line" ] && [ "$cfg_guard_line" -lt "$cfg_stop_line" ]; then
+    ok "rollback-docker.sh checks the config version before stopping services"
+else
+    bad "rollback-docker.sh config-version guard missing or too late (guard@${cfg_guard_line:-?}, stop@${cfg_stop_line:-?})"
+fi
 
 # Rollback resumability: --replacepkgs on both the dry run and the real call.
 rp=$(grep -vE '^\s*#' rollback-docker.sh | grep -c -- '--replacepkgs' || true)

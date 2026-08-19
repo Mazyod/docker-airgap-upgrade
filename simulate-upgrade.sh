@@ -2,7 +2,7 @@
 # /root/simulate-upgrade.sh
 # Run on a fresh RHEL 8 VM to test the full upgrade process
 #
-# This script simulates the complete Docker 29.1.5 → 29.6.2 upgrade path
+# This script simulates the complete Docker 29.1.5 → 29.7.2 upgrade path
 # in a controlled environment before deploying to production.
 #
 # WHAT THIS DOES AND DOES NOT PROVE
@@ -26,7 +26,7 @@ RHEL_VER=$(rpm -E %rhel)
 PKG_DIR="/opt/docker-offline/rhel${RHEL_VER}"
 
 echo "=========================================="
-echo "Docker Upgrade Simulation: 29.1.5 → 29.6.2"
+echo "Docker Upgrade Simulation: 29.1.5 → 29.7.2"
 echo "RHEL major: $RHEL_VER"
 echo "Date: $(date)"
 echo "=========================================="
@@ -79,11 +79,11 @@ cd "$PKG_DIR"
 # Download with explicit versions. -f so a bad version fails here rather than
 # writing a 404 page into a .rpm.
 for pkg in \
-    "docker-ce-29.6.2-1.el${RHEL_VER}.x86_64.rpm" \
-    "docker-ce-cli-29.6.2-1.el${RHEL_VER}.x86_64.rpm" \
-    "containerd.io-2.2.6-1.el${RHEL_VER}.x86_64.rpm" \
-    "docker-buildx-plugin-0.35.0-1.el${RHEL_VER}.x86_64.rpm" \
-    "docker-compose-plugin-5.3.1-1.el${RHEL_VER}.x86_64.rpm"
+    "docker-ce-29.7.2-1.el${RHEL_VER}.x86_64.rpm" \
+    "docker-ce-cli-29.7.2-1.el${RHEL_VER}.x86_64.rpm" \
+    "containerd.io-2.3.3-1.el${RHEL_VER}.x86_64.rpm" \
+    "docker-buildx-plugin-0.36.1-1.el${RHEL_VER}.x86_64.rpm" \
+    "docker-compose-plugin-5.5.0-1.el${RHEL_VER}.x86_64.rpm"
 do
     echo "Downloading: $pkg"
     curl -fsLO "https://download.docker.com/linux/rhel/${RHEL_VER}/x86_64/stable/Packages/$pkg"
@@ -153,8 +153,13 @@ dnf distro-sync -y --disablerepo='*' --enablerepo=docker-local --allowerasing \
     docker-buildx-plugin docker-compose-plugin
 
 # NOTE: `containerd config migrate` used to run here. It was required for the
-# 1.7 -> 2.x config format change. 2.2.1 and 2.2.6 both use config v3, so there
-# is nothing to migrate and the existing config is carried across untouched.
+# 1.7 -> 2.x config format change. 2.3.3 raises the config version from 3 to 4
+# but READS a v3 file unchanged -- it migrates in memory at load and never
+# writes back -- so the existing config is carried across untouched.
+#
+# Running migrate here would also be pointless: it writes to stdout, not to the
+# file. Writing its v4 output over the config would block a later rollback to
+# containerd 2.2.1, which loads at most version 3.
 
 # Start services in correct order: containerd FIRST
 echo ""
@@ -203,11 +208,11 @@ assert_pkg() {
     fi
 }
 
-assert_pkg docker-ce             29.6.2
-assert_pkg docker-ce-cli         29.6.2
-assert_pkg containerd.io         2.2.6
-assert_pkg docker-buildx-plugin  0.35.0
-assert_pkg docker-compose-plugin 5.3.1
+assert_pkg docker-ce             29.7.2
+assert_pkg docker-ce-cli         29.7.2
+assert_pkg containerd.io         2.3.3
+assert_pkg docker-buildx-plugin  0.36.1
+assert_pkg docker-compose-plugin 5.5.0
 
 # Config preservation is the single most important behavioural change in
 # upgrade-docker.sh v2.0.0, so it is a FAILURE here, not a note. (The dnf path

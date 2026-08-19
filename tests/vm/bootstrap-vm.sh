@@ -122,8 +122,22 @@ docker network inspect custom-bridge >/dev/null 2>&1 || docker network create cu
 echo ""
 echo "=== Writing baseline manifest to $MANIFEST ==="
 vm "mkdir -p /root/vmtests"
-orbctl push -m "$VM_NAME" ./vm-write-manifest.sh /tmp/vm-write-manifest.sh 2>/dev/null || \
-    vm "cp $(cd .. && pwd)/vm/vm-write-manifest.sh /tmp/vm-write-manifest.sh"
+
+# Stage the manifest writer by copying it off the mounted macOS filesystem --
+# OrbStack exposes the Mac's tree inside the machine at the same absolute path.
+#
+# `orbctl push` is NOT usable here. Its destination is resolved relative to the
+# Linux user's HOME, so an absolute /tmp/... destination is silently discarded:
+# nothing is copied and it still exits 0. The previous `push || cp` form could
+# therefore never reach its fallback, and the failure only surfaced one line
+# later as a confusing "chmod: cannot access" error.
+#
+# Verify the file actually landed rather than trusting any exit status.
+vm "cp \"$(pwd)/vm-write-manifest.sh\" /tmp/vm-write-manifest.sh"
+if ! vm "test -f /tmp/vm-write-manifest.sh" >/dev/null 2>&1; then
+    echo "ERROR: could not stage vm-write-manifest.sh into the VM." >&2
+    exit 1
+fi
 vm "chmod +x /tmp/vm-write-manifest.sh && /tmp/vm-write-manifest.sh $MANIFEST"
 
 echo ""

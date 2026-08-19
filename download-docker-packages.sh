@@ -1,10 +1,10 @@
 #!/bin/bash
 # download-docker-packages.sh
 # Run on the ONLINE RHEL 8 server to collect all packages needed for air-gapped upgrade
-VERSION="2.1.0"
+VERSION="2.2.0"
 #
 # This script downloads:
-# - Docker 29.6.2 packages for RHEL 8 and RHEL 9
+# - Docker 29.7.2 packages for RHEL 8 and RHEL 9
 # - Rollback packages (29.1.5) for emergency recovery
 # - NVIDIA Container Toolkit packages (for GPU servers)
 # - All upgrade/rollback/recovery scripts
@@ -44,18 +44,18 @@ fetch_pkg() {
 }
 
 echo ""
-echo "=== Downloading Docker 29.6.2 packages ==="
+echo "=== Downloading Docker 29.7.2 packages ==="
 
 # RHEL 8
 echo ""
 echo "Downloading RHEL 8 packages..."
 cd "$DEST_BASE/rhel8"
 for pkg in \
-    docker-ce-29.6.2-1.el8.x86_64.rpm \
-    docker-ce-cli-29.6.2-1.el8.x86_64.rpm \
-    containerd.io-2.2.6-1.el8.x86_64.rpm \
-    docker-buildx-plugin-0.35.0-1.el8.x86_64.rpm \
-    docker-compose-plugin-5.3.1-1.el8.x86_64.rpm
+    docker-ce-29.7.2-1.el8.x86_64.rpm \
+    docker-ce-cli-29.7.2-1.el8.x86_64.rpm \
+    containerd.io-2.3.3-1.el8.x86_64.rpm \
+    docker-buildx-plugin-0.36.1-1.el8.x86_64.rpm \
+    docker-compose-plugin-5.5.0-1.el8.x86_64.rpm
 do
     fetch_pkg 8 "$pkg"
 done
@@ -65,11 +65,11 @@ echo ""
 echo "Downloading RHEL 9 packages..."
 cd "$DEST_BASE/rhel9"
 for pkg in \
-    docker-ce-29.6.2-1.el9.x86_64.rpm \
-    docker-ce-cli-29.6.2-1.el9.x86_64.rpm \
-    containerd.io-2.2.6-1.el9.x86_64.rpm \
-    docker-buildx-plugin-0.35.0-1.el9.x86_64.rpm \
-    docker-compose-plugin-5.3.1-1.el9.x86_64.rpm
+    docker-ce-29.7.2-1.el9.x86_64.rpm \
+    docker-ce-cli-29.7.2-1.el9.x86_64.rpm \
+    containerd.io-2.3.3-1.el9.x86_64.rpm \
+    docker-buildx-plugin-0.36.1-1.el9.x86_64.rpm \
+    docker-compose-plugin-5.5.0-1.el9.x86_64.rpm
 do
     fetch_pkg 9 "$pkg"
 done
@@ -223,7 +223,7 @@ echo "Bundle ready: /opt/docker-upgrade-bundle.tar.gz"
 echo "Size: $(du -h /opt/docker-upgrade-bundle.tar.gz | cut -f1)"
 echo ""
 echo "Contents:"
-echo "  - Docker 29.6.2 / containerd.io 2.2.6 packages (RHEL 8 & 9)"
+echo "  - Docker 29.7.2 / containerd.io 2.3.3 packages (RHEL 8 & 9)"
 echo "  - Rollback packages (29.1.5 / containerd.io 2.2.1)"
 echo "  - NVIDIA Container Toolkit"
 echo "  - upgrade-docker.sh"

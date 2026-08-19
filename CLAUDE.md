@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this repo is
 
-Six standalone Bash scripts for upgrading Docker Engine 29.1.5 → 29.6.2 (and containerd.io 2.2.1 → 2.2.6) on **air-gapped RHEL 8/9 servers**. There is no application code, no build system, no package manager, and no test framework — the deliverable is the scripts themselves, bundled into a tarball and hand-carried to disconnected servers.
+Six standalone Bash scripts for upgrading Docker Engine 29.1.5 → 29.7.2 (and containerd.io 2.2.1 → 2.3.3) on **air-gapped RHEL 8/9 servers**. There is no application code, no build system, no package manager, and no test framework — the deliverable is the scripts themselves, bundled into a tarball and hand-carried to disconnected servers.
 
 The scripts run as root on RHEL. They cannot be executed on the macOS dev machine.
 
@@ -25,6 +25,7 @@ All six scripts are currently `bash -n` clean and `shellcheck` clean. Keep them 
 tests/vm/bootstrap-vm.sh      # build the S1 baseline
 tests/vm/build-bundle.sh      # real download-docker-packages.sh run
 tests/vm/tier2-run.sh         # Tier 2 cases: reject / upgrade / rollback
+tests/vm/config-version-check.sh  # containerd config v3/v4 boundary + the rollback guard
 tests/vm/negative-control.sh  # prove test 2.4 catches the regression
 tests/vm/reset-baseline.sh    # back to S1 between destructive runs
 ```
@@ -46,15 +47,31 @@ The repo deliberately contains two incompatible ways of installing the same pack
 
 ## Current upgrade scope (read this before changing phase logic)
 
-The cluster is on 29.1.5 / containerd.io 2.2.1. This upgrade stays **inside the containerd 2.2.x line**. That is why several things the previous round required are gone:
+The cluster is on 29.1.5 / containerd.io 2.2.1. This upgrade crosses **containerd 2.2 → 2.3**, a minor bump (2.3 is containerd's first annual LTS), not the 1.7 → 2.x major boundary the previous round crossed. Several things that round required are still gone:
 
-- **No containerd config migration or regeneration.** 2.2.1 and 2.2.6 share config v3. Regenerating would discard a relocated `root` path, registry mirrors and runtime config — silently repointing a node at an empty `/var/lib/containerd`. Phase 6 verifies; it does not rewrite.
+- **No containerd config migration or regeneration.** See the config-version section below — this is now a subtler claim than it used to be. Regenerating would discard a relocated `root` path, registry mirrors and runtime config — silently repointing a node at an empty `/var/lib/containerd` — *and* write a config that blocks rollback. Phase 6 verifies; it does not rewrite.
 - **No XFS `ftype=1` check.** Any node running containerd 2.x has already satisfied it.
 - **No automatic orphaned-network cleanup.** Extracted to `clean-swarm-networks.sh`, run on demand.
 
-All three are recoverable from git history at `upgrade-docker.sh` v1.2.3 (commit `974683a`) if a future containerd **major** upgrade needs them back. Do not resurrect them for a point release.
+All three are recoverable from git history at `upgrade-docker.sh` v1.2.3 (commit `974683a`) if a future containerd **major** upgrade needs them back. Do not resurrect them for a minor bump.
 
-**The whole-cluster-together rule does not apply here.** 29.1.5 and 29.6.2 both speak containerd 2.2.x gRPC, so a mixed 29.1.5/29.6.2 Swarm is fine and nodes roll one at a time. The rule still holds across the 1.7 ↔ 2.x boundary.
+**The whole-cluster-together rule does not apply here.** 29.1.5 and 29.7.2 are both Docker 29.x engines and speak the same Swarm protocol, so a mixed 29.1.5/29.7.2 Swarm is fine and nodes roll one at a time. containerd is a per-node local runtime; its version does not cross the wire between nodes. The rule still holds across the containerd 1.7 ↔ 2.x boundary. (Mixed-version clusters remain **Tier 3 and untested** — the VM harness is single-node.)
+
+### The containerd config version is asymmetric — this is the sharp edge
+
+containerd 2.2.1 supports config **version 3**; 2.3.3 raises the current version to **4**. The compatibility is one-directional, and both directions were measured on a real node with a relocated root (`tests/vm/config-version-check.sh`), not inferred from release notes:
+
+| | Result |
+|---|---|
+| v3 config under containerd 2.3.3 | **Loads.** Migrated in memory at load, logs `Configuration migrated from version 3`. Nothing written back; the file stays byte-identical. Relocated `root` survives — `containerd config dump` still reports it. |
+| v4 config under containerd 2.2.1 | **Refuses to start:** `failed to load TOML from /etc/containerd/config.toml: expected containerd config version equal to or less than \`3\`, got \`4\`` |
+
+Consequences that the scripts encode, and that must not be "simplified" away:
+
+- **Nothing in the upgrade path may write a v4 config.** `containerd config default` under 2.3.3 emits v4, so phase 6's no-config branch warns loudly when it has to generate one. `containerd config migrate` writes to **stdout**, not to the file — that is why running it is harmless and also why it is pointless here.
+- **The containerd.io RPM ships `/etc/containerd/config.toml` as `%config(noreplace)`** (verified: flags `cn`), so an operator's file survives the transaction byte for byte. That is the whole basis for "verify, don't rewrite".
+- **`rollback-docker.sh` phase 0c is a fail-closed guard**, and it runs *before* anything stops. A v4 config on disk with no usable backup means the downgrade would succeed and then leave the node with a runtime that will not start — on the node that is already in trouble. Phase 0c refuses instead, while docker and containerd are still up and refusing costs nothing.
+- **Order matters in rollback phase 3's "no config and no backup" branch.** It generates a default *after* the phase-2 downgrade, so it is the rollback containerd's own binary emitting its own version. Generating before the downgrade would write a version the downgraded binary cannot read.
 
 ## Invariants the scripts depend on
 
@@ -65,20 +82,29 @@ All three are recoverable from git history at `upgrade-docker.sh` v1.2.3 (commit
 - **Assert on RPM metadata, never on filenames.** The previous bundle has an identical directory layout, so a filename check would let an operator "upgrade" 29.1.5 → 29.1.5 and be told it succeeded.
 - **One rpm transaction, not several.** Splitting containerd.io and docker-ce into separate invocations can leave a downgraded runtime under a newer engine. Resolving the set together closes that gap, and rpm — not argument order — decides install ordering. This is **not** atomicity: rpm has no general rollback once execution starts, so a failing scriptlet can still leave partial state. That is what `PKG_STATE="attempted"` exists to report.
 - **`rollback-docker.sh` needs `--replacepkgs`.** `--oldpackage` permits a lower EVR but not reinstalling an identical one, so a rerun after a partially applied downgrade would be refused with "already installed" — on precisely the node that needs the rerun. (`upgrade-docker.sh` uses `--force`, which already implies it.)
-- **Whole clusters upgrade together across a containerd major.** containerd 2.x's gRPC API is incompatible with 1.7.x; mixed-version Swarm clusters produce ALPN handshake errors. Does not apply within 2.2.x.
+- **Whole clusters upgrade together across a containerd major.** containerd 2.x's gRPC API is incompatible with 1.7.x; mixed-version Swarm clusters produce ALPN handshake errors. Does not apply within 2.x, including the 2.2 → 2.3 minor bump.
 - **`docker-buildx-plugin` and `docker-compose-plugin` version independently** of docker-ce. Don't pin them to the docker-ce version.
 
 ## Version constants are duplicated — change all of them together
 
-Package versions (`29.6.2`, `2.2.6`, `0.35.0`, `5.3.1`, rollback `29.1.5`/`2.2.1`) appear in:
+Package versions (`29.7.2`, `2.3.3`, `0.36.1`, `5.5.0`, rollback `29.1.5`/`2.2.1`) appear in:
 
 - `download-docker-packages.sh` — four download loops (rhel8, rhel9, rollback-rhel8, rollback-rhel9)
 - `upgrade-docker.sh` — `EXPECTED_DOCKER_VERSION` / `EXPECTED_CONTAINERD_VERSION` constants, plus the header and banner
 - `rollback-docker.sh` — `ROLLBACK_DOCKER_VERSION` / `ROLLBACK_CONTAINERD_VERSION` constants, plus the header and banner
 - `simulate-upgrade.sh` — its own download loop, the `dnf install` pins, and the `assert_pkg` calls
-- `README.md` — the version table and verification section
+- `tests/static-checks.sh` — `WANT_DOCKER` / `WANT_CONTAINERD` / `WANT_BUILDX` / `WANT_COMPOSE`
+- `tests/vm/lib.sh` — `TARGET_*` (and `BASELINE_*` when the *starting* version moves). `tools/make-release.sh` sources this file, so the release title follows automatically
+- `README.md` — the version table, the release-date table, and the verification section
+- `RUNBOOK.md` — the target/from header
+- `docs/TEST-PLAN.md` — the version references in the Tier 2 table
 
 The two upgrade/rollback scripts now hold their versions in named constants at the top rather than scattered through the body — change the constant, not the occurrences.
+
+The two test files are the backstop: `tests/static-checks.sh` fails if any script or
+README drifts from its `WANT_*` values, so a retarget that forgets a file gets caught
+— but only if you update `WANT_*` itself. Change it first, then let the failures tell
+you what else to edit.
 
 Directory layout is assumed by path in several scripts: `/opt/docker-offline/rhel${RHEL_VER}`, `rollback-rhel${RHEL_VER}`, `nvidia`. RHEL version comes from `rpm -E %rhel`.
 
@@ -92,7 +118,7 @@ shipped but says nothing about which packages an operator installed, and an air-
 operator cannot rebuild the bundle. See `docs/RELEASING.md`.
 
 ```bash
-tools/make-release.sh v29.6.2-1        # --draft to review first
+tools/make-release.sh v29.7.2-1        # --draft to review first
 ```
 
 Tag scheme is `v<TARGET_DOCKER_VERSION>-<BUNDLE_REVISION>`. The script refuses to run
@@ -107,9 +133,9 @@ Every script except `simulate-upgrade.sh` declares `VERSION="x.y.z"` on ~line 4 
 
 | Script | Version |
 |---|---|
-| `upgrade-docker.sh` | 2.0.0 |
-| `rollback-docker.sh` | 2.0.0 |
-| `download-docker-packages.sh` | 2.1.0 |
+| `upgrade-docker.sh` | 2.1.0 |
+| `rollback-docker.sh` | 2.1.0 |
+| `download-docker-packages.sh` | 2.2.0 |
 | `clean-swarm-networks.sh` | 1.0.0 |
 | `recover-dnf.sh` | 1.2.2 |
 
@@ -124,12 +150,13 @@ Numbered phase blocks, each fenced by a `####` comment banner: **0 validate payl
 Things the phase structure encodes:
 
 - **Phase 0 runs before anything mutates the node** — including before the Swarm drain. A payload problem must not leave a node drained.
-- **The containerd 1.x hard stop is evaluated unconditionally**, before the already-at-target / partial-upgrade / unexpected-version branches. It was previously nested inside the unexpected-version branch, which made it bypassable: a node with docker-ce already at 29.6.2 but containerd still 1.x took the partial-upgrade branch and never reached it. Any guard that must always fire belongs outside the `if/elif/else`, not in one arm of it.
+- **The containerd 1.x hard stop is evaluated unconditionally**, before the already-at-target / partial-upgrade / unexpected-version branches. It was previously nested inside the unexpected-version branch, which made it bypassable: a node with docker-ce already at 29.7.2 but containerd still 1.x took the partial-upgrade branch and never reached it. Any guard that must always fire belongs outside the `if/elif/else`, not in one arm of it.
 - **Already-at-target means all five packages**, not the core three. A partially applied transaction can leave correct core packages beside stale plugins, and that node still needs the run.
 - **`rollback-docker.sh` has a phase 0b** that selects and confirms the containerd config backup *before* services stop. Choosing it in phase 3 (after the downgrade) left an operator who saw the wrong backup named with no option but to interrupt a half-finished rollback.
+- **`rollback-docker.sh` has a phase 0c** that refuses the rollback outright when `/etc/containerd/config.toml` is a version the rollback containerd cannot load and no usable backup exists. It runs before phase 0b's services stop, for the same reason: a node that downgrades and then cannot start its runtime is strictly worse off than one that was told no.
 - **Swarm workers cannot drain or inspect themselves** — only managers can run `docker node` commands. Workers get printed instructions and a "has this been drained?" prompt; managers drain themselves interactively. `IS_MANAGER` comes from `.Swarm.ControlAvailable`.
 - **Failure is reported, not guessed at.** An EXIT trap tracks `CURRENT_PHASE`, `SERVICES_STOPPED`, and a tri-state `PKG_STATE` (`untouched`/`attempted`/`installed`). It deliberately does **not** auto-restart services: after an rpm transaction, retry-vs-rollback is an operator judgement call. `PKG_STATE` is set to `attempted` *before* the rpm call, because a transaction can change host state and still fail.
-- **NVIDIA is best-effort.** `libnvidia-container-devel` and `libnvidia-container1-debuginfo` are force-removed first because they pin old versions; failures warn instead of aborting. A corrupt NVIDIA RPM skips the toolkit upgrade rather than aborting the run. `nvidia-ctk runtime configure --runtime=containerd` is deliberately skipped — nvidia-ctk doesn't understand containerd config v3 yet.
+- **NVIDIA is best-effort.** `libnvidia-container-devel` and `libnvidia-container1-debuginfo` are force-removed first because they pin old versions; failures warn instead of aborting. A corrupt NVIDIA RPM skips the toolkit upgrade rather than aborting the run. `nvidia-ctk runtime configure --runtime=containerd` is deliberately skipped — nvidia-ctk doesn't understand containerd config v3, let alone the v4 that 2.3.3 introduces, and rewriting the config is exactly what must not happen here.
 
 ## clean-swarm-networks.sh
 

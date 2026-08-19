@@ -1,7 +1,7 @@
 #!/bin/bash
 # upgrade-docker.sh
-# Run on each AIR-GAPPED server to upgrade Docker 29.1.5 → 29.6.2
-VERSION="2.0.0"
+# Run on each AIR-GAPPED server to upgrade Docker 29.1.5 → 29.7.2
+VERSION="2.1.0"
 #
 # Prerequisites:
 # - Extract docker-upgrade-bundle.tar.gz to /opt/
@@ -18,13 +18,24 @@ VERSION="2.0.0"
 # to avoid SSL certificate issues with corporate satellite servers
 # (e.g., "SSL certificate problem: EE certificate key too weak")
 #
-# SCOPE OF THIS VERSION (2.0.0)
+# SCOPE OF THIS VERSION (2.1.0)
 #
-# This upgrade stays inside the containerd 2.2.x line (2.2.1 -> 2.2.6). It is
-# NOT the 28.5.1 -> 29.1.5 migration this script originally performed, which
-# crossed the containerd 1.7 -> 2.x major boundary. Three things that boundary
-# required have been removed, because inside 2.2.x they range from inert to
-# actively harmful:
+# This upgrade crosses containerd 2.2.1 -> 2.3.3: a MINOR containerd bump, not
+# the 1.7 -> 2.x MAJOR boundary the 28.5.1 -> 29.1.5 migration crossed. 2.3 is
+# containerd's first annual LTS.
+#
+# The minor bump does raise the containerd config version from 3 to 4, but it
+# is read-compatible in the direction that matters: 2.3.3 loads an existing
+# version = 3 file, migrates it in memory, and never writes it back. So no
+# config migration is performed here either -- see phase 6, which explains what
+# was measured and why writing a v4 config would be actively harmful.
+#
+# What is NOT read-compatible is the reverse direction, and that is new in this
+# version: containerd 2.2.1 refuses a version = 4 config outright. Phase 0c of
+# rollback-docker.sh guards it, before anything stops.
+#
+# Three things the 1.7 -> 2.x boundary required remain removed, because at a
+# minor bump they range from inert to actively harmful:
 #
 #   - Phase 4.5, orphaned VXLAN/network cleanup. Extracted to the standalone
 #     clean-swarm-networks.sh. The daemon now stops cleanly, so there is no
@@ -36,9 +47,11 @@ VERSION="2.0.0"
 #     prompt. Any node already running containerd 2.x has satisfied the ftype
 #     requirement; the check cannot fire usefully here.
 #
-#   - containerd config regeneration. 2.2.1 and 2.2.6 share config v3, so there
-#     is nothing to migrate, and regenerating would DISCARD a relocated root
-#     path, registry mirrors, and runtime config. Phase 6 now verifies instead.
+#   - containerd config regeneration. 2.3.3 reads the existing v3 config and
+#     migrates it in memory, so there is nothing to migrate on disk -- and
+#     regenerating would DISCARD a relocated root path, registry mirrors, and
+#     runtime config, as well as writing a v4 file that blocks rollback.
+#     Phase 6 verifies instead.
 #
 # All three are preserved in git history at upgrade-docker.sh v1.2.3 (commit
 # 974683a) should a future containerd MAJOR upgrade need them back.
@@ -55,7 +68,7 @@ NC='\033[0m' # No Color
 exec > >(tee -a /var/log/docker-upgrade.log) 2>&1
 
 echo "=========================================="
-echo "Docker Upgrade: 29.1.5 → 29.6.2"
+echo "Docker Upgrade: 29.1.5 → 29.7.2"
 echo "Script Version: $VERSION"
 echo "Server: $(hostname)"
 echo "Date: $(date)"
@@ -174,15 +187,15 @@ trap 'exit 143' TERM
 #
 # Keep in sync with download-docker-packages.sh, rollback-docker.sh,
 # simulate-upgrade.sh and README.md -- see CLAUDE.md.
-EXPECTED_DOCKER_VERSION="29.6.2"
-EXPECTED_CONTAINERD_VERSION="2.2.6"
+EXPECTED_DOCKER_VERSION="29.7.2"
+EXPECTED_CONTAINERD_VERSION="2.3.3"
 
 # buildx and compose version INDEPENDENTLY of docker-ce -- these are their own
 # versions, not derived from the engine version, and must never be set to it.
 # They are still asserted: the bundle ships specific builds, and a bundle that
 # quietly carries last round's plugins should not report success.
-EXPECTED_BUILDX_VERSION="0.35.0"
-EXPECTED_COMPOSE_VERSION="5.3.1"
+EXPECTED_BUILDX_VERSION="0.36.1"
+EXPECTED_COMPOSE_VERSION="5.5.0"
 
 # The baseline this upgrade was designed and tested against. Starting anywhere
 # else is a warning, except containerd 1.x which is a hard stop -- that crosses
@@ -515,7 +528,7 @@ CURRENT_COMPOSE=$(rpm -q docker-compose-plugin --queryformat '%{VERSION}' 2>/dev
 # UNCONDITIONAL hard stop, evaluated before any of the branches below.
 #
 # This was previously nested inside the "unexpected starting version" branch,
-# which made it bypassable: a node with docker-ce already at 29.6.2 but
+# which made it bypassable: a node with docker-ce already at 29.7.2 but
 # containerd still on 1.x took the partial-upgrade branch instead and never
 # reached this check -- letting the script attempt exactly the major migration
 # it no longer supports.
@@ -524,7 +537,7 @@ case "$CURRENT_CONTAINERD" in
         echo ""
         echo -e "${RED}=========================================="
         echo "ERROR: containerd 1.x DETECTED"
-        echo "==========================================${NC}"
+        echo -e "==========================================${NC}"
         echo ""
         echo "  this node has containerd.io $CURRENT_CONTAINERD"
         echo ""
@@ -577,7 +590,7 @@ else
         echo ""
         echo -e "${YELLOW}=========================================="
         echo "WARNING: UNEXPECTED STARTING VERSION"
-        echo "==========================================${NC}"
+        echo -e "==========================================${NC}"
         echo ""
         echo "  tested upgrade path: $SUPPORTED_FROM_DOCKER / containerd.io $SUPPORTED_FROM_CONTAINERD"
         echo "  this node has:       ${CURRENT_DOCKER:-absent} / containerd.io ${CURRENT_CONTAINERD:-absent}"
@@ -688,7 +701,7 @@ if [ "$SWARM_STATE" = "active" ]; then
             echo ""
             echo -e "${RED}=========================================="
             echo "WARNING: WORKER NODE CANNOT DRAIN ITSELF"
-            echo "==========================================${NC}"
+            echo -e "==========================================${NC}"
             echo ""
             echo "This is a Swarm WORKER node. Workers cannot drain themselves."
             echo "Please drain this node from a MANAGER node first:"
@@ -843,13 +856,29 @@ echo ""
 echo "=== Phase 6: Verify containerd Config ==="
 CURRENT_PHASE="phase 6 (containerd config)"
 
-# containerd 2.2.1 and 2.2.6 share config v3 -- there is nothing to migrate.
+# containerd 2.2.1 speaks config v3; 2.3.3 raises the current version to v4.
+# Unlike the 2.2.1 -> 2.2.6 move this replaces, that IS a config-format
+# boundary -- but it is a read-compatible one, and the correct response is
+# still to leave the file alone. Verified against containerd.io 2.3.3 on a node
+# with a relocated root (tests/vm/config-version-check.sh):
 #
-# This phase deliberately does NOT run `containerd config default`. Doing so
-# overwrites the file, discarding a relocated `root` path, registry mirrors,
-# and runtime configuration. A node whose containerd root was moved during the
-# 1.7 -> 2.x upgrade would be silently repointed at an empty
-# /var/lib/containerd, orphaning every image and snapshot it holds.
+#   - 2.3.3 loads a version = 3 config unchanged. It migrates it IN MEMORY at
+#     load time and logs "Configuration migrated from version 3, use
+#     `containerd config migrate` to avoid migration". Nothing is written back.
+#   - The RPM ships /etc/containerd/config.toml as %config(noreplace), so an
+#     operator's file survives the transaction byte for byte.
+#   - A relocated top-level `root` survives the in-memory migration:
+#     `containerd config dump` still reports the relocated path.
+#
+# So this phase still VERIFIES rather than rewrites -- and that now matters
+# MORE, not less. `containerd config default` under 2.3.3 emits version = 4,
+# and containerd 2.2.1 refuses to load a v4 file at all:
+#
+#   containerd: failed to load TOML from /etc/containerd/config.toml:
+#   expected containerd config version equal to or less than `3`, got `4`
+#
+# Writing a v4 config here would arm a trap that springs only during an
+# emergency rollback, on a node that is already in trouble. Leave v3 alone.
 #
 # Config validity is proven downstream rather than here: phase 8 polls
 # `ctr version` and the overlayfs snapshotter, and neither responds if the
@@ -857,13 +886,83 @@ CURRENT_PHASE="phase 6 (containerd config)"
 
 CONTAINERD_CONF="/etc/containerd/config.toml"
 
+# The highest config version the ROLLBACK containerd (2.2.1) can load. A config
+# at or below this is safe to leave in place for an emergency rollback.
+ROLLBACK_SAFE_CONFIG_VERSION=3
+
+# Read the top-level `version` key. The awk stops at the first [section] header
+# so only top-level keys count, matching the `root` parser below.
+read_config_version() {
+    # Tolerate an optionally quoted value. containerd wants an integer here, so
+    # `version = "4"` is not a config it would accept anyway -- but reading it
+    # as 4 makes this guard FIRE, whereas failing to match would silently read
+    # as "no version key" and wave the file through. Err toward firing.
+    awk '/^[[:space:]]*\[/ { exit } { print }' "$1" 2>/dev/null \
+        | sed -n "s/^[[:space:]]*version[[:space:]]*=[[:space:]]*['\"]\{0,1\}\([0-9][0-9]*\)['\"]\{0,1\}.*/\1/p" \
+        | head -1
+}
+
 if [ ! -f "$CONTAINERD_CONF" ]; then
+    # containerd.io ships this file, so reaching here means it was deliberately
+    # removed. Generating a default is the only option, but under 2.3.3 that
+    # default is v4 -- which the rollback containerd cannot read. Say so plainly
+    # rather than letting the operator discover it mid-emergency.
     echo -e "${YELLOW}No $CONTAINERD_CONF found - generating a default.${NC}"
     mkdir -p /etc/containerd
     containerd config default > "$CONTAINERD_CONF"
     echo "Default configuration written."
+    GENERATED_VERSION=$(read_config_version "$CONTAINERD_CONF")
+    if [ -n "$GENERATED_VERSION" ] && \
+       [ "$GENERATED_VERSION" -gt "$ROLLBACK_SAFE_CONFIG_VERSION" ]; then
+        echo ""
+        echo -e "${YELLOW}WARNING: the generated config is version $GENERATED_VERSION.${NC}"
+        echo "containerd 2.2.1 cannot load it. If this node is ever"
+        echo "rolled back, containerd will refuse to start until the config is"
+        echo "replaced with a version <= $ROLLBACK_SAFE_CONFIG_VERSION file."
+        echo "rollback-docker.sh checks for this and will tell you before it acts."
+    fi
 else
     echo "Existing configuration preserved (backed up in $BACKUP_DIR)."
+fi
+
+# Report the config version, and flag the rollback implication if it is one the
+# rollback containerd cannot read.
+CONFIG_VERSION=$(read_config_version "$CONTAINERD_CONF")
+if [ -z "$CONFIG_VERSION" ]; then
+    echo "containerd config version: unset (treated as legacy; rollback-safe)"
+elif [ "${#CONFIG_VERSION}" -gt 4 ]; then
+    # Not a real config version -- a corrupt file. Comparing it would print a
+    # raw "integer expression expected" from bash, since `[` is 64-bit only.
+    # Report it instead; phase 8 is what actually proves the config loads.
+    echo ""
+    echo -e "${YELLOW}NOTE: containerd config version reads as '$CONFIG_VERSION'.${NC}"
+    echo "That is not a valid config version -- $CONTAINERD_CONF may be corrupt."
+    echo "Services start next; if containerd fails to come up, this is why."
+elif [ "$CONFIG_VERSION" -le "$ROLLBACK_SAFE_CONFIG_VERSION" ]; then
+    # Deliberately bounded from ABOVE only. A lower bound ("is this too old for
+    # 2.3.3?") is not asserted: every node in this fleet came from containerd
+    # 2.2.1, which writes v3, so a v2 config would have to be hand-made. Adding
+    # an untested lower bound risks refusing a node that is actually fine, and
+    # phase 8's readiness gate already catches a config containerd cannot load.
+    echo "containerd config version: $CONFIG_VERSION (rollback-safe)"
+else
+    echo ""
+    echo -e "${YELLOW}NOTE: containerd config version is $CONFIG_VERSION.${NC}"
+    echo "containerd 2.2.1 -- the rollback target -- loads at most version"
+    echo "$ROLLBACK_SAFE_CONFIG_VERSION. A rollback would leave containerd unable to start until"
+    echo "this file is reverted."
+    # Only name the backup if one actually exists. Phase 3 copies the config
+    # with `|| true`, so when there was no config to back up there is no file
+    # here either -- and sending an operator to a path that does not exist,
+    # mid-rollback, is worse than saying nothing.
+    if [ -f "$BACKUP_DIR/config.toml" ]; then
+        echo "The pre-upgrade copy is in:"
+        echo "  $BACKUP_DIR/config.toml"
+    else
+        echo -e "${YELLOW}No pre-upgrade copy exists in $BACKUP_DIR -- there was no${NC}"
+        echo -e "${YELLOW}config to back up. Keep a copy of this file somewhere off${NC}"
+        echo -e "${YELLOW}the node if you may need to roll back.${NC}"
+    fi
 fi
 
 # rpm keeps %config(noreplace) files in place and drops the package's version
@@ -914,7 +1013,7 @@ if [ ! -d "$CONTAINERD_ROOT" ]; then
         echo ""
         echo -e "${RED}=========================================="
         echo "ERROR: RELOCATED containerd ROOT IS MISSING"
-        echo "==========================================${NC}"
+        echo -e "==========================================${NC}"
         echo ""
         echo "  /etc/containerd/config.toml points at: $CONTAINERD_ROOT"
         echo "  ...but that directory does not exist."
@@ -991,7 +1090,8 @@ CURRENT_PHASE="phase 7 (nvidia toolkit)"
         fi
 
         # Reconfigure NVIDIA runtime for Docker
-        # Note: nvidia-ctk doesn't support containerd config v3 yet, so skip containerd
+        # Note: nvidia-ctk doesn't understand containerd config v3, let alone the
+        # v4 that containerd 2.3.3 introduces, so the containerd runtime is skipped.
         echo "Configuring NVIDIA runtime for Docker..."
         if nvidia-ctk runtime configure --runtime=docker 2>/dev/null; then
             echo -e "${GREEN}NVIDIA Docker runtime configured.${NC}"
@@ -999,8 +1099,11 @@ CURRENT_PHASE="phase 7 (nvidia toolkit)"
             echo -e "${YELLOW}WARNING: nvidia-ctk docker config failed. Manual config may be needed.${NC}"
         fi
 
-        # Skip containerd config - nvidia-ctk doesn't support config version 3
-        echo "Skipping containerd NVIDIA config (nvidia-ctk doesn't support config v3 yet)"
+        # Skip the containerd runtime deliberately. Beyond nvidia-ctk not
+        # understanding config v3/v4, having it rewrite /etc/containerd/config.toml
+        # is exactly what phase 6 exists to prevent: it would discard a relocated
+        # root and could emit a version the rollback containerd cannot load.
+        echo "Skipping containerd NVIDIA config (nvidia-ctk does not understand config v3/v4)"
 
         echo "NVIDIA toolkit upgrade complete."
     else

@@ -1,28 +1,40 @@
-# Test Plan — Docker 29.1.5 → 29.6.2 Retarget
+# Test Plan — Docker 29.1.5 → 29.7.2 Retarget
 
 **Date:** 2026-07-28
 **Scope:** the six scripts retargeted in `a65edd7`, `7df0355`, `a095c40` and later
 
-## Execution status (2026-07-28)
+## Execution status (2026-08-19, retarget to 29.7.2 / containerd.io 2.3.3)
 
 | Tier | Status | Evidence |
 |---|---|---|
-| Tier 1 static | **PASSED 122/122** | `tests/static-checks.sh --online` |
+| Tier 1 static | **PASSED 127/127** | `tests/static-checks.sh --online` — includes all 16 RPM URLs |
 | Tier 2 VM | **PASSED 45/45** | `tests/vm/tier2-run.sh` on Rocky 9 / x86_64 / systemd |
+| Tier 2 config-version boundary | **PASSED 30/30** | `tests/vm/config-version-check.sh` — cases 2.23–2.28 |
 | Tier 2 negative control | **PASSED 3/3** | `tests/vm/negative-control.sh` — mutant loses the relocated root |
 | Tier 1b stubbed | not built | optional; Tier 2 covers most of its intent |
 | Tier 3 Swarm | **NOT RUN** | needs a real multi-node cluster |
+
+Every number above was produced by the scripts as they now stand, against a bundle
+rebuilt from this checkout — not from an earlier build.
 
 Tier 2 ran against a **relocated containerd root on a separate XFS filesystem** with
 real images, containers and volume data on it — the exact configuration the previous
 script version destroyed. The negative control confirms a one-line mutant restoring
 the old phase 6 loses that root (`/data/containerd` → `/var/lib/containerd`), so 2.4
-is a genuine regression test rather than a vacuous pass.
+is a genuine regression test rather than a vacuous pass. Since the retarget, that
+mutant is doubly harmful: regenerating the config under containerd 2.3.3 both loses
+the relocated root *and* writes a `version = 4` file that would block a later
+rollback.
+
+The config-version guard (`rollback-docker.sh` phase 0c) was **mutation-tested**, not
+merely exercised — see 2.27/2.28 above for what the neutered build does to the node.
 
 **Tier 3 remains mandatory before production.** Nothing about Swarm — drain,
 reactivation, overlay reconvergence, mixed-version operation, or
-`clean-swarm-networks.sh` — has been executed. See `tests/vm/README.md` for the full
-list of what the VM tier does and does not prove.
+`clean-swarm-networks.sh` — has been executed. The claim that a mixed
+29.1.5 / 29.7.2 cluster is safe rests on both being Docker 29.x engines, **not** on a
+measurement. See `tests/vm/README.md` for the full list of what the VM tier does and
+does not prove.
 
 ## What each tier can and cannot prove
 
@@ -123,7 +135,7 @@ in place. Clear `/var/log/docker-*.log` before any canonical run.
 |---|---|---|---|
 | 2.1 | `simulate-upgrade.sh` | S0 | Exits 0; all asserts OK |
 | 2.2 | Same on RHEL 9 | S0 | Exits 0 — the script auto-detects the RHEL major, so this runs the **checked-in artifact unmodified** |
-| 2.3 | Real air-gapped path | S1 | Exits 0; phase 9 asserts all five packages; `docker version` shows 29.6.2 |
+| 2.3 | Real air-gapped path | S1 | Exits 0; phase 9 asserts all five packages; `docker version` shows 29.7.2 |
 | **2.4** | **Relocated-root regression** ⚑ | S1 | See below — the most important test here |
 | 2.5 | `daemon.json` preserved | S1 | Byte-identical after upgrade; daemon restarts; `docker info` shows the configured mirror actually loaded |
 | 2.6 | Wrong bundle (29.1.5 RPMs) | S1 | Fails in phase 0; services still running; node untouched |
@@ -143,6 +155,60 @@ in place. Clear `/var/log/docker-*.log` before any canonical run.
 | 2.20 | NVIDIA absent / corrupt / valid | S1 variants | Absent and corrupt both skip cleanly without aborting; valid installs |
 | 2.21 | `.rpmnew` surfaced | S1 with a modified config.toml | Phase 6 reports the `.rpmnew` |
 | 2.22 | Logs | any canonical run | Cleared beforehand; contains start marker, every expected phase, final marker; process exit status recorded |
+
+### 2.23–2.28 — the containerd config-version boundary ⚑
+
+New in the 2.2 → 2.3 retarget. containerd 2.2.1 loads config version 3; 2.3.3 raises
+the current version to 4, and the compatibility is one-directional. Automated by
+`tests/vm/config-version-check.sh`, which is **destructive** — reset the baseline
+afterwards.
+
+| # | Test | From | Pass criteria |
+|---|---|---|---|
+| 2.23 | v3 config under containerd 2.3.3 | S1 | containerd starts; `ctr version` and the overlayfs snapshotter respond; journal logs `Configuration migrated from version 3` |
+| 2.24 | Config not rewritten | S1 | `/etc/containerd/config.toml` is byte-identical (sha256) after the rpm transaction; still `version = 3`; no `.rpmsave` |
+| 2.25 | Relocated root survives the in-memory migration | S1 | `containerd config dump` under 2.3.3 still reports the relocated `root` |
+| 2.26 | The v4 generators | S1 | `containerd config default` under 2.3.3 emits a version above 3; `containerd config migrate` writes to stdout and leaves the file untouched |
+| 2.27 | **Rollback guard** ⚑ | S1 + v4 config on disk, no backup dir | `rollback-docker.sh` exits non-zero in phase 0c naming the config version; containerd.io **not** downgraded; docker and containerd still running |
+| 2.27a | Guard follows phase 3's branch | S1, config **absent**, backup holds a v4 config | Refused, and the message names the *backup* as the offending file. Phase 3 restores the backup, so the backup — not the on-disk file — is what containerd would be asked to load |
+| 2.27b | Older usable backup is found | S1, newest backup v4, older backup v3 | Refused, and the message prints the `cp` for the older, loadable backup rather than claiming none exists |
+| 2.28 | Negative control — the hazard is real | S1 + v4 config, downgrade forced past the guard | containerd 2.2.1 fails to start; journal shows `expected containerd config version equal to or less than`; restoring the v3 file recovers it |
+
+2.28 is the one that keeps 2.27 honest. If containerd 2.2.1 ever starts cleanly on a
+v4 config, phase 0c is guarding nothing and should be reconsidered rather than kept
+for decoration.
+
+**Mutation-tested.** Setting `ROLLBACK_MAX_CONFIG_VERSION=99` in the VM's copy of
+`rollback-docker.sh` (so the guard can never fire) makes 2.27 fail in exactly the way
+that matters — and shows what the guard is worth:
+
+```
+FAIL D3 aborted without naming the config version
+FAIL D4 containerd.io was NOT downgraded (got '2.2.1', want '2.3.3')
+FAIL D5 containerd is still running (got 'activating', want 'active')
+FAIL D6 docker is still running (got 'inactive', want 'active')
+```
+
+Without the guard the rollback runs to completion and leaves the node with containerd
+in a crash-restart loop and docker down. Note that the exit-code check alone (D2)
+still passes in the mutant, because the rollback fails *later*, when it cannot start
+containerd — so the state assertions D4–D6, not the exit code, are what actually
+distinguish "refused safely" from "broke the node".
+
+2.27a/2.27b are mutation-tested the same way. Making the effective-config choice skip
+the backup (`if false; then` on that branch, reproducing the original defect found in
+review) yields:
+
+```
+PASS D7  config absent + v4 BACKUP: rollback exited non-zero (exit 1)
+FAIL D7a containerd.io was NOT downgraded (got '2.2.1', want '2.3.3')
+FAIL D7b containerd still running (got 'activating', want 'active')
+FAIL D8  refusal did not identify the backup as the offending config
+```
+
+D7 passing there is the whole point: the mutant's non-zero exit comes from the
+rollback completing and *then* failing to start containerd. Any guard test that
+checks only an exit code is measuring the outage it was meant to prevent.
 
 ### 2.4 — Relocated-root regression, in full
 
@@ -194,7 +260,7 @@ after each manager upgrade.
 |---|---|---|
 | 3.1 | Worker drain guard (run first) | Refuses without attestation; prints manager-side command |
 | 3.2 | Worker upgrade | Drains, upgrades, reactivates, tasks reschedule |
-| 3.3 | **Mixed-version cluster** | One node on 29.6.2, rest on 29.1.5; service spanning both; no ALPN errors; overlay traffic works both directions |
+| 3.3 | **Mixed-version cluster** | One node on 29.7.2, rest on 29.1.5; service spanning both; no ALPN errors; overlay traffic works both directions |
 | 3.4 | Mixed-version soak | Sustained representative traffic, not one request. Journals on every node clean of ALPN, overlay, snapshotter, OOM, daemon-restart errors |
 | 3.5 | Overlay DNS / VIP / ingress | Service discovery, VIP routing, routing mesh, secrets and configs all functional across versions |
 | 3.6 | Manager upgrade | Self-drains; quorum retained; Raft healthy after |
@@ -202,7 +268,7 @@ after each manager upgrade.
 | 3.8 | Cleanup abort | Answer "n" at the final prompt: services restarted, nothing deleted, exit 0 |
 | 3.9 | `clean-swarm-networks.sh` | On a dedicated/snapshotted drained node: preview matches deletions exactly; services return; node rejoins overlays; exit 0 |
 | 3.10 | Cleanup incomplete | Force one deletion to fail: reports the failure and **exits 2** |
-| 3.11 | Rollback in a mixed cluster | A rolled-back 29.1.5 node rejoins a cluster containing 29.6.2 nodes and schedules work |
+| 3.11 | Rollback in a mixed cluster | A rolled-back 29.1.5 node rejoins a cluster containing 29.7.2 nodes and schedules work |
 
 ## Environment fidelity
 

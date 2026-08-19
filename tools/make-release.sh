@@ -14,9 +14,9 @@
 # the tag being released -- is the failure mode this guards against.
 #
 # Usage:
-#   tools/make-release.sh v29.6.2-1
-#   tools/make-release.sh v29.6.2-1 --draft
-#   tools/make-release.sh v29.6.2-1 --reuse-bundle   # skip the rebuild (fast, for retries)
+#   tools/make-release.sh v29.7.2-1
+#   tools/make-release.sh v29.7.2-1 --draft
+#   tools/make-release.sh v29.7.2-1 --reuse-bundle   # skip the rebuild (fast, for retries)
 
 set -uo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")/.." || exit 1

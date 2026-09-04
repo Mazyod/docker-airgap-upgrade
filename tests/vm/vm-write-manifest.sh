@@ -57,4 +57,14 @@ if grep -qE '^[A-Z_]+=$' "$OUT"; then
     exit 1
 fi
 
+# MISSING is the CANARY line's own failure marker, and it is NOT empty, so the
+# check above waves it through. A manifest recording MISSING would describe a
+# baseline whose volume data is already gone, which is not a baseline.
+if grep -qx 'CANARY=MISSING' "$OUT"; then
+    echo "ERROR: the canary container did not yield /data/canary.txt." >&2
+    echo "       docker inspect survivor:" >&2
+    docker inspect survivor --format '  state={{.State.Status}} started={{.State.StartedAt}}' >&2 2>&1 || true
+    exit 1
+fi
+
 cat "$OUT"

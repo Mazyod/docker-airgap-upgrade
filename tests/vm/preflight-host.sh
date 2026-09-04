@@ -102,8 +102,17 @@ else
     bad "relocated root has NO snapshots after restart -- containerd is on another root"
 fi
 
-# Bring the canary container back up: nothing inside the guest restarts it, and
-# vm-write-manifest.sh needs to exec into it.
-vm_try "docker start survivor >/dev/null 2>&1" >/dev/null 2>&1
+# dockerd, not just containerd. Nothing else here would notice if the restart
+# left the engine down.
+assert_vm_eq "docker is active after restart" "systemctl is-active docker" "active"
+
+# And the canary, which is the only assertion that proves the data on the
+# relocated root is still REACHABLE rather than merely present as a directory
+# count. Starting `survivor` is part of the assertion, not a side effect quietly
+# swallowed: nothing inside the guest restarts it after a reboot, and
+# vm-write-manifest.sh execs into it immediately afterwards.
+assert_vm_eq "canary container restarts and its volume data is intact" \
+    "docker start survivor >/dev/null 2>&1; docker exec survivor cat /data/canary.txt" \
+    "VOLUME-CANARY-DATA"
 
 summary

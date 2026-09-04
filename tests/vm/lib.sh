@@ -210,18 +210,25 @@ mkdir -p $RELOCATED_ROOT"
 # restart survival, containerd.service's RequiresMountsFor drop-in, is asserted
 # by preflight-host.sh.)
 require_relocated_xfs() {
-    local tgt fs src active enabled fail=""
+    local tgt fs src active enabled backing fail=""
     tgt=$(vm_try     "findmnt -n -o TARGET --target $RELOCATED_ROOT 2>/dev/null" | tr -d '\r' | tail -1)
     fs=$(vm_try      "findmnt -n -o FSTYPE --target $RELOCATED_ROOT 2>/dev/null" | tr -d '\r' | tail -1)
     src=$(vm_try     "findmnt -n -o SOURCE --target $RELOCATED_ROOT 2>/dev/null" | tr -d '\r' | tail -1)
     active=$(vm_try  "systemctl is-active data.mount 2>/dev/null"  | tr -d '\r' | tail -1)
     enabled=$(vm_try "systemctl is-enabled data.mount 2>/dev/null" | tr -d '\r' | tail -1)
+    # Which loop device(s) the harness image is actually attached to. "It is a
+    # loop device" is not the claim being made -- "it is THIS image" is.
+    backing=$(vm_try "losetup -j $LOOP_IMG 2>/dev/null | cut -d: -f1 | tr '\\n' ' '" | tr -d '\r' | tail -1)
 
     [ "$tgt" = "/data" ]      || fail="$fail\n       mount point is '${tgt:-<none>}', want /data"
     [ "$fs" = "xfs" ]         || fail="$fail\n       filesystem is '${fs:-<none>}', want xfs"
     case "$src" in
         /dev/loop*) ;;
         *) fail="$fail\n       source is '${src:-<none>}', want a /dev/loop* device" ;;
+    esac
+    case " ${backing% } " in
+        *" $src "*) ;;
+        *) fail="$fail\n       source '${src:-<none>}' is not backed by $LOOP_IMG (losetup -j reports: ${backing:-<none>})" ;;
     esac
     [ "$active" = "active" ]   || fail="$fail\n       data.mount is '${active:-<none>}', want active"
     [ "$enabled" = "enabled" ] || fail="$fail\n       data.mount is '${enabled:-<none>}', want enabled -- the mount would NOT survive a restart"

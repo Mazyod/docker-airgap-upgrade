@@ -37,7 +37,20 @@ vm_create() {
 # is no separate volume or image to clean up on this backend.
 vm_delete() {
     orbctl delete -f "$VM_NAME" >/dev/null 2>&1 || true
-    if vm_exists; then
+
+    # Prove absence from a SUCCESSFUL listing. vm_exists returning false covers
+    # both "the machine is gone" and "orbctl could not be reached", and reading
+    # the second as confirmed deletion is fail-open. Capture output and status
+    # separately -- `$(cmd || true)` cannot see the status at all.
+    local listing status
+    listing=$(orbctl list 2>/dev/null)
+    status=$?
+    if [ "$status" -ne 0 ]; then
+        echo "ERROR: 'orbctl list' failed (exit $status); cannot verify that" >&2
+        echo "       '$VM_NAME' was deleted. Refusing to report success." >&2
+        return 1
+    fi
+    if printf '%s\n' "$listing" | awk '{print $1}' | grep -qx "$VM_NAME"; then
         echo "ERROR: machine '$VM_NAME' still exists after orbctl delete." >&2
         return 1
     fi

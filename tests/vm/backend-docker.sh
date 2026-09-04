@@ -14,7 +14,8 @@
 # device comes out of the HOST's global loop table and mounting XFS autoloads
 # the host kernel's xfs module. tests/vm/README.md spells out what that costs.
 #
-# Requires: Linux + a reachable Docker daemon. No sudo, no KVM.
+# Requires: Linux + a LOCAL, ROOTFUL, x86_64 Docker daemon. No sudo, no KVM.
+# need_backend checks all three rather than assuming them -- see the comment there.
 
 HARNESS_IMAGE="${HARNESS_IMAGE:-${VM_NAME}-rocky9-systemd:latest}"
 HARNESS_DATA_VOLUME="${HARNESS_DATA_VOLUME:-${VM_NAME}-data}"
@@ -47,12 +48,33 @@ need_backend() {
         exit 1
     fi
 
-    case "${DOCKER_HOST:-}" in
-        ""|unix://*) ;;
+    # Locality: DOCKER_HOST is only one of the ways to select a daemon. A remote
+    # endpoint can equally come from `docker context use` or DOCKER_CONTEXT, and
+    # with DOCKER_HOST unset those would sail past a DOCKER_HOST-only check.
+    # Resolve the EFFECTIVE endpoint: DOCKER_HOST wins when set, otherwise ask
+    # the CLI which context is current (it honours DOCKER_CONTEXT).
+    local endpoint src_desc
+    if [ -n "${DOCKER_HOST:-}" ]; then
+        endpoint="$DOCKER_HOST"
+        src_desc="DOCKER_HOST"
+    else
+        endpoint=$(docker context inspect --format '{{.Endpoints.docker.Host}}' 2>/dev/null)
+        src_desc="the active docker context"
+        if [ -z "$endpoint" ]; then
+            echo "ERROR: could not determine the effective Docker endpoint." >&2
+            echo "       'docker context inspect' produced nothing, so locality cannot be" >&2
+            echo "       verified and the harness refuses rather than guessing. Set" >&2
+            echo "       DOCKER_HOST to a local unix socket explicitly." >&2
+            exit 1
+        fi
+    fi
+    case "$endpoint" in
+        unix://*) ;;
         *)
-            echo "ERROR: DOCKER_HOST='$DOCKER_HOST' points at a non-local daemon." >&2
-            echo "       The harness bind-mounts the repo at $HARNESS_REPO_DIR, which only" >&2
-            echo "       works when the daemon can see that path. Use a local unix socket." >&2
+            echo "ERROR: $src_desc selects a non-local daemon ('$endpoint')." >&2
+            echo "       The harness hands the repo to the guest as a bind mount of" >&2
+            echo "       $HARNESS_REPO_DIR, which only works when the daemon can see that" >&2
+            echo "       path. Use a local unix socket." >&2
             exit 1
             ;;
     esac
@@ -132,7 +154,19 @@ vm_create() {
         "$HARNESS_IMAGE" >/dev/null \
         || { echo "ERROR: docker run failed." >&2; return 1; }
 
-    _vm_wait_systemd
+    _vm_wait_systemd || return 1
+
+    # The endpoint check in need_backend is a heuristic -- a local unix socket
+    # could still front a remote daemon. This is the definitive test: the guest
+    # must be able to READ this checkout at its own absolute path, because every
+    # file-transfer site in the harness is a plain `cp` that depends on it.
+    if ! docker exec "$VM_NAME" test -f "$HARNESS_LIB_DIR/vm-write-manifest.sh"; then
+        echo "ERROR: the repo is not visible inside '$VM_NAME' at $HARNESS_REPO_DIR." >&2
+        echo "       The bind mount did not resolve to this checkout, so the daemon is" >&2
+        echo "       not looking at this filesystem. Every harness file transfer depends" >&2
+        echo "       on that path being identical inside and outside the guest." >&2
+        return 1
+    fi
 }
 
 # REPORT any host loop device still backed by this harness's data image.
@@ -172,26 +206,46 @@ harness_report_loops() {
     return "$found"
 }
 
+# Is $2 absent from the inventory produced by $3?
+#
+# Absence must be proven from a SUCCESSFUL listing, never from a failed
+# `docker inspect` -- inspect exits non-zero both for "no such object" and for
+# "the daemon just died", and treating the second as confirmed absence is the
+# same fail-open mistake verify_unit_stopped() exists to avoid elsewhere in this
+# repo. Capture output and status separately, then look for the name.
+_harness_gone() {
+    local label="$1" name="$2" cmd="$3" out status
+    out=$($cmd 2>/dev/null)
+    status=$?
+    if [ "$status" -ne 0 ]; then
+        echo "ERROR: could not list ${label}s to verify removal (docker exited $status)." >&2
+        echo "       '$name' may or may not still exist -- refusing to report it deleted." >&2
+        return 1
+    fi
+    if printf '%s\n' "$out" | grep -qxF "$name"; then
+        echo "ERROR: $label '$name' still exists after removal." >&2
+        [ "$label" = "volume" ] && \
+            echo "       Something may still be using it: docker ps -a --filter volume=$name" >&2
+        return 1
+    fi
+    return 0
+}
+
 # Idempotent, but it does not claim success it has not verified.
 vm_delete() {
     docker rm -f "$VM_NAME" >/dev/null 2>&1 || true
     docker volume rm -f "$HARNESS_DATA_VOLUME" >/dev/null 2>&1 || true
     docker image rm -f "$HARNESS_IMAGE" >/dev/null 2>&1 || true
 
+    # Prove absence from a SUCCESSFUL inventory, never from a failed inspect.
+    # `docker inspect` exits non-zero both for "no such object" and for "the
+    # daemon just died", and treating the second as confirmed absence is exactly
+    # the fail-open pattern verify_unit_stopped() exists to avoid elsewhere in
+    # this repo. Take the listing, check its status, then look for the name.
     local rc=0
-    if docker container inspect "$VM_NAME" >/dev/null 2>&1; then
-        echo "ERROR: container '$VM_NAME' still exists after removal." >&2
-        rc=1
-    fi
-    if docker volume inspect "$HARNESS_DATA_VOLUME" >/dev/null 2>&1; then
-        echo "ERROR: volume '$HARNESS_DATA_VOLUME' still exists after removal." >&2
-        echo "       Something else may still be using it: docker ps -a --filter volume=$HARNESS_DATA_VOLUME" >&2
-        rc=1
-    fi
-    if docker image inspect "$HARNESS_IMAGE" >/dev/null 2>&1; then
-        echo "ERROR: image '$HARNESS_IMAGE' still exists after removal." >&2
-        rc=1
-    fi
+    _harness_gone "container" "$VM_NAME"             "docker ps -a --format {{.Names}}"                  || rc=1
+    _harness_gone "volume"    "$HARNESS_DATA_VOLUME" "docker volume ls --format {{.Name}}"               || rc=1
+    _harness_gone "image"     "$HARNESS_IMAGE"       "docker image ls --format {{.Repository}}:{{.Tag}}" || rc=1
 
     harness_report_loops || true
     return "$rc"

@@ -25,7 +25,7 @@ tests/static-checks.sh       # Tier 1: reads source text, executes no upgrade lo
 ```
 
 Tier 2 (real execution against a real systemd node) lives in `tests/vm/` and runs on
-either macOS with OrbStack or Linux with a reachable Docker daemon — see
+either macOS with OrbStack or Linux with a local, rootful, x86_64 Docker daemon — see
 `tests/vm/README.md`.
 
 ## House rules

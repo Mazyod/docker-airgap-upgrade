@@ -24,8 +24,9 @@ shellcheck <script>.sh       # all scripts are shellcheck clean; keep them that 
 tests/static-checks.sh       # Tier 1: reads source text, executes no upgrade logic
 ```
 
-Tier 2 (real execution against a real systemd node) lives in `tests/vm/` and currently
-requires macOS with OrbStack — see `tests/vm/README.md`.
+Tier 2 (real execution against a real systemd node) lives in `tests/vm/` and runs on
+either macOS with OrbStack or Linux with a reachable Docker daemon — see
+`tests/vm/README.md`.
 
 ## House rules
 

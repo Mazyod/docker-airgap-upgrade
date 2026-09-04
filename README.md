@@ -285,8 +285,9 @@ would silently orphan every image and snapshot on the node.
 | Negative control | **3/3** | `./tests/vm/negative-control.sh` |
 | Swarm | **not run** | needs a multi-node cluster — see `docs/TEST-PLAN.md` Tier 3 |
 
-The VM tier runs the real scripts against Rocky Linux 9 (x86_64, systemd) via
-OrbStack, with containerd's root relocated to a separate XFS filesystem holding real
+The VM tier runs the real scripts against Rocky Linux 9 (x86_64, systemd) — an
+OrbStack machine on macOS, or a privileged systemd container on a Linux host with
+Docker — with containerd's root relocated to a separate XFS filesystem holding real
 images, containers and volume data. It covers the phase-0 rejections, the real
 upgrade, config preservation, idempotent re-run, and rollback.
 

@@ -98,6 +98,10 @@ case "$HARNESS_BACKEND" in
     *) echo "ERROR: HARNESS_BACKEND='$HARNESS_BACKEND' is not 'orb' or 'docker'." >&2; exit 1 ;;
 esac
 
+# The sourced path is chosen at runtime, so point shellcheck at both candidates
+# and tell it to resolve them relative to this file rather than to the caller's
+# working directory (tools/make-release.sh sources this from the repo root).
+# shellcheck source-path=SCRIPTDIR
 # shellcheck source=backend-orb.sh
 # shellcheck source=backend-docker.sh
 source "$HARNESS_LIB_DIR/backend-$HARNESS_BACKEND.sh"

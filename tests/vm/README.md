@@ -1,7 +1,7 @@
 # VM test harness
 
 Runs the **real** upgrade scripts against a **real** RHEL-like node with **real**
-systemd, rpm and Docker — on a MacBook, in a few minutes, repeatably.
+systemd, rpm and Docker — on a laptop or a workstation, in a few minutes, repeatably.
 
 Before this existed, nothing in this repo had ever been executed. Static checks
 (`tests/static-checks.sh`) only read the source text; they cannot catch a phase
@@ -9,16 +9,69 @@ that stops the wrong service or a config that gets silently regenerated.
 
 ## Requirements
 
-**macOS + [OrbStack](https://orbstack.dev)** (`brew install orbstack`). It provides
-Linux machines with systemd as PID 1 and x86_64 emulation via Rosetta, which is what
-makes this possible on Apple Silicon.
+Either host works:
 
-This harness does **not** currently run anywhere else. `lib.sh` reaches the guest
-through exactly four `orbctl` wrappers — `need_orbctl`, `vm_exists`, `vm`, `vm_try` —
-and no other file in `tests/vm/` touches the hypervisor, so those four are the entire
-port surface. A Linux host with Docker and `/dev/kvm` could back them with a privileged
-systemd container or a KVM guest, and would not need x86_64 emulation at all. That port
-has not been written or validated. Until it is, Tier 2 runs on a Mac or it does not run.
+| Backend | Host | Guest |
+|---|---|---|
+| `orb` | **macOS + [OrbStack](https://orbstack.dev)** (`brew install orbstack`) | an OrbStack Linux machine, x86_64 via Rosetta on Apple Silicon |
+| `docker` | **Linux + a reachable Docker daemon** (no sudo, no KVM) | a privileged Rocky 9 systemd container, built from `Dockerfile.rocky9-systemd` |
+
+`lib.sh` picks one automatically: OrbStack when `orbctl` is installed, otherwise a
+Docker daemon it can reach. Override with `HARNESS_BACKEND=orb` or
+`HARNESS_BACKEND=docker`. If neither is available it says so and names both.
+
+Everything above the backend is shared, because the backend contract is small. The
+**core is six operations** — `need_backend`, `vm_exists`, `vm`, `vm_try`, `vm_create`,
+`vm_delete` — implemented in `backend-orb.sh` and `backend-docker.sh`. Two further
+operations, `vm_wake` and `vm_restart`, serve the harness's own lifecycle code and sit
+outside that core. (Earlier revisions of this file and of `CLAUDE.md` claimed the port
+surface was *four* helpers. It never was: create and delete were raw `orbctl` calls
+sitting in `bootstrap-vm.sh` and `teardown-vm.sh`, outside any helper.)
+
+### What the container backend costs
+
+`--privileged` is genuine host access, not a VM boundary, and two of its effects reach
+the host:
+
+- **Loop devices come from the host's global table.** The relocated root's 3 GB image
+  is attached with a host loop device. `mount -o loop` sets autoclear so it is released
+  with the container, and `teardown-vm.sh` sweeps for strays anyway — but two harness
+  runs on one host contend for the same table. Check with `losetup -a` before and after.
+- **Mounting XFS autoloads the host kernel's `xfs` module**, and it stays loaded.
+
+The guest also runs on the **host's** kernel, not Rocky's. So does the OrbStack guest,
+which runs OrbStack's — this is a change in *which* wrong kernel you get, not a new
+category of gap.
+
+## The restart hazard, and how it is guarded
+
+A guest restart tears down the mount namespace. The 3 GB backing image does not go
+away with it. Without something ordering the mount before containerd, systemd starts
+containerd first and containerd comes up on an **empty shadow `/data/containerd`** in
+the guest's own root filesystem — reporting itself `active` the whole time, with zero
+snapshots, no images and the canary container dead.
+
+That is the same "silently repointing a node at an empty root" hazard that
+`upgrade-docker.sh` phase 6 exists to prevent, except manufactured by the harness
+rather than by the product. A Tier 2 run in that state produces a screenful of
+confident-looking failures that say nothing about the scripts, and `reset-baseline.sh`
+would cheerfully rebuild the canary data **on the shadow root** and hand back a green
+run built on a lie.
+
+Three things stop it, and each has been mutation-tested by breaking it deliberately:
+
+1. `lib.sh`'s `ensure_relocated_mount()` installs a systemd `data.mount` unit and a
+   `containerd.service` drop-in carrying `RequiresMountsFor=/data/containerd`. It runs
+   on **both** backends — an OrbStack machine that reboots loses a bare `mount -o loop`
+   too, and a production node with a relocated containerd root would carry an fstab
+   entry anyway, so this makes the baseline more faithful rather than less.
+2. `lib.sh`'s `require_relocated_xfs()` refuses to proceed when the relocated root is
+   not on XFS. `bootstrap-vm.sh`, `reset-baseline.sh`, `tier2-run.sh`,
+   `config-version-check.sh` and `negative-control.sh` all call it, and in the two
+   reconstructing scripts it runs *before* any service starts or canary data is written.
+3. `preflight-host.sh` restarts the guest and asserts the mount, the ordering and the
+   snapshots all come back. `bootstrap-vm.sh` runs it, so a baseline is never declared
+   ready without it having passed.
 
 ## Quick start
 
@@ -42,8 +95,12 @@ tests/vm/bootstrap-vm.sh --recreate   # nuke and rebuild, if state has drifted
 
 | Script | Purpose |
 |---|---|
-| `lib.sh` | Shared helpers, version constants, assertions. Sourced, not run. |
+| `lib.sh` | Backend selection, shared helpers, version constants, assertions. Sourced, not run. |
+| `backend-orb.sh` | The OrbStack implementation of the backend contract. Sourced by `lib.sh`. |
+| `backend-docker.sh` | The privileged-container implementation. Sourced by `lib.sh`. |
+| `Dockerfile.rocky9-systemd` | The container backend's guest image: systemd PID 1, the `data.mount` unit, the containerd drop-in. |
 | `bootstrap-vm.sh` | Creates the machine and builds the **S1 baseline** (see below). |
+| `preflight-host.sh` | Restarts the guest and proves the relocated root survives it. Run by `bootstrap-vm.sh`. |
 | `build-bundle.sh` | Runs the real `download-docker-packages.sh` in the VM and records the artifact SHA-256. |
 | `tier2-run.sh` | The Tier 2 cases: `reject`, `upgrade`, `rollback`, or all. |
 | `config-version-check.sh` | The containerd 2.2 → 2.3 config-version boundary, and `rollback-docker.sh` phase 0c. Destructive; reset afterwards. |
@@ -60,7 +117,8 @@ The harness is only meaningful because of what `bootstrap-vm.sh` builds:
 - docker-ce 29.1.5 / containerd.io 2.2.1 / buildx 0.30.1 / compose 5.0.1 — exactly
   what production runs today
 - **containerd root relocated to `/data/containerd`** on a *separate* XFS filesystem
-  with `ftype=1`, backed by a loopback device
+  with `ftype=1`, backed by a loopback device mounted through an ordered systemd
+  mount unit
 - a representative `/etc/docker/daemon.json` with a registry mirror
 - a pulled image, a named container, and a volume holding a canary file
 - a manifest recording all of the above
@@ -94,10 +152,15 @@ phase 0c would be guarding nothing and should be reconsidered, not kept.
 - **Real RHEL.** Rocky is a rebuild, not RHEL. Subscription-manager, satellite
   behaviour, and any RHEL-specific packaging differences are out of scope — and the
   satellite SSL problem is the entire reason these scripts use `rpm` over `dnf`.
-- **Production SELinux/cgroup/storage.** The VM's policy and storage layout are not
-  your nodes'.
+- **Production SELinux/cgroup/storage.** The guest's policy and storage layout are not
+  your nodes'. On the container backend SELinux is not enforcing at all.
 - **NVIDIA.** No GPU.
-- **Bare metal.** OrbStack machines are lightweight VMs, not your hardware.
+- **Bare metal.** OrbStack machines are lightweight VMs and the container backend is
+  not a machine at all — no reboot semantics, no kernel command line, no initramfs,
+  no udev, no real block devices. Neither is your hardware.
+- **A guest kernel.** Both backends run the guest on the *host's* kernel, so
+  kernel-version-dependent overlayfs, XFS and cgroup behaviour is the host's, not
+  RHEL's.
 
 Tier 3 in `docs/TEST-PLAN.md` remains mandatory before a production rollout,
 particularly the mixed-version tests that authorize node-by-node rolling.
@@ -107,6 +170,9 @@ particularly the mixed-version tests that authorize node-by-node rolling.
 1. Update the version constants at the top of `lib.sh`.
 2. Update the target versions in `tier2-run.sh`'s assertions if package names change.
 3. Re-run `bootstrap-vm.sh --recreate`.
+
+On the container backend, `--recreate` also deletes the named data volume holding the
+loopback image and sweeps any host loop device still backed by it.
 
 If a future upgrade crosses a containerd **major** boundary again, the removed
 machinery (config migration, XFS ftype check, orphaned-network cleanup) is in git

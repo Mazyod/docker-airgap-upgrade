@@ -19,7 +19,7 @@ shellcheck upgrade-docker.sh              # available via homebrew
 
 All six scripts are currently `bash -n` clean and `shellcheck` clean. Keep them that way — where a suppression is genuinely warranted, use an inline `# shellcheck disable=SCxxxx` with a reason, not a blanket ignore.
 
-**Real execution happens through `tests/vm/`** — an OrbStack-based harness that runs the actual scripts against Rocky Linux 9 (x86_64, systemd PID 1) on the dev Mac:
+**Real execution happens through `tests/vm/`** — a harness that runs the actual scripts against Rocky Linux 9 (x86_64, systemd PID 1):
 
 ```bash
 tests/vm/bootstrap-vm.sh      # build the S1 baseline
@@ -32,7 +32,11 @@ tests/vm/reset-baseline.sh    # back to S1 between destructive runs
 
 The S1 baseline deliberately puts containerd's root on a **separate XFS filesystem at `/data/containerd`** with real images, containers and volume data on it. That is the configuration the pre-v2.0.0 phase 6 destroyed, and it is the only way to test it. See `tests/vm/README.md` for what this proves and — importantly — what it does not (no Swarm, not real RHEL, no GPU, not bare metal).
 
-**The harness only runs on macOS with OrbStack installed.** `tests/vm/lib.sh` shells out to `orbctl` through four helpers (`need_orbctl`, `vm_exists`, `vm`, `vm_try`); nothing else in `tests/vm/` touches the hypervisor. On a Linux host with Docker and `/dev/kvm` those four helpers are the whole port surface — a privileged systemd container or a KVM guest would do — but that port has not been written or validated, so **Tier 2 is currently unrunnable off a Mac.** Say so plainly rather than reporting Tier 2 as skipped for an unrelated reason.
+**The harness has two backends and runs on either host:** macOS with OrbStack, or Linux with a reachable Docker daemon (a privileged Rocky 9 systemd container — no sudo, no KVM). `tests/vm/lib.sh` picks one automatically from `HARNESS_BACKEND=auto|orb|docker` and sources `backend-orb.sh` or `backend-docker.sh`.
+
+The backend contract is **six** core operations — `need_backend`, `vm_exists`, `vm`, `vm_try`, `vm_create`, `vm_delete` — plus `vm_wake` and `vm_restart` for the harness's own lifecycle code. This file used to claim the port surface was *four* helpers; that was wrong, because create and delete were raw `orbctl` calls sitting in `bootstrap-vm.sh` and `teardown-vm.sh` outside any helper. Don't reintroduce a raw hypervisor call anywhere but a backend file.
+
+**The container backend's restart hazard is the sharp edge.** A guest restart tears down the mount namespace while the 3 GB loopback image survives, so without an ordered mount unit containerd starts on an empty shadow `/data/containerd` and reports itself active — manufacturing the exact data-loss symptom phase 6 exists to prevent. `ensure_relocated_mount()` installs a `data.mount` unit and a `containerd.service` drop-in (`RequiresMountsFor`) on **both** backends; `require_relocated_xfs()` refuses to proceed when the relocated root is not on XFS; `preflight-host.sh` restarts the guest and proves it comes back. Do not replace any of those with a bare `mount -o loop`.
 
 `simulate-upgrade.sh` remains a separate dnf-path smoke test. It is **not** the same code path as `upgrade-docker.sh` (see below), so passing it does not prove the air-gapped path works.
 

@@ -359,7 +359,7 @@ would silently orphan every image and snapshot on the node.
 
 | Tier | Status for 29.8.0 | How |
 |---|---|---|
-| Static | **154/154** | `./tests/static-checks.sh --online` |
+| Static | **206/206** | `./tests/static-checks.sh --online` |
 | VM (real execution) | **re-run owed** | `./tests/vm/bootstrap-vm.sh && ./tests/vm/build-bundle.sh && ./tests/vm/tier2-run.sh` |
 | VM config-version boundary | **30/30** | `./tests/vm/config-version-check.sh` |
 | Negative control | **3/3** | `./tests/vm/negative-control.sh` |
@@ -367,10 +367,10 @@ would silently orphan every image and snapshot on the node.
 
 The VM rows were measured on Rocky Linux 9 via the Docker backend, against a bundle
 rebuilt from the checkout at commit `8d4dcf4`. `tier2-run.sh` last printed 56/56
-there; its assertion set has changed since — case 2.6b was added and case 2.3 now
-asserts the installed `%{VERSION}-%{RELEASE}` and `runc` — and it has not been
-re-run, so the old figure is not quoted as if it covered the current tree. See
-`docs/TEST-PLAN.md`.
+there; its assertion set has changed twice since — case 2.6b was added and case 2.3
+now asserts the installed `%{VERSION}-%{RELEASE}` and `runc`, and the agent-mode
+slice added a whole `agent` phase — and it has not been re-run, so the old figure is
+not quoted as if it covered the current tree. See `docs/TEST-PLAN.md`.
 
 The runc swap was verified directly on the node: `containerd.io-2.3.4-2` ships runc
 1.5.1 and `-1` ships 1.4.3. Case 2.6a stages the real upstream `-1` RPM and proves

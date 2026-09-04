@@ -7,7 +7,7 @@
 
 | Tier | Status | Evidence |
 |---|---|---|
-| Tier 1 static | **PASSED 154/154** | `tests/static-checks.sh --online` — includes all 16 RPM URLs |
+| Tier 1 static | **PASSED 206/206** | `tests/static-checks.sh --online` — includes all 16 RPM URLs |
 | Tier 2 VM | **RE-RUN OWED** | last measured 56/56 at commit `8d4dcf4`; the assertion set has changed since — see below |
 | Tier 2 config-version boundary | **PASSED 30/30** | `tests/vm/config-version-check.sh` — cases 2.23–2.28, at `8d4dcf4` |
 | Tier 2 negative control | **PASSED 3/3** | `tests/vm/negative-control.sh` — mutant loses the relocated root, at `8d4dcf4` |
@@ -19,14 +19,23 @@ The Tier 2 numbers were produced against a bundle rebuilt from the checkout at
 `sha256:496868cbfb7836a1536a8b25c758e302828e85f80a8b042023ca694ea4c21924`, 334 MB,
 carrying `containerd.io-2.3.4-2` for el8 and el9 and no `-1` anywhere.
 
-**Why `tier2-run.sh` is marked re-run owed.** Its assertion set changed after that
-run and the suite has not been executed since: case 2.6b was added, case 2.3 gained
-a `%{VERSION}-%{RELEASE}` assertion and a `runc` assertion, and 2.6a lost a
+**Why `tier2-run.sh` is marked re-run owed.** Its assertion set changed twice after
+that run and the suite has not been executed since.
+
+From the review fixes: case 2.6b was added, case 2.3 gained a
+`%{VERSION}-%{RELEASE}` assertion and a `runc` assertion, and 2.6a lost a
 `%{VERSION}`-only assertion that could not fail independently of the
-`%{VERSION}-%{RELEASE}` one beside it. Do not quote 56/56 for the current tree; run
-the suite and record what it prints. `config-version-check.sh` and
-`negative-control.sh` were not touched, but they run against the same guest and
-their results are recorded here at the commit that produced them.
+`%{VERSION}-%{RELEASE}` one beside it.
+
+From the agent-mode slices: a whole `agent` phase (case 2.29) and
+`tests/vm/agent-mode-negative-control.sh`. That phase is **not part of `all`** — it
+runs only as `tests/vm/tier2-run.sh agent` — so it needs its own invocation and its
+own recorded figure, and it resets the baseline before it starts.
+
+Do not quote 56/56 for the current tree; run the suite and record what it prints.
+`config-version-check.sh` and `negative-control.sh` were not touched, but they run
+against the same guest and their results are recorded here at the commit that
+produced them.
 
 The runc swap was verified directly rather than inferred. `/usr/bin/runc` as shipped
 by each build, read from the RPM headers on the test node:

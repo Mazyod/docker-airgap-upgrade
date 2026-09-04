@@ -1,0 +1,95 @@
+# tests/vm/Dockerfile.rocky9-systemd
+#
+# The guest for the container backend (tests/vm/backend-docker.sh): Rocky Linux
+# 9 with systemd as PID 1, enough userland for real rpm transactions, and a
+# loop-backed XFS filesystem wired in as an ordered systemd mount unit.
+#
+# Rocky is a RHEL rebuild -- `rpm -E %rhel` returns 9 and the packages are the
+# same el9 builds -- but it is not RHEL and this is not a machine. See
+# tests/vm/README.md for exactly what that does and does not prove.
+#
+# The quay.io stream is used rather than the `rockylinux` Docker Official
+# Image: the DOI is archived at 9.3, quay is the maintained stream.
+FROM quay.io/rockylinux/rockylinux:9
+
+# systemd looks at this to decide it is running containerized.
+ENV container=docker
+
+# Everything the harness and the scripts under test reach for:
+#   systemd/procps-ng  -- PID 1, `ps -p 1 -o comm=`
+#   util-linux         -- losetup, findmnt, mount
+#   xfsprogs           -- mkfs.xfs -n ftype=1, xfs_info
+#   diffutils          -- cmp, used by config-version-check.sh's B2/C2
+#   python3            -- negative-control.sh's mutant builder
+#   dnf-plugins-core   -- `dnf config-manager`, `dnf download`
+#   tar/gzip/findutils/gawk/hostname/iproute -- the rest of the harness surface
+RUN dnf -y install \
+        systemd systemd-libs procps-ng iproute util-linux xfsprogs \
+        diffutils python3 dnf-plugins-core tar gzip findutils gawk hostname \
+ && dnf clean all \
+ && rm -rf /var/cache/dnf
+
+# Prune the units a container cannot satisfy (udev, initctl, getty, the
+# multi-user set). local-fs.target is deliberately LEFT FUNCTIONAL -- only the
+# contents of its .wants directory are cleared -- because data.mount below is
+# enabled into it.
+RUN (cd /lib/systemd/system/sysinit.target.wants/ \
+      && for i in *; do case "$i" in systemd-tmpfiles-setup.service) ;; *) rm -f "$i" ;; esac; done) ; \
+    rm -f /lib/systemd/system/multi-user.target.wants/* \
+          /etc/systemd/system/*.wants/* \
+          /lib/systemd/system/local-fs.target.wants/* \
+          /lib/systemd/system/sockets.target.wants/*udev* \
+          /lib/systemd/system/sockets.target.wants/*initctl* \
+          /lib/systemd/system/basic.target.wants/* ; \
+    true
+
+# --- The relocated containerd root, as a first-class mount unit ---------------
+#
+# THIS IS LOAD-BEARING. A container restart tears down the mount namespace, so
+# the loop mount disappears while the 3 GB backing file survives on the volume.
+# Without an ordered mount unit, systemd starts containerd first and containerd
+# comes up on an EMPTY shadow /data/containerd directory in the overlay
+# rootfs -- reporting itself active with zero snapshots and no images. That
+# manufactures a screenful of confident-looking Tier 2 failures that say
+# nothing about the scripts under test.
+#
+# A production node with a relocated containerd root would carry an fstab entry
+# for exactly this reason, so wiring it here makes the baseline MORE faithful,
+# not less.
+#
+# tests/vm/lib.sh's ensure_relocated_mount() rewrites this file from $LOOP_IMG
+# at bootstrap and is authoritative; the copy baked in here keeps the image
+# self-contained and correct from its very first boot. The two paths must
+# agree -- backend-docker.sh sets LOOP_IMG to the What= path below.
+RUN mkdir -p /var/harness /data /etc/systemd/system/local-fs.target.wants \
+             /etc/systemd/system/containerd.service.d
+
+RUN printf '%s\n' \
+    '[Unit]' \
+    'Description=Harness XFS filesystem for the relocated containerd root' \
+    'Before=containerd.service' \
+    '' \
+    '[Mount]' \
+    'What=/var/harness/data.img' \
+    'Where=/data' \
+    'Type=xfs' \
+    'Options=loop' \
+    '' \
+    '[Install]' \
+    'WantedBy=local-fs.target' \
+    > /etc/systemd/system/data.mount \
+ && ln -sf /etc/systemd/system/data.mount \
+           /etc/systemd/system/local-fs.target.wants/data.mount
+
+# containerd.service does not exist yet -- containerd.io installs it later.
+# A drop-in placed now applies the moment it does.
+RUN printf '%s\n' \
+    '[Unit]' \
+    'RequiresMountsFor=/data/containerd' \
+    > /etc/systemd/system/containerd.service.d/10-harness-mount.conf
+
+# systemd's own shutdown signal. Without this, `docker stop` sends SIGTERM,
+# which systemd reads as "switch to rescue mode".
+STOPSIGNAL SIGRTMIN+3
+
+CMD ["/sbin/init"]

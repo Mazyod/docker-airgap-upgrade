@@ -11,7 +11,8 @@
 #   - Rocky Linux (RHEL rebuild), x86_64, systemd as PID 1
 #   - docker-ce 29.1.5 / containerd.io 2.2.1 / buildx 0.30.1 / compose 5.0.1
 #   - containerd root relocated to /data/containerd on a SEPARATE XFS
-#     filesystem with ftype=1, backed by a loopback image
+#     filesystem with ftype=1, backed by a loopback image mounted through an
+#     ordered systemd mount unit
 #   - a representative /etc/docker/daemon.json (registry mirror, log opts)
 #   - a pulled image, a named container, and a volume holding a canary file
 #   - a manifest of all of the above, for the assertions in tier2-run.sh
@@ -27,20 +28,22 @@ source ./lib.sh
 RECREATE=false
 [ "${1:-}" = "--recreate" ] && RECREATE=true
 
-need_orbctl
+need_backend
 
-REPO_DIR="$(cd ../.. && pwd)"
+REPO_DIR="$HARNESS_REPO_DIR"
+
+echo "backend: $HARNESS_BACKEND"
 
 if vm_exists && [ "$RECREATE" = true ]; then
     echo "Deleting existing VM '$VM_NAME'..."
-    orbctl delete -f "$VM_NAME"
+    vm_delete
 fi
 
 if ! vm_exists; then
-    echo "Creating $VM_DISTRO:$VM_RELEASE ($VM_ARCH) machine '$VM_NAME'..."
-    orbctl create -a "$VM_ARCH" "$VM_DISTRO:$VM_RELEASE" "$VM_NAME"
+    vm_create
 else
     echo "Reusing existing VM '$VM_NAME'."
+    vm_wake
 fi
 
 echo ""
@@ -67,19 +70,13 @@ rpm -q docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose
 
 echo ""
 echo "=== Relocated containerd root on a separate XFS (ftype=1) ==="
-vm "set -e
-systemctl stop docker docker.socket >/dev/null 2>&1 || true
+vm "systemctl stop docker docker.socket >/dev/null 2>&1 || true
 systemctl stop containerd >/dev/null 2>&1 || true
-sleep 2
+sleep 2"
 
-if ! findmnt --target /data >/dev/null 2>&1 || [ \"\$(findmnt -n -o TARGET --target /data)\" != /data ]; then
-    [ -f $LOOP_IMG ] || dd if=/dev/zero of=$LOOP_IMG bs=1M count=3072 status=none
-    blkid $LOOP_IMG >/dev/null 2>&1 || mkfs.xfs -q -n ftype=1 $LOOP_IMG
-    mkdir -p /data
-    mount -o loop $LOOP_IMG /data
-fi
-mkdir -p $RELOCATED_ROOT
+ensure_relocated_mount
 
+vm "set -e
 mkdir -p /etc/containerd
 containerd config default > /etc/containerd/config.toml
 sed -i \"s|^root = .*|root = '$RELOCATED_ROOT'|\" /etc/containerd/config.toml
@@ -96,6 +93,11 @@ EOF
 findmnt --target /data | tail -1
 xfs_info /data | grep -o 'ftype=[0-9]'
 grep '^root' /etc/containerd/config.toml"
+
+# Refuse to build a baseline on a filesystem that is not the separate XFS.
+# Without this the canary data lands on a shadow directory in the guest's own
+# root filesystem and every relocated-root assertion downstream is theatre.
+require_relocated_xfs
 
 echo ""
 echo "=== Starting services on the relocated root ==="
@@ -120,25 +122,14 @@ fi
 docker network inspect custom-bridge >/dev/null 2>&1 || docker network create custom-bridge >/dev/null"
 
 echo ""
+echo "=== Restart regression check (hard precondition) ==="
+./preflight-host.sh
+
+echo ""
 echo "=== Writing baseline manifest to $MANIFEST ==="
 vm "mkdir -p /root/vmtests"
-
-# Stage the manifest writer by copying it off the mounted macOS filesystem --
-# OrbStack exposes the Mac's tree inside the machine at the same absolute path.
-#
-# `orbctl push` is NOT usable here. Its destination is resolved relative to the
-# Linux user's HOME, so an absolute /tmp/... destination is silently discarded:
-# nothing is copied and it still exits 0. The previous `push || cp` form could
-# therefore never reach its fallback, and the failure only surfaced one line
-# later as a confusing "chmod: cannot access" error.
-#
-# Verify the file actually landed rather than trusting any exit status.
-vm "cp \"$(pwd)/vm-write-manifest.sh\" /tmp/vm-write-manifest.sh"
-if ! vm "test -f /tmp/vm-write-manifest.sh" >/dev/null 2>&1; then
-    echo "ERROR: could not stage vm-write-manifest.sh into the VM." >&2
-    exit 1
-fi
-vm "chmod +x /tmp/vm-write-manifest.sh && /tmp/vm-write-manifest.sh $MANIFEST"
+stage_manifest_writer
+vm "/tmp/vm-write-manifest.sh $MANIFEST"
 
 echo ""
 echo "=== Staging repo scripts into the VM ==="
@@ -150,7 +141,7 @@ ls /root/scripts"
 
 echo ""
 echo "=========================================="
-echo "BASELINE (S1) READY on VM '$VM_NAME'"
+echo "BASELINE (S1) READY on VM '$VM_NAME' (backend: $HARNESS_BACKEND)"
 echo "=========================================="
 echo "Next:"
 echo "  tests/vm/build-bundle.sh    # run the real download script inside the VM"

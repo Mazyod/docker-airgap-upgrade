@@ -226,6 +226,12 @@ takes two passes, and `docs/AGENT-RUNBOOK.md` has the procedure.
 /opt/docker-offline/rollback-docker.sh
 ```
 
+Add `--preflight` to run the payload validation, the `rpm --test` dry run, the
+backup selection and the config-version guard **without touching the node** — that
+answers "would a rollback strand this node?" while everything is still up. Add
+`--config-backup=DIR` to name the backup phase 3 should restore rather than taking
+whichever is newest.
+
 Returns the node to 29.1.5 / 2.2.1. It validates and dry-runs before stopping
 anything, so a rollback that cannot succeed fails while the node is still up.
 

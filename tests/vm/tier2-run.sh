@@ -1750,6 +1750,266 @@ else
     bad "2.42 teardown: guest is still '$sw' -- leaving the EXIT trap armed to retry"
 fi
 
+#############################################
+head_ "2.43-2.48  Agent mode: rollback preflight and backup selection"
+#############################################
+# Slice 6. rollback-docker.sh gains --preflight, --config-backup and
+# --non-interactive. Phase 0c gains NOTHING: there is no safe way to downgrade
+# into a runtime that cannot start, so --config-backup can only turn a refusal
+# into `ready` by naming a backup the older containerd can genuinely load.
+#
+# The node must be AT TARGET for any of this to mean anything: a v4 config is
+# what the target containerd generates, and 2.48 has to have something to roll
+# back FROM.
+./reset-baseline.sh >/dev/null 2>&1
+restore_pkgs
+vm "rm -f $SF" >/dev/null 2>&1
+RBLOG=/var/log/docker-rollback.log
+CONF=/etc/containerd/config.toml
+
+out=$(vm_try "cd /opt/docker-offline && ./upgrade-docker.sh --status-file=$SF </dev/null 2>&1")
+if printf '%s' "$out" | grep -q "UPGRADE COMPLETE"; then
+    ok "2.43 fixture: node upgraded to the target"
+else
+    bad "2.43 fixture: the upgrade did not complete -- every case below is vacuous"
+    printf '%s\n' "$out" | tail -20 | sed 's/^/       /'
+fi
+# Two config fixtures kept off the node's live path: the v3 the baseline wrote,
+# and a v4 the TARGET containerd generates. Both are read back and asserted,
+# because a fixture that silently produced the same version twice would make
+# 2.44 and 2.45 pass without testing anything.
+vm "cp $CONF /root/cv3.toml" >/dev/null 2>&1
+vm "containerd config default > /root/cv4.toml" >/dev/null 2>&1
+conf_v3=$(vm_try "sed -n 's/^version *= *//p' /root/cv3.toml | head -1" | tr -d '\r' | tail -1)
+conf_v4=$(vm_try "sed -n 's/^version *= *//p' /root/cv4.toml | head -1" | tr -d '\r' | tail -1)
+if [ "${conf_v3:-0}" -le 3 ] 2>/dev/null && [ "${conf_v4:-0}" -gt 3 ] 2>/dev/null; then
+    ok "2.43 fixture: on-disk config is v$conf_v3, the target generates v$conf_v4"
+else
+    bad "2.43 fixture: config versions are v'$conf_v3' and v'$conf_v4' -- the boundary is not staged"
+fi
+
+# --- 2.43: --preflight on a healthy node ---
+vm "rm -f $SF" >/dev/null 2>&1
+capture_strict_state a43
+rc=$(vm_try "cd /opt/docker-offline && ./rollback-docker.sh --preflight --status-file=$SF </dev/null >/dev/null 2>&1; echo \$?" | tail -1)
+if [ "$rc" = "0" ]; then
+    ok "2.43 rollback --preflight on a healthy node exits 0"
+else
+    bad "2.43 rollback --preflight exited '$rc', want 0"
+    vm_try "cd /opt/docker-offline && ./rollback-docker.sh --preflight --status-file=/tmp/x.kv </dev/null 2>&1" | tail -20 | sed 's/^/       /'
+fi
+assert_status_complete "2.43" "$SF"
+assert_status_key "2.43" "$SF" result ready
+assert_status_key "2.43" "$SF" mode preflight
+assert_status_key "2.43" "$SF" next_action proceed
+assert_status_key "2.43" "$SF" config_rollback_safe true
+assert_status_key "2.43" "$SF" refusal_reason ""
+assert_status_key "2.43" "$SF" pkg_state untouched
+assert_status_key "2.43" "$SF" services_stopped false
+# STATE: read-only means read-only.
+assert_untouched_strict "2.43" target a43
+
+# --- 2.44: --preflight with a v4 config and no usable backup refuses ---
+# This is case 2.27 re-expressed as a preflight: the same guard, reached on a
+# node nobody has touched, instead of after the services stop.
+vm "rm -f $SF" >/dev/null 2>&1
+vm "rm -rf /root/docker-backup-*" >/dev/null 2>&1
+vm "cp /root/cv4.toml $CONF" >/dev/null 2>&1
+capture_strict_state a44
+rc=$(vm_try "cd /opt/docker-offline && ./rollback-docker.sh --preflight --status-file=$SF </dev/null >/dev/null 2>&1; echo \$?" | tail -1)
+if [ "$rc" = "1" ]; then
+    ok "2.44 --preflight refuses a v$conf_v4 config with no usable backup (exit 1)"
+else
+    bad "2.44 exited '$rc' with a v$conf_v4 config and no backup, want 1"
+fi
+assert_status_key "2.44" "$SF" result refused
+assert_status_key "2.44" "$SF" refusal_reason config-version-blocks-rollback
+assert_status_key "2.44" "$SF" next_action restore-config
+assert_status_key "2.44" "$SF" config_version_effective "$conf_v4"
+assert_status_key "2.44" "$SF" config_rollback_safe false
+assert_status_key "2.44" "$SF" config_backup_source none
+assert_status_key "2.44" "$SF" pkg_state untouched
+assert_status_complete "2.44" "$SF"
+out=$(vm_try "cd /opt/docker-offline && ./rollback-docker.sh --preflight --status-file=$SF </dev/null 2>&1")
+if printf '%s' "$out" | grep -q "CONFIG VERSION BLOCKS THIS ROLLBACK"; then
+    ok "2.44 the refusal names the config version"
+else
+    bad "2.44 the refusal does not name the config version"
+    printf '%s\n' "$out" | tail -8 | sed 's/^/       /'
+fi
+# STATE: the node is untouched, which is the whole point of hoisting the guard.
+# A refusal that downgraded and THEN failed to start containerd also exits 1.
+assert_untouched_strict "2.44" target a44
+assert_vm_eq "2.44 the config file is byte-identical" \
+    "sha256sum $CONF | cut -d' ' -f1" "$(vm_try "sha256sum /root/cv4.toml | cut -d' ' -f1" | tail -1)"
+p1_before=$(log_phase_count "$RBLOG" '=== Phase 1: Stop Services ===')
+
+# --- 2.45: --config-backup selects an older, loadable backup ---
+# The newest backup holds the v4; an older one holds the v3. Naming the older
+# turns a refusal into ready -- not by overriding the guard, but by giving it a
+# different, genuine fact to judge.
+vm "rm -rf /root/docker-backup-*" >/dev/null 2>&1
+vm "mkdir -p /root/docker-backup-20250101-000000 /root/docker-backup-20260101-000000" >/dev/null 2>&1
+vm "cp /root/cv3.toml /root/docker-backup-20250101-000000/config.toml" >/dev/null 2>&1
+vm "cp /root/cv4.toml /root/docker-backup-20260101-000000/config.toml" >/dev/null 2>&1
+vm "rm -f $SF" >/dev/null 2>&1
+capture_strict_state a45
+rc=$(vm_try "cd /opt/docker-offline && ./rollback-docker.sh --preflight --status-file=$SF --config-backup=/root/docker-backup-20250101-000000 </dev/null >/dev/null 2>&1; echo \$?" | tail -1)
+if [ "$rc" = "0" ]; then
+    ok "2.45 --config-backup naming the older, loadable backup exits 0"
+else
+    bad "2.45 exited '$rc' with a loadable backup named, want 0"
+    vm_try "cd /opt/docker-offline && ./rollback-docker.sh --preflight --status-file=/tmp/x.kv --config-backup=/root/docker-backup-20250101-000000 </dev/null 2>&1" | tail -20 | sed 's/^/       /'
+fi
+assert_status_key "2.45" "$SF" result ready
+assert_status_key "2.45" "$SF" config_backup_source flag
+assert_status_key "2.45" "$SF" config_backup_selected /root/docker-backup-20250101-000000
+assert_status_key "2.45" "$SF" config_rollback_safe true
+# What 0c judged is the BACKUP's version, not the v4 sitting on disk. Reporting
+# the on-disk version here would tell an agent the opposite of the decision.
+assert_status_key "2.45" "$SF" config_version_effective "$conf_v3"
+assert_status_key "2.45" "$SF" config_version_on_disk "$conf_v4"
+assert_status_complete "2.45" "$SF"
+# The same node, the same two backups, with NO flag: the newest is the v4 one,
+# so the guard fires. This is the pair that proves the flag did the work.
+vm "rm -f /tmp/noflag.kv" >/dev/null 2>&1
+rc=$(vm_try "cd /opt/docker-offline && ./rollback-docker.sh --preflight --non-interactive --status-file=/tmp/noflag.kv --config-backup=newest </dev/null >/dev/null 2>&1; echo \$?" | tail -1)
+if [ "$rc" = "1" ]; then
+    ok "2.45 the same node with --config-backup=newest refuses (exit 1)"
+else
+    bad "2.45 --config-backup=newest exited '$rc' with a v$conf_v4 newest backup, want 1"
+fi
+assert_status_key "2.45 newest" /tmp/noflag.kv refusal_reason config-version-blocks-rollback
+assert_status_key "2.45 newest" /tmp/noflag.kv config_version_effective "$conf_v4"
+vm "rm -f /tmp/noflag.kv" >/dev/null 2>&1
+assert_untouched_strict "2.45" target a45
+
+# --- 2.46: --config-backup naming a directory that is not there ---
+vm "rm -f $SF" >/dev/null 2>&1
+capture_strict_state a46
+rc=$(vm_try "cd /opt/docker-offline && ./rollback-docker.sh --preflight --status-file=$SF --config-backup=/root/docker-backup-does-not-exist </dev/null >/dev/null 2>&1; echo \$?" | tail -1)
+if [ "$rc" = "1" ]; then
+    ok "2.46 --config-backup naming a missing directory exits 1"
+else
+    bad "2.46 exited '$rc' for a missing backup directory, want 1"
+fi
+assert_status_key "2.46" "$SF" result refused
+assert_status_key "2.46" "$SF" refusal_reason config-backup-not-found
+assert_status_key "2.46" "$SF" next_action supply-flag
+assert_status_key "2.46" "$SF" pkg_state untouched
+assert_status_complete "2.46" "$SF"
+# It must NOT silently fall back to the newest, which here is the unloadable
+# v4 one: a fallback would restore a file the caller did not choose.
+assert_status_key "2.46" "$SF" config_backup_selected none
+# A directory that exists but holds no config.toml is the same refusal.
+vm "mkdir -p /root/empty-backup-dir" >/dev/null 2>&1
+vm "rm -f /tmp/empty.kv" >/dev/null 2>&1
+rc=$(vm_try "cd /opt/docker-offline && ./rollback-docker.sh --preflight --status-file=/tmp/empty.kv --config-backup=/root/empty-backup-dir </dev/null >/dev/null 2>&1; echo \$?" | tail -1)
+if [ "$rc" = "1" ]; then
+    ok "2.46 a backup directory with no config.toml is refused too"
+else
+    bad "2.46 an empty backup directory exited '$rc', want 1"
+fi
+assert_status_key "2.46 empty" /tmp/empty.kv refusal_reason config-backup-not-found
+vm "rm -rf /root/empty-backup-dir /tmp/empty.kv" >/dev/null 2>&1
+assert_untouched_strict "2.46" target a46
+
+# --- 2.47: an ambiguous selection refuses under --non-interactive ---
+# NOT a preflight: this is a real rollback that must stop in phase 0b, before
+# phase 1 stops anything. The two backups from 2.45 are still in place.
+vm "rm -f $SF" >/dev/null 2>&1
+capture_strict_state a47
+rc=$(vm_try "cd /opt/docker-offline && ./rollback-docker.sh --non-interactive --status-file=$SF </dev/null >/dev/null 2>&1; echo \$?" | tail -1)
+if [ "$rc" = "1" ]; then
+    ok "2.47 two backups and no --config-backup exits 1 under --non-interactive"
+else
+    bad "2.47 exited '$rc' with an ambiguous selection, want 1"
+fi
+assert_status_key "2.47" "$SF" result refused
+assert_status_key "2.47" "$SF" refusal_reason config-backup-ambiguous
+assert_status_key "2.47" "$SF" next_action supply-flag
+assert_status_key "2.47" "$SF" pkg_state untouched
+assert_status_complete "2.47" "$SF"
+cands=$(status_key "$SF" config_backup_candidates)
+if printf '%s' "$cands" | grep -q "20250101-000000" && printf '%s' "$cands" | grep -q "20260101-000000"; then
+    ok "2.47 config_backup_candidates lists both backups ($cands)"
+else
+    bad "2.47 config_backup_candidates is '$cands' and does not list both"
+fi
+# Temporal: it refused BEFORE phase 1. Finding the services active afterwards
+# would also hold after a stop, a downgrade and a restart.
+assert_phase_count_unchanged "2.47" "$RBLOG" '=== Phase 1: Stop Services ===' "$p1_before"
+assert_untouched_strict "2.47" target a47
+
+# --- 2.48: a full non-interactive rollback completes ---
+# A loadable config everywhere: one backup holding the v3, and the v3 on disk.
+vm "rm -rf /root/docker-backup-*" >/dev/null 2>&1
+vm "mkdir -p /root/docker-backup-20260202-000000" >/dev/null 2>&1
+vm "cp /root/cv3.toml /root/docker-backup-20260202-000000/config.toml" >/dev/null 2>&1
+vm "cp /root/cv3.toml $CONF" >/dev/null 2>&1
+vm "rm -f $SF" >/dev/null 2>&1
+# --non-interactive without --status-file is refused at parse time here too.
+rc=$(vm_try "cd /opt/docker-offline && ./rollback-docker.sh --non-interactive --config-backup=newest </dev/null >/dev/null 2>&1; echo \$?" | tail -1)
+if [ "$rc" = "1" ]; then
+    ok "2.48 --non-interactive without --status-file is refused at parse time"
+else
+    bad "2.48 --non-interactive with no status file exited '$rc', want 1"
+fi
+if vm_try "test -e $SF; echo \$?" | tail -1 | grep -qx 1; then
+    ok "2.48 that parse-time refusal wrote no status file"
+else
+    bad "2.48 a status file appeared for a parse-time refusal"
+fi
+out=$(vm_try "cd /opt/docker-offline && ./rollback-docker.sh --non-interactive --status-file=$SF --config-backup=newest </dev/null 2>&1")
+if printf '%s' "$out" | grep -q "ROLLBACK COMPLETE"; then
+    ok "2.48 a fully answered rollback runs without a terminal"
+else
+    bad "2.48 the non-interactive rollback did NOT complete"
+    printf '%s\n' "$out" | tail -25 | sed 's/^/       /'
+fi
+assert_status_complete "2.48" "$SF"
+assert_status_key "2.48" "$SF" result completed
+assert_status_key "2.48" "$SF" exit_code 0
+assert_status_key "2.48" "$SF" mode non-interactive
+assert_status_key "2.48" "$SF" pkg_state installed
+assert_status_key "2.48" "$SF" config_backup_source flag
+assert_status_key "2.48" "$SF" config_backup_selected /root/docker-backup-20260202-000000
+assert_status_key "2.48" "$SF" services_stopped false
+assert_status_key "2.48" "$SF" next_action none
+# STATE: the packages really went back, and the node really came up.
+#
+# The THREE packages the rollback bundle carries, not all five:
+# rollback-docker.sh downgrades docker-ce, docker-ce-cli and containerd.io and
+# deliberately leaves the plugins alone, because buildx and compose version
+# independently of docker-ce. Asserting a full baseline profile here would
+# demand a downgrade the script does not perform and never claimed to.
+assert_vm_eq "2.48 docker-ce back to $BASELINE_DOCKER" \
+    "rpm -q docker-ce --queryformat '%{VERSION}'" "$BASELINE_DOCKER"
+assert_vm_eq "2.48 docker-ce-cli back to $BASELINE_DOCKER" \
+    "rpm -q docker-ce-cli --queryformat '%{VERSION}'" "$BASELINE_DOCKER"
+assert_vm_eq "2.48 containerd.io back to $BASELINE_CONTAINERD" \
+    "rpm -q containerd.io --queryformat '%{VERSION}'" "$BASELINE_CONTAINERD"
+# And the plugins are left where the upgrade put them -- asserted, so a future
+# change that started downgrading them would be noticed rather than assumed.
+assert_vm_eq "2.48 buildx left at $TARGET_BUILDX" \
+    "rpm -q docker-buildx-plugin --queryformat '%{VERSION}'" "$TARGET_BUILDX"
+assert_vm_eq "2.48 compose left at $TARGET_COMPOSE" \
+    "rpm -q docker-compose-plugin --queryformat '%{VERSION}'" "$TARGET_COMPOSE"
+assert_vm_eq "2.48 docker active after the rollback" "systemctl is-active docker" "active"
+assert_vm_eq "2.48 containerd active after the rollback" "systemctl is-active containerd" "active"
+assert_vm_eq "2.48 canary data intact" \
+    "docker start survivor >/dev/null 2>&1; docker exec survivor cat /data/canary.txt" \
+    "VOLUME-CANARY-DATA"
+# The relocated root survived the downgrade too.
+# The same expression config-version-check.sh B7 uses, byte for byte.
+# `containerd config dump` quotes the value with SINGLE quotes, so
+# stripping only double quotes compares a quoted string against a bare
+# path and fails on a perfectly healthy node.
+assert_vm_eq "2.48 containerd still uses the relocated root" \
+    "containerd config dump 2>/dev/null | awk '/^[[:space:]]*\\[/ { exit } { print }' | sed -n \"s/^[[:space:]]*root[[:space:]]*=[[:space:]]*['\\\"]\\{0,1\\}\\([^'\\\"]*\\)['\\\"]\\{0,1\\}.*/\\1/p\" | head -1" \
+    "$RELOCATED_ROOT"
+
+vm "rm -rf /root/docker-backup-* /root/cv3.toml /root/cv4.toml" >/dev/null 2>&1
 vm "rm -f $SF" >/dev/null 2>&1
 ./reset-baseline.sh >/dev/null 2>&1
 fi

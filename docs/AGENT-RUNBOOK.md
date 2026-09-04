@@ -233,15 +233,17 @@ and `drain_performed` for whether **this run** did the draining.
 
 | Flag | Scripts | Effect |
 |---|---|---|
-| `--preflight` | upgrade | Run every check that can be made with the node untouched, report, exit |
-| `--non-interactive` | upgrade, cleanup | Refuse, rather than prompt, on a gate with no answer. **Requires `--status-file`** |
+| `--preflight` | upgrade, rollback | Run every check that can be made with the node untouched, report, exit |
+| `--non-interactive` | all three | Refuse, rather than prompt, on a question with no answer. **Requires `--status-file`** |
 | `--status-file=PATH` | all three | Write a `key=value` record of the run to PATH. Absolute paths only |
 | `--dry-run` | cleanup | Stop, enumerate, print the inventory and its hash, restart, exit 0. Deletes nothing |
 | `--expect-inventory-sha=SHA` | cleanup | Refuse unless this run's own enumeration hashes to SHA |
+| `--config-backup=WHAT` | rollback | Which containerd config backup phase 3 should restore: `newest`, `none`, or a directory |
 | `--help` | all three | Usage, exit 0. Works as any user and touches nothing |
 | `--version` | all three | The script's version, exit 0 |
 
-`rollback-docker.sh` has no gate flags and no `--non-interactive` yet. Run it on a terminal.
+`rollback-docker.sh` has no **gate** flags: its one question is a value, not a yes/no, so it is
+`--config-backup` rather than a gate.
 
 ### `--non-interactive`
 
@@ -362,10 +364,46 @@ contradictory instructions.
 A `--expect-inventory-sha` value that is not 64 lowercase hex characters is also a usage error,
 not a mismatch — so a typo does not send you inspecting the node.
 
-### `--preflight`
+### `--config-backup` — `rollback-docker.sh`
+
+The rollback's one question is *which* backup phase 3 should restore, and that is a value
+rather than a yes/no. Today it is asked only when more than one `/root/docker-backup-*`
+directory exists, and answering "no" aborts the rollback — so naming a non-newest backup used
+to mean stopping and copying a file by hand.
+
+| Value | Effect |
+|---|---|
+| `newest` | take the newest directory without asking — what answering yes does today |
+| `none` | restore nothing; phase 3 keeps whatever config is on disk |
+| a directory | use that one. **Refused** with `config-backup-not-found` if it does not exist or holds no `config.toml` |
+
+With no flag, behaviour is unchanged: exactly one backup, or none, is used without a question;
+more than one prompts. Under `--non-interactive` more than one with no flag is refused with
+`refusal_reason=config-backup-ambiguous`, and `config_backup_candidates` lists every directory
+to choose from.
+
+**The flag is a fact, not an override.** Phase 0c still judges the config phase 3 would
+*actually* load, and still refuses one the rollback containerd cannot read. So
+`--config-backup=DIR` can turn a refusal into `ready` — but only by naming a backup that
+passes the config-version guard, which is a different thing from forcing past it. Note what
+that guard checks: the top-level `version` key is one the older containerd accepts. It does not
+parse the rest of the file, so a backup it approves can still be wrong in some other way.
+`--config-backup=none` weakens nothing either: with no backup selected, the config phase 3
+loads is the on-disk file, and a version that blocks the rollback still blocks it.
+
+`config_backup_source` records how the selection was reached — `flag`, `newest`, `prompt` or
+`none` — so an audit can tell a flag that was trusted from a question a human answered.
+
+### `--preflight` — `upgrade-docker.sh`
 
 Run this first, on every node, before the real run. It is read-only: nothing is stopped,
 nothing is installed, no directory is created, and dnf is checked but not repaired.
+
+Everything in this section — the exit-3 case, the dnf check, the five-package classification,
+the two checks hoisted out of phase 6, and the gate prediction — is about the **upgrade**.
+`rollback-docker.sh --preflight` is a different, smaller thing: it runs phases 0, 0b and 0c
+and exits 0 or 1, with no exit 3 and no gates. It is described under the other two scripts,
+below.
 
 | Exit | `result` | Meaning |
 |---|---|---|
@@ -505,6 +543,8 @@ services, which is what its recovery logic needs. A stop that failed partway lea
 | `verification-failed` | installed versions do not match the target | upgrade, rollback |
 | `config-version-blocks-rollback` | the config the rollback would load is one it cannot read | rollback |
 | `config-backup-declined` | operator declined the newest backup | rollback |
+| `config-backup-ambiguous` | more than one backup exists and no `--config-backup` named one | rollback |
+| `config-backup-not-found` | `--config-backup` named a directory that does not exist or holds no `config.toml` | rollback |
 | `non-swarm-declined` | declined to clean a host that is not in a Swarm | cleanup |
 | `stop-declined` | declined to stop services | cleanup |
 | `delete-declined` | declined to delete the enumerated inventory | cleanup |
@@ -605,6 +645,7 @@ their digest check, and `not-attempted` means the run ended before phase 7.
 | `services_stopped` | `true` \| `false` |
 | `pkg_state` | `untouched` \| `attempted` \| `installed` |
 | `config_backup_selected` | path, or `none` |
+| `config_backup_source` | `flag` \| `newest` \| `prompt` \| `none` \| `unknown` |
 | `config_backup_candidates` | comma-separated paths, or empty |
 | `config_version_on_disk` | integer \| `unset` \| `absent` \| `unknown` |
 | `config_version_effective` | integer \| `unset` \| `none` \| `unreadable` \| `unknown` |
@@ -682,11 +723,16 @@ only applies to an empty line of typed input: end-of-file is refused, not defaul
 
 ### `rollback-docker.sh`
 
-One prompt, and only when more than one `/root/docker-backup-*` directory exists.
+One question, and only when more than one `/root/docker-backup-*` directory exists. It is a
+value rather than a gate, so it is answered with `--config-backup` rather than a `--NAME` flag.
 
 | Question | Default | How to decide |
 |---|---|---|
-| Use the backup marked above? | **yes** | The newest is not necessarily the one belonging to the upgrade you are rolling back. If you cannot tell which is right, answer no — it exits 0 having changed nothing — and **stop**. Do not simply copy a different `config.toml` into place and re-run: the next run selects the newest backup again and phase 3 restores it over your copy. Escalate so the backup selection is resolved first |
+| Use the backup marked above? | **yes** | The newest is not necessarily the one belonging to the upgrade you are rolling back. If you know which one is right, pass `--config-backup=DIR` and skip the question. If you cannot tell, answer no — it exits 0 having changed nothing — and **stop**. Do not copy a different `config.toml` into place and re-run instead: with no flag the next run selects the newest again and phase 3 restores it over your copy |
+
+Under `--non-interactive` this question is not asked. More than one backup with no
+`--config-backup` is refused with `config-backup-ambiguous`, and the candidates are listed in
+the record.
 
 ### `clean-swarm-networks.sh`
 
@@ -729,7 +775,9 @@ Read this first, from the status file. The prose below is for a run that had no
 | `refused` | `relocated-root-missing` | `fix-mount` | mount the filesystem, then preflight again |
 | `refused` | `tasks-present` | `investigate` | the drain already ran; wait and look from a manager |
 | `refused` | `drain-unconfirmed` | `drain-from-manager` | drain it from a manager, confirm it is empty, then retry |
-| `refused` | `config-version-blocks-rollback` | `restore-config` | restore the named backup, then try again |
+| `refused` | `config-version-blocks-rollback` | `restore-config` | restore the named backup, then try again. If a *different* backup on the node holds a config the older containerd can load, `--config-backup=DIR` naming it is the fix |
+| `refused` | `config-backup-ambiguous` | `supply-flag` | choose from `config_backup_candidates` and pass `--config-backup=DIR` |
+| `refused` | `config-backup-not-found` | `supply-flag` | the directory does not exist or holds no `config.toml`; choose from `config_backup_candidates` |
 | `refused` | `inventory-sha-required` | `rerun-dry-run` | you cannot pre-answer the deletion; dry run first, then pass its hash |
 | `refused` | `inventory-changed` | `rerun-dry-run` | the node changed between the two passes; dry run again and use the new hash |
 | `refused` | `enumeration-failed` | `investigate` | the inventory could not be read or hashed. Services were restored; nothing was deleted |
@@ -856,6 +904,14 @@ validates the payload and dry-runs the rpm transaction before stopping anything,
 rpm would refuse outright fails while the node is still up. That is a bounded promise: the dry
 run proves rpm's planned transaction resolves, not that scriptlets and file writes will
 succeed.
+
+**Run `rollback-docker.sh --preflight` before you need it.** It executes phases 0, 0b and 0c —
+the payload validation, the `rpm --test` dry run, the backup selection and the config-version
+guard — and exits without touching the node. That answers "would a rollback strand this node?"
+while docker and containerd are still up, which is exactly when it is cheap to fix. Exit 0 with
+`result=ready` means the rollback would proceed; exit 1 means it would refuse, and
+`refusal_reason` says why. It is a bounded promise: it does not predict rpm scriptlets, or
+whether a service will start.
 
 It refuses outright, in phase 0c, when the containerd config the rollback would actually load
 is a version the older containerd cannot read — because the downgrade would otherwise succeed

@@ -40,6 +40,16 @@
 #           to prevent
 #        pairs with tier2-run.sh case 2.41
 #
+#   M5   rollback phase 0b ignores --config-backup and always takes the newest
+#        -> a rollback the flag makes safe is refused, because the guard judges
+#           a backup the caller did not choose
+#        pairs with tier2-run.sh case 2.45
+#
+#   M6   rollback phase 0c's guard neutered, reached through --preflight
+#        -> preflight reports READY for a node whose rollback leaves containerd
+#           unable to start, and following that ready does exactly that
+#        pairs with tier2-run.sh case 2.44
+#
 # This is DESTRUCTIVE: it runs real upgrades against mutant scripts. It resets
 # the baseline before and after every mutant.
 
@@ -53,10 +63,12 @@ require_relocated_xfs
 SF=/tmp/agent-mutant-status.kv
 MUT=/opt/docker-offline/upgrade-MUTANT.sh
 CMUT=/opt/docker-offline/clean-MUTANT.sh
+RMUT=/opt/docker-offline/rollback-MUTANT.sh
 CLEANLOG=/var/log/docker-network-cleanup.log
+CONF=/etc/containerd/config.toml
 
 reset_all() {
-    vm "rm -f $MUT $CMUT $SF" >/dev/null 2>&1
+    vm "rm -f $MUT $CMUT $RMUT $SF" >/dev/null 2>&1
     vm "rm -rf /root/docker-backup-*" >/dev/null 2>&1
     # reset-baseline.sh does NOT leave the Swarm -- that state lives under the
     # docker data root and survives a daemon restart -- so a mutant that builds
@@ -528,6 +540,166 @@ if [ "$sw" = "inactive" ]; then
     trap - EXIT INT TERM
 else
     bad "M4 teardown: guest is still '$sw' -- leaving the EXIT trap armed"
+fi
+
+#############################################
+head_ "M5  rollback phase 0b ignores --config-backup"
+#############################################
+# --config-backup exists so an operator can name the backup that belongs to the
+# upgrade being rolled back, rather than whichever happens to be newest. Ignore
+# it and the guard judges a file nobody chose -- so a rollback the flag makes
+# safe is refused, on the node that is already in trouble.
+#
+# Case 2.45 asserts exit 0, result=ready and config_backup_source=flag, so it
+# FAILS against this mutant.
+reset_all
+
+# Two backups: the NEWEST holds a config the rollback containerd cannot load,
+# an older one holds a config it can. Built by hand from the node's own v3 so
+# the fixture needs no upgrade first, and both are read back and asserted --
+# a fixture whose two files had the same version would prove nothing.
+vm "set -e
+rm -rf /root/docker-backup-*
+mkdir -p /root/docker-backup-20250101-000000 /root/docker-backup-20260101-000000
+cp $CONF /root/docker-backup-20250101-000000/config.toml
+sed 's/^version = .*/version = 4/' $CONF > /root/docker-backup-20260101-000000/config.toml" >/dev/null 2>&1
+old_v=$(vm_try "sed -n 's/^version *= *//p' /root/docker-backup-20250101-000000/config.toml | head -1" | tr -d '\r' | tail -1)
+new_v=$(vm_try "sed -n 's/^version *= *//p' /root/docker-backup-20260101-000000/config.toml | head -1" | tr -d '\r' | tail -1)
+if [ "${old_v:-0}" -le 3 ] 2>/dev/null && [ "${new_v:-0}" -gt 3 ] 2>/dev/null; then
+    ok "M5 fixture: older backup is v$old_v, newest is v$new_v"
+else
+    bad "M5 fixture: versions are v'$old_v' and v'$new_v' -- the mutant proves nothing"
+fi
+
+vm 'set -e
+cp /opt/docker-offline/rollback-docker.sh /opt/docker-offline/rollback-MUTANT.sh
+cat > /tmp/m5.py <<"PYEOF"
+import pathlib
+p = pathlib.Path("/opt/docker-offline/rollback-MUTANT.sh")
+s = p.read_text()
+# The mutation is ONE thing: whether a named directory is honoured. Everything
+# else about phase 0b is untouched, so the newest is selected exactly as it was
+# before the flag existed.
+real = """elif [ -n "$CONFIG_BACKUP_FLAG" ] && [ "$CONFIG_BACKUP_FLAG" != "newest" ]; then"""
+assert real in s, "the named-backup branch was not found -- update this mutant"
+s = s.replace(real, """elif false; then   # MUTANT: --config-backup=DIR is ignored""", 1)
+p.write_text(s)
+print("M5 built")
+PYEOF
+python3 /tmp/m5.py
+chmod +x /opt/docker-offline/rollback-MUTANT.sh
+grep -c MUTANT /opt/docker-offline/rollback-MUTANT.sh'
+
+vm "rm -f $SF" >/dev/null 2>&1
+# EXACTLY case 2.45's invocation.
+mut_rc=$(vm_try "cd /opt/docker-offline && ./rollback-MUTANT.sh --preflight --status-file=$SF --config-backup=/root/docker-backup-20250101-000000 </dev/null >/dev/null 2>&1; echo \$?" | tail -1)
+mut_result=$(vm_try "sed -n 's/^result=//p' $SF 2>/dev/null | head -1" | tail -1)
+mut_sel=$(vm_try "sed -n 's/^config_backup_selected=//p' $SF 2>/dev/null | head -1" | tail -1)
+mut_src=$(vm_try "sed -n 's/^config_backup_source=//p' $SF 2>/dev/null | head -1" | tail -1)
+mut_eff=$(vm_try "sed -n 's/^config_version_effective=//p' $SF 2>/dev/null | head -1" | tail -1)
+echo "  mutant preflight: exit $mut_rc result=$mut_result"
+echo "                    selected=$mut_sel source=$mut_src effective version=$mut_eff"
+if [ "$mut_rc" = "1" ] && [ "$mut_result" = "refused" ] &&
+   [ "$mut_sel" = "/root/docker-backup-20260101-000000" ] && [ "$mut_eff" = "$new_v" ]; then
+    ok "M5 reproduced the hazard: the named backup was ignored and the rollback refused"
+    echo "       Case 2.45 asserts exit 0, result=ready, config_backup_source=flag and"
+    echo "       the older directory as the selection, so it FAILS against this mutant."
+else
+    bad "M5 did NOT reproduce the hazard (exit $mut_rc, result=$mut_result, selected=$mut_sel)"
+fi
+# The unmutated script, same node, same invocation: this is the pair.
+vm "rm -f /tmp/real.kv" >/dev/null 2>&1
+real_rc=$(vm_try "cd /opt/docker-offline && ./rollback-docker.sh --preflight --status-file=/tmp/real.kv --config-backup=/root/docker-backup-20250101-000000 </dev/null >/dev/null 2>&1; echo \$?" | tail -1)
+real_result=$(vm_try "sed -n 's/^result=//p' /tmp/real.kv 2>/dev/null | head -1" | tail -1)
+if [ "$real_rc" = "0" ] && [ "$real_result" = "ready" ]; then
+    ok "M5 the real script, on the same node, reports ready (exit 0)"
+else
+    bad "M5 the real script exited '$real_rc' result=$real_result -- the mutant is not the difference"
+fi
+vm "rm -f /tmp/real.kv" >/dev/null 2>&1
+
+#############################################
+head_ "M6  rollback phase 0c's guard neutered, reached through --preflight"
+#############################################
+# Confirming only that the mutant preflight reports "ready" would prove little:
+# case 2.44's untouched-state assertions still pass against it, because a
+# preflight that gives the wrong answer still touches nothing. The hazard is
+# what happens when an agent BELIEVES that answer, so this mutant follows the
+# ready through into a real rollback and asserts the outage reproduces.
+#
+# ONE mutation covers both halves: the guard's threshold. It is what preflight
+# reports and what the real run enforces, so raising it makes the preflight lie
+# and the real run act on the lie.
+reset_all
+
+# A config the rollback containerd cannot load, and no backup to fall back on:
+# the genuinely unrecoverable case. Built by hand from the node's own config so
+# the fixture needs no upgrade first.
+vm "set -e
+rm -rf /root/docker-backup-*
+sed -i 's/^version = .*/version = 4/' $CONF" >/dev/null 2>&1
+armed=$(vm_try "sed -n 's/^version *= *//p' $CONF | head -1" | tr -d '\r' | tail -1)
+if [ "${armed:-0}" -gt 3 ] 2>/dev/null; then
+    ok "M6 fixture: the on-disk config is now version $armed"
+else
+    bad "M6 fixture: config is version '$armed' -- the mutant proves nothing"
+fi
+# Services must still be UP: the whole claim is that the guard refuses on a
+# healthy node. They were started against the v3 and the edit does not stop them.
+assert_vm_eq "M6 fixture: docker still active" "systemctl is-active docker" "active"
+assert_vm_eq "M6 fixture: containerd still active" "systemctl is-active containerd" "active"
+
+vm 'set -e
+cp /opt/docker-offline/rollback-docker.sh /opt/docker-offline/rollback-MUTANT.sh
+cat > /tmp/m6.py <<"PYEOF"
+import pathlib
+p = pathlib.Path("/opt/docker-offline/rollback-MUTANT.sh")
+s = p.read_text()
+# The mutation is ONE thing: the highest config version the guard accepts.
+real = "ROLLBACK_MAX_CONFIG_VERSION=3"
+assert real in s, "the guard threshold was not found -- update this mutant"
+s = s.replace(real, "ROLLBACK_MAX_CONFIG_VERSION=99   # MUTANT: the guard can never fire", 1)
+p.write_text(s)
+print("M6 built")
+PYEOF
+python3 /tmp/m6.py
+chmod +x /opt/docker-offline/rollback-MUTANT.sh
+grep -c MUTANT /opt/docker-offline/rollback-MUTANT.sh'
+
+vm "rm -f $SF" >/dev/null 2>&1
+mut_rc=$(vm_try "cd /opt/docker-offline && ./rollback-MUTANT.sh --preflight --status-file=$SF </dev/null >/dev/null 2>&1; echo \$?" | tail -1)
+mut_result=$(vm_try "sed -n 's/^result=//p' $SF 2>/dev/null | head -1" | tail -1)
+mut_safe=$(vm_try "sed -n 's/^config_rollback_safe=//p' $SF 2>/dev/null | head -1" | tail -1)
+echo "  mutant preflight: exit $mut_rc result=$mut_result config_rollback_safe=$mut_safe"
+if [ "$mut_rc" = "0" ] && [ "$mut_result" = "ready" ] && [ "$mut_safe" = "true" ]; then
+    ok "M6 mutant preflight reports READY for a rollback that strands the node"
+else
+    bad "M6 mutant preflight did not report ready (exit $mut_rc, result=$mut_result)"
+fi
+
+echo ""
+echo "=== Following that ready into a real rollback, as an agent would ==="
+vm "rm -f $SF" >/dev/null 2>&1
+# The journal is read from HERE onward. Scanning the whole unit history would
+# find a config-version complaint left by an earlier suite and report it as
+# this mutant's doing.
+m6_since=$(vm_try "date '+%Y-%m-%d %H:%M:%S'" | tr -d '\r' | tail -1)
+vm_try "cd /opt/docker-offline && ./rollback-MUTANT.sh --status-file=$SF </dev/null 2>&1" | tail -4
+after_ph=$(vm_try "sed -n 's/^phase=//p' $SF 2>/dev/null | head -1" | tail -1)
+after_pkg=$(vm_try "sed -n 's/^pkg_state=//p' $SF 2>/dev/null | head -1" | tail -1)
+c_state=$(vm_try "systemctl is-active containerd || true" | tail -1)
+d_state=$(vm_try "systemctl is-active docker || true" | tail -1)
+journal=$(vm_try "journalctl -u containerd --no-pager --since '$m6_since' 2>/dev/null | grep -c 'expected containerd config version' || echo 0" | tail -1)
+echo "  after the run: phase=$after_ph pkg_state=$after_pkg containerd=$c_state docker=$d_state"
+echo "                 journal lines naming the config version: $journal"
+if [ "$after_pkg" = "installed" ] && [ "$c_state" != "active" ] && [ "${journal:-0}" -gt 0 ]; then
+    ok "M6 reproduced the hazard: the downgrade completed and containerd will not start"
+    echo "       That is the outage phase 0c exists to prevent, and the state an agent"
+    echo "       reaches by trusting the mutant's 'ready'. Case 2.44 asserts"
+    echo "       result=refused and config_rollback_safe=false, so it FAILS against"
+    echo "       this mutant."
+else
+    bad "M6 did NOT reproduce the outage (pkg_state=$after_pkg containerd=$c_state journal=$journal)"
 fi
 
 #############################################

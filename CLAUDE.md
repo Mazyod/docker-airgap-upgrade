@@ -124,8 +124,8 @@ Consequences the scripts encode:
 built from `containerd.io-2.3.4-1` — is automated in `tests/vm/tier2-run.sh` and
 passing; it stages the real upstream `-1` RPM and asserts the node's packages,
 services and canary data are untouched. Case **2.6b** — the already-at-target gate,
-which decides there is nothing to do *before* phase 9 ever runs — is now written
-in `tier2-run.sh` too but has **not been executed**; it downgrades containerd.io
+which decides there is nothing to do *before* phase 9 ever runs — is in
+`tier2-run.sh` too and now passing; it downgrades containerd.io
 alone to the `-1` build and re-runs the correct bundle. Do not report either as
 verified beyond what `docs/TEST-PLAN.md`'s execution status says, and update that
 table and this paragraph together.
@@ -376,6 +376,45 @@ state that becomes its own stale artifact on a node nobody can reach.
 parse-time usage error, and so is a hash that is not 64 lowercase hex characters. Neither
 writes a status file, because at that point the path is not known to be valid.
 
+### `rollback-docker.sh --config-backup` and `--preflight`
+
+The rollback's one question is *which* backup phase 3 restores — a **value**, not a yes/no —
+so it becomes `--config-backup=newest|none|DIR` rather than a gate. That is why this script
+has no `gate()` and no `GATE_ANSWERS`: the wrapper would be dead code. Naming a non-newest
+backup previously required aborting the rollback and copying a file by hand.
+
+Four things are load-bearing:
+
+- **The flag is a fact, not an override.** Phase 0c gains nothing. `--config-backup=DIR` can
+  turn a refusal into `ready` only by naming a backup the older containerd can genuinely load.
+  Section 1.14 greps the phase 0c block for `force`, `skip`, `override` and `GATE_ANSWERS` and
+  requires zero matches, comments included — a comment offering an override is a design
+  decision, not noise.
+- **`--config-backup=none` weakens nothing.** With no backup selected, the config phase 3
+  loads is the on-disk file, which is exactly what phase 0c then judges. A version that blocks
+  the rollback still blocks it.
+- **Phase 0c and phase 3 branch on the identical condition**, `[ -n "$BACKUP_DIR" ] && [ -f
+  "$BACKUP_DIR/config.toml" ]`, and phase 3 never re-globs for a backup. A guard that inspected
+  one file while phase 3 restored another would wave through exactly the config it exists to
+  catch. Section 1.14 requires the shared condition in both regions and no `docker-backup-`
+  glob in phase 3.
+- **`config_version_effective` reports what 0c judged**, not what is on disk. With a v4 on disk
+  and a v3 backup selected they differ, and reporting the disk would tell an agent the opposite
+  of the decision.
+
+Under `--non-interactive`, more than one backup with no `--config-backup` is refused as
+`config-backup-ambiguous` rather than resolved by taking the newest. Under `--preflight` the
+newest is *reported* with a note that the real interactive run would ask — preflight never
+prompts, and refusing over a question the interactive path would simply ask would be a worse
+answer than reporting one.
+
+`--preflight` runs phases 0, 0b and 0c and exits before phase 1. Those three phases were
+already read-only, so preflight is the same path with an earlier exit, not a parallel one. It
+exits 0 (`ready`) or 1; there is no exit 3, because this script has no already-at-baseline
+classification and inventing one would change the interactive path. Section 1.14 scans
+`preflight_report` plus phases 0, 0b and 0c for mutators and requires the exit to sit after
+phase 0c and before phase 1.
+
 Design and plan: `docs/superpowers/specs/2026-09-04-agent-mode-design.md` and
 `docs/superpowers/plans/2026-09-04-agent-mode-implementation.md`.
 
@@ -386,7 +425,7 @@ Every script except `simulate-upgrade.sh` declares `VERSION="x.y.z"` on ~line 4 
 | Script | Version |
 |---|---|
 | `upgrade-docker.sh` | 2.5.0 |
-| `rollback-docker.sh` | 2.2.1 |
+| `rollback-docker.sh` | 2.3.0 |
 | `download-docker-packages.sh` | 2.3.0 |
 | `clean-swarm-networks.sh` | 1.3.0 |
 | `recover-dnf.sh` | 1.2.2 |

@@ -1,7 +1,7 @@
 #!/bin/bash
 # rollback-docker.sh
 # Emergency rollback: Docker 29.8.0 → 29.1.5
-VERSION="2.2.1"
+VERSION="2.3.0"
 #
 # Use this script if:
 # - Services fail to start after upgrade
@@ -85,13 +85,22 @@ ENDED="unknown"
 STARTED="unknown"
 RUN_ID="unknown"
 
-# Slice 4 populates these; declared here because the parser will own them, and
-# assigning GATE_ANSWERS[x] before `declare -A` would create an indexed array
-# that cannot be converted afterwards.
-# shellcheck disable=SC2034  # reserved for the gate flags; see the agent-mode plan
+# NON_INTERACTIVE is a STRICTNESS switch, not a consent switch. It grants
+# nothing: it decides only what happens to a question nobody answered.
+#
+# This script has NO gate() and no GATE_ANSWERS. Its one question -- which
+# containerd config backup to restore -- is a VALUE, not a yes/no, so it
+# becomes --config-backup rather than a gate, and the yes/no wrapper would be
+# dead code here. Naming a non-newest backup previously meant aborting the
+# rollback and copying a file by hand.
 NON_INTERACTIVE=false
-# shellcheck disable=SC2034  # reserved for the gate flags; see the agent-mode plan
-declare -A GATE_ANSWERS=()
+
+# The backup selection stated on the command line, before phase 0b resolves it:
+#   ""        nothing stated -- today's behaviour, prompt when it is ambiguous
+#   newest    take the newest without asking
+#   none      restore nothing; keep whatever is on disk
+#   <dir>     that directory, refused if it does not exist or holds no config
+CONFIG_BACKUP_FLAG=""
 
 usage() {
     cat <<USAGE
@@ -100,9 +109,27 @@ $SCRIPT_NAME $VERSION
 Usage: $SCRIPT_NAME [OPTIONS]
 
 Options:
+  --preflight          Run phases 0, 0b and 0c with the node untouched,
+                       report, and exit. Changes nothing: no service is
+                       stopped, no package is replaced, no config is written.
+                       Exits 0 when the real rollback would proceed and 1 when
+                       it would refuse -- which answers "would a rollback
+                       strand this node?" while everything is still running.
   --status-file=PATH   Write a key=value record of this run to PATH. Written
                        once at startup with result=running and again on every
                        exit path, including success and interrupts.
+  --non-interactive    Refuse, rather than prompt, when the backup selection
+                       is ambiguous and no --config-backup was given. Never
+                       reads stdin. Requires --status-file.
+  --config-backup=WHAT Which containerd config backup phase 3 should restore.
+                       WHAT is one of:
+                         newest    the newest /root/docker-backup-* directory
+                         none      restore nothing; keep the on-disk config
+                         DIR       that directory, refused if it does not
+                                   exist or holds no config.toml
+                       This states a fact, not an override: phase 0c still
+                       judges whatever config phase 3 would actually load, and
+                       still refuses one the rollback containerd cannot read.
   --help, -h           Show this help and exit.
   --version            Print the script version and exit.
 
@@ -134,6 +161,26 @@ while [ "$#" -gt 0 ]; do
             fi
             STATUS_FILE="$2"; shift
             ;;
+        --preflight) MODE="preflight" ;;
+        --non-interactive) NON_INTERACTIVE=true ;;
+        --config-backup=*)
+            CONFIG_BACKUP_FLAG="${1#*=}"
+            if [ -z "$CONFIG_BACKUP_FLAG" ]; then
+                echo "ERROR: --config-backup needs newest, none, or a directory" >&2
+                exit 1
+            fi
+            ;;
+        --config-backup)
+            # An empty value must be rejected here too. Accepted, it would
+            # leave the flag empty and the run would silently behave as if no
+            # selection had been stated at all -- which is a prompt, or an
+            # ambiguity refusal, neither of which the caller asked for.
+            if [ "$#" -lt 2 ] || [ -z "$2" ]; then
+                echo "ERROR: --config-backup needs newest, none, or a directory" >&2
+                exit 1
+            fi
+            CONFIG_BACKUP_FLAG="$2"; shift
+            ;;
         --help|-h) usage; exit 0 ;;
         --version) echo "$SCRIPT_NAME $VERSION"; exit 0 ;;
         *)
@@ -144,6 +191,25 @@ while [ "$#" -gt 0 ]; do
     esac
     shift
 done
+
+# `mode` is one token. --preflight wins over --non-interactive because the run
+# is read-only either way, and the preflight branches key off this value.
+# Resolved AFTER the loop so flag order on the command line cannot matter.
+if [ "$MODE" != "preflight" ] && [ "$NON_INTERACTIVE" = true ]; then
+    MODE="non-interactive"
+fi
+
+# Exit 1 conflates refusal with failure, and 130 and 143 say nothing about
+# phase, service state or package state. This interface calls the status file
+# authoritative and then tells an exit-1 caller to read refusal_reason and
+# next_action; without the file those fields do not exist and the caller is
+# back to grepping coloured prose. Refuse the combination here rather than
+# shipping an interface that can be used uselessly.
+if [ "$NON_INTERACTIVE" = true ] && [ -z "$STATUS_FILE" ]; then
+    echo "ERROR: --non-interactive requires --status-file=PATH." >&2
+    echo "Without it a refusal is indistinguishable from a failure." >&2
+    exit 1
+fi
 
 if [ -n "$STATUS_FILE" ]; then
     if [ "${STATUS_FILE#/}" = "$STATUS_FILE" ]; then
@@ -301,6 +367,10 @@ status_keys() {
     status_kv services_stopped "$SERVICES_STOPPED"
     status_kv pkg_state "$PKG_STATE"
     status_kv config_backup_selected "${BACKUP_DIR:-none}"
+    # HOW the selection was reached, so an audit can tell a flag that was
+    # trusted from a question a human answered. Neither makes the backup the
+    # right one; the record only says which was relied on.
+    status_kv config_backup_source "$CONFIG_BACKUP_SOURCE"
     status_kv config_backup_candidates "$CONFIG_BACKUP_CANDIDATES"
     status_kv config_version_on_disk "$CONFIG_VERSION_ON_DISK"
     status_kv config_version_effective "$CONFIG_VERSION_EFFECTIVE"
@@ -320,6 +390,10 @@ status_keys() {
 # operator judgement that depends on why it failed.
 derive_next_action() {
     case "$RESULT" in
+        ready)
+            NEXT_ACTION="proceed"
+            return 0
+            ;;
         completed|nothing-to-do)
             NEXT_ACTION="none"
             return 0
@@ -328,7 +402,14 @@ derive_next_action() {
     case "$REFUSAL_REASON" in
         not-root)  NEXT_ACTION="rerun-as-root"; return 0 ;;
         bad-usage) NEXT_ACTION="none";          return 0 ;;
+        payload-invalid) NEXT_ACTION="rebuild-bundle"; return 0 ;;
         config-version-blocks-rollback) NEXT_ACTION="restore-config"; return 0 ;;
+        # Both are answered by naming a backup, not by investigating the node.
+        config-backup-ambiguous|config-backup-not-found)
+                   NEXT_ACTION="supply-flag";   return 0 ;;
+        # rpm refuses a transaction for disk space and host dependencies too,
+        # neither of which a new bundle fixes.
+        dry-run-failed) NEXT_ACTION="investigate"; return 0 ;;
     esac
     # start-services only when the units are OBSERVED down. SERVICES_STOPPED
     # is set before the first stop command, so a stop that failed partway
@@ -343,6 +424,50 @@ derive_next_action() {
     else
         NEXT_ACTION="investigate"
     fi
+    return 0
+}
+
+# Everything --preflight adds, in one place so the read-only claim can be read
+# in one place. Phases 0, 0b and 0c are ALREADY read-only -- they validate the
+# payload, dry-run the transaction with `rpm -Uvh --test`, glob for backups and
+# read two config files -- so preflight is not a separate code path through
+# them. It is the same path with an exit before phase 1 stops anything.
+#
+# READ-ONLY. Nothing in this function or on the path that reaches it may stop a
+# service, replace a package, restore or generate a config, or create a
+# directory. tests/static-checks.sh greps the whole region for exactly that.
+#
+# It only ever runs on the READY path: every refusal preflight can produce --
+# an invalid payload, a refused dry run, a backup that does not exist, an
+# ambiguous selection, a config version that blocks the rollback -- exits from
+# the phase that found it, with its own message and its own token. So this
+# reports the selection and returns 0.
+# shellcheck disable=SC2329  # invoked from the --preflight arm after phase 0c
+preflight_report() {
+    echo ""
+    echo -e "${GREEN}==========================================${NC}"
+    echo -e "${GREEN}ROLLBACK PREFLIGHT${NC}"
+    echo -e "${GREEN}==========================================${NC}"
+    echo ""
+    echo "  docker-ce:              $BEFORE_DOCKER -> $ROLLBACK_DOCKER_VERSION"
+    echo "  containerd.io:          $BEFORE_CONTAINERD -> $ROLLBACK_CONTAINERD_VERSION"
+    echo "  config on disk:         $CONTAINERD_CONF (version $CONFIG_VERSION_ON_DISK)"
+    echo "  backup candidates:      ${CONFIG_BACKUP_CANDIDATES:-<none>}"
+    echo "  backup selected:        ${BACKUP_DIR:-none}"
+    echo "  selection made by:      $CONFIG_BACKUP_SOURCE"
+    # What phase 0c actually judged, which is not always what is on disk.
+    echo "  config phase 3 loads:   version $CONFIG_VERSION_EFFECTIVE"
+    echo "  rollback-safe:          $CONFIG_ROLLBACK_SAFE"
+    echo ""
+    RESULT="ready"
+    echo -e "${GREEN}Ready: the real rollback would proceed from here.${NC}"
+    echo "Nothing on this node was changed."
+    echo ""
+    echo "This is a bounded promise. It says the payload validates, rpm accepts"
+    echo "the planned transaction, and the config phase 3 would load is one"
+    echo "containerd $ROLLBACK_CONTAINERD_VERSION can read. It does not predict rpm scriptlets, or"
+    echo "whether a service will start."
+    echo "=========================================="
     return 0
 }
 
@@ -369,6 +494,7 @@ PKG_STATE="untouched"
 # written, so no key is emitted without a value in its documented domain.
 EXIT_CODE="unknown"
 CONFIG_BACKUP_CANDIDATES=""
+CONFIG_BACKUP_SOURCE="unknown"
 CONFIG_VERSION_ON_DISK="unknown"
 CONFIG_VERSION_EFFECTIVE="unknown"
 CONFIG_ROLLBACK_SAFE="unknown"
@@ -399,6 +525,15 @@ on_exit() {
     case "$REFUSAL_REASON" in
         not-root|bad-usage) exit "$rc" ;;
     esac
+
+    # --preflight touches nothing, so the state report below -- services,
+    # packages, recovery advice -- describes a node this run never went near,
+    # and every refusal it can produce has already printed the line that
+    # explains itself. Printing "ROLLBACK FAILED" under a read-only check that
+    # correctly refused would say the opposite of what happened.
+    if [ "$MODE" = "preflight" ]; then
+        exit "$rc"
+    fi
 
     echo ""
     echo -e "${RED}==========================================${NC}"
@@ -826,13 +961,74 @@ BACKUP_DIRS=(/root/docker-backup-*/)
 shopt -u nullglob
 
 BACKUP_DIR=""
+# How the selection below was reached: flag | newest | prompt | none.
+#   flag    --config-backup named a directory, or said newest
+#   newest  nothing was stated and the newest was taken without a question
+#   prompt  a human confirmed the newest
+#   none    nothing will be restored, so phase 3 keeps what is on disk
+CONFIG_BACKUP_SOURCE="none"
 CONFIG_BACKUP_CANDIDATES=$(printf '%s,' "${BACKUP_DIRS[@]%/}" | sed 's/,$//')
-if [ "${#BACKUP_DIRS[@]}" -eq 0 ]; then
+
+if [ "$CONFIG_BACKUP_FLAG" = "none" ]; then
+    # An explicit statement of fact, and it cannot weaken anything. Phase 0c
+    # judges the config that would ACTUALLY be loaded, and with no backup
+    # selected that is the on-disk file: a version the rollback containerd
+    # cannot read still refuses, exactly as it would without the flag.
+    echo "--config-backup=none: no backup will be restored."
+    echo "The existing containerd config will be kept as-is."
+    echo "Phase 0c checks whether containerd $ROLLBACK_CONTAINERD_VERSION can actually load it."
+
+elif [ -n "$CONFIG_BACKUP_FLAG" ] && [ "$CONFIG_BACKUP_FLAG" != "newest" ]; then
+    # A named directory. REFUSED rather than silently falling back to the
+    # newest: a fallback would restore a file the caller did not choose, which
+    # is precisely what this flag exists to prevent.
+    SEL_BACKUP="${CONFIG_BACKUP_FLAG%/}"
+    if [ ! -d "$SEL_BACKUP" ]; then
+        REFUSAL_REASON="config-backup-not-found"
+        REFUSAL_DETAIL="no such backup directory: $SEL_BACKUP"
+        echo -e "${RED}ERROR: --config-backup names a directory that does not exist:${NC}"
+        echo "  $SEL_BACKUP"
+        if [ -n "$CONFIG_BACKUP_CANDIDATES" ]; then
+            echo ""
+            echo "Backups on this node:"
+            printf '  %s\n' "${BACKUP_DIRS[@]%/}"
+        else
+            echo ""
+            echo "There are no /root/docker-backup-* directories on this node."
+        fi
+        echo ""
+        echo "Nothing has been changed."
+        exit 1
+    fi
+    if [ ! -f "$SEL_BACKUP/config.toml" ]; then
+        REFUSAL_REASON="config-backup-not-found"
+        REFUSAL_DETAIL="$SEL_BACKUP holds no config.toml"
+        echo -e "${RED}ERROR: --config-backup names a directory with no config.toml:${NC}"
+        echo "  $SEL_BACKUP"
+        echo ""
+        echo "Pass --config-backup=none to keep the config that is on disk."
+        echo "Nothing has been changed."
+        exit 1
+    fi
+    BACKUP_DIR="$SEL_BACKUP"
+    CONFIG_BACKUP_SOURCE="flag"
+    echo "Using the backup named on the command line: $BACKUP_DIR"
+
+elif [ "${#BACKUP_DIRS[@]}" -eq 0 ]; then
     echo "No /root/docker-backup-* directories found."
     echo "The existing containerd config will be kept as-is."
     echo "Phase 0c checks whether containerd $ROLLBACK_CONTAINERD_VERSION can actually load it."
+
 else
     BACKUP_DIR="${BACKUP_DIRS[-1]%/}"
+    # Decided HERE, not inside the multi-backup arm below: with exactly one
+    # backup that arm never runs, and --config-backup=newest would then be
+    # recorded as though nobody had stated anything.
+    if [ "$CONFIG_BACKUP_FLAG" = "newest" ]; then
+        CONFIG_BACKUP_SOURCE="flag"
+    else
+        CONFIG_BACKUP_SOURCE="newest"
+    fi
 
     if [ "${#BACKUP_DIRS[@]}" -gt 1 ]; then
         echo -e "${YELLOW}${#BACKUP_DIRS[@]} backups exist:${NC}"
@@ -847,15 +1043,53 @@ else
         echo "The newest backup is not necessarily the one belonging to the"
         echo "upgrade you are rolling back."
         echo ""
-        if ! prompt_yes_no "Use the backup marked above? [Y/n]" "y"; then
-            REFUSAL_REASON="config-backup-declined"
-            REFUSAL_DETAIL="operator declined the newest backup: $BACKUP_DIR"
+        if [ "$CONFIG_BACKUP_FLAG" = "newest" ]; then
+            # A pre-declared answer wins in BOTH modes, exactly like a gate
+            # flag: the flag states a fact, and the mode only decides what
+            # happens to facts nobody stated.
+            echo "--config-backup=newest was given; taking the newest without asking."
+        elif [ "$MODE" = "preflight" ]; then
+            # Preflight NEVER prompts. It reports what a yes would select and
+            # says so, rather than refusing over a question the real
+            # interactive run would simply ask.
+            echo "This is a preflight, so nothing is asked. The newest is reported"
+            echo "because that is what answering yes would select."
+            echo "Pass --config-backup=DIR to have phase 0c judge a different one."
+        elif [ "$NON_INTERACTIVE" = true ]; then
+            REFUSAL_REASON="config-backup-ambiguous"
+            REFUSAL_DETAIL="${#BACKUP_DIRS[@]} backups exist and none was named"
+            # Nothing was selected: phase 3 will never run. Reporting the
+            # newest as `config_backup_selected` on a run that refused would
+            # tell a reader a decision was made when the refusal is precisely
+            # that none was.
+            BACKUP_DIR=""
+            CONFIG_BACKUP_SOURCE="none"
+            echo -e "${RED}ERROR: --non-interactive was given and the backup selection is ambiguous.${NC}"
+            echo "More than one backup exists and no --config-backup was passed, so"
+            echo "nothing has stated which one belongs to the upgrade being rolled back."
             echo ""
-            echo "Aborting. Nothing has been changed."
-            echo "To use a different backup, copy its config.toml into place"
-            echo "manually before re-running:"
-            echo "  cp <backup>/config.toml /etc/containerd/config.toml"
-            exit 0
+            echo "Pass one of:"
+            echo "  --config-backup=DIR   (one of the directories listed above)"
+            echo "  --config-backup=newest"
+            echo "  --config-backup=none    (keep the config that is on disk)"
+            echo ""
+            echo "Nothing has been changed."
+            exit 1
+        else
+            if ! prompt_yes_no "Use the backup marked above? [Y/n]" "y"; then
+                REFUSAL_REASON="config-backup-declined"
+                REFUSAL_DETAIL="operator declined the newest backup: $BACKUP_DIR"
+                # Same reason as the ambiguity refusal above: nothing will be
+                # restored, so nothing is selected.
+                BACKUP_DIR=""
+                CONFIG_BACKUP_SOURCE="none"
+                echo ""
+                echo "Aborting. Nothing has been changed."
+                echo "To use a different backup, re-run naming it:"
+                echo "  ./rollback-docker.sh --config-backup=DIR"
+                exit 0
+            fi
+            CONFIG_BACKUP_SOURCE="prompt"
         fi
     else
         echo "Using backup: $BACKUP_DIR"
@@ -865,6 +1099,7 @@ else
         echo -e "${YELLOW}NOTE: $BACKUP_DIR has no config.toml.${NC}"
         echo "The existing containerd config will be kept as-is."
         BACKUP_DIR=""
+        CONFIG_BACKUP_SOURCE="none"
     fi
 fi
 
@@ -1048,6 +1283,25 @@ else
     fi
     echo ""
     exit 1
+fi
+
+#############################################
+# Everything above this line is read-only: phase 0 validates the payload and
+# dry-runs the transaction with `rpm -Uvh --test`, phase 0b globs for backups,
+# and phase 0c reads two config files. Everything BELOW it mutates -- phase 1
+# stops services, phase 2 replaces packages, phase 3 rewrites the config.
+#
+# The exit sits here rather than earlier so preflight covers the whole of
+# phase 0c, which is the check it exists to run: "would a rollback strand this
+# node?", answered while docker and containerd are still up.
+if [ "$MODE" = "preflight" ]; then
+    CURRENT_PHASE="preflight"
+    if preflight_report; then
+        PREFLIGHT_RC=0
+    else
+        PREFLIGHT_RC=$?
+    fi
+    exit "$PREFLIGHT_RC"
 fi
 
 #############################################

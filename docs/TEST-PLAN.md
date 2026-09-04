@@ -7,19 +7,19 @@
 
 | Tier | Status | Evidence |
 |---|---|---|
-| Tier 1 static | **PASSED 233/233** | `tests/static-checks.sh --online` — includes all 16 RPM URLs |
-| Tier 2 VM | **PASSED 67/67** | `tests/vm/tier2-run.sh` (the `all` phases) at commit `9c56f16` |
-| Tier 2 agent mode | **PASSED 486/486, 1 skipped** | `tests/vm/tier2-run.sh agent` — cases 2.29 through 2.38, at `9c56f16`. The skip is the worker predictor state, which needs a second node |
-| Tier 2 config-version boundary | **PASSED 30/30** | `tests/vm/config-version-check.sh` — cases 2.23–2.28, at `9c56f16` |
-| Tier 2 negative control | **PASSED 3/3** | `tests/vm/negative-control.sh` — mutant loses the relocated root, at `9c56f16` |
-| Tier 2 agent negative control | **PASSED 4/4 mutants** | `tests/vm/agent-mode-negative-control.sh` — M1a, M1b, M2 and M3 each make their case fail, at `9c56f16` |
+| Tier 1 static | **PASSED 226/226** offline | `tests/static-checks.sh`; the 16 RPM URL checks are the one skip and need `--online` |
+| Tier 2 VM | **PASSED 67/67** | `tests/vm/tier2-run.sh` (the `all` phases) — the interactive-path regression gate |
+| Tier 2 agent mode | **PASSED 697/697, 2 skipped** | `tests/vm/tier2-run.sh agent` — cases 2.29 through 2.48. One skip is the worker predictor state, which needs a second node; the other is phase 4's VXLAN loop, which an attachable overlay does not exercise from the host namespace |
+| Tier 2 config-version boundary | **PASSED 30/30** | `tests/vm/config-version-check.sh` — cases 2.23–2.28 |
+| Tier 2 negative control | **PASSED 3/3** | `tests/vm/negative-control.sh` — mutant loses the relocated root |
+| Tier 2 agent negative control | **PASSED 24/24, 8 mutants** | `tests/vm/agent-mode-negative-control.sh` — M1a, M1b, M2, M3, M4a, M4b, M5 and M6 each reproduce the hazard their paired case exists to catch |
 | Tier 1b stubbed | not built | optional; Tier 2 covers most of its intent |
 | Tier 3 Swarm | **NOT RUN** | needs a real multi-node cluster |
 
 Every Tier 2 figure above was produced in one campaign against a bundle rebuilt from
-the checkout at `9c56f16`, on Rocky Linux 9 through the Docker backend, with the guest
-recreated from scratch (`bootstrap-vm.sh --recreate`, whose own precondition check
-passed 8/8) and the baseline reset between suites.
+the checkout under test, on Rocky Linux 9 through the Docker backend, with the
+baseline reset between suites. The agent-mode figure covers the cleanup dry run and
+the rollback preflight added in the last two slices; it was 486 before them.
 
 The `agent` phase is **not part of `all`** — it runs only as `tests/vm/tier2-run.sh
 agent`, resets the baseline before it starts, and therefore carries its own figure.
@@ -37,7 +37,7 @@ by each build, read from the RPM headers on the test node:
 | containerd.io-2.3.4-**2** | 1.5.1 | 14,062,896 |
 | containerd.io-2.3.4-**1** | 1.4.3 | 15,920,328 |
 
-### The containerd RPM-release guard: 2.6a is automated, 2.6b is still owed
+### The containerd RPM-release guard: 2.6a and 2.6b are both automated
 
 The `EXPECTED_CONTAINERD_RELEASE` assertion has three call sites, and they fail in
 different places, so one case does not cover them: phase 0 checks the payload, the already-at-target gate checks what is
@@ -68,8 +68,9 @@ originally proposed. Same starting state, and no mutant of the script under test
 ever run — which matters, because a case that requires disabling the guard to set
 itself up cannot then be trusted to prove the guard works.
 
-**Mutation to run against 2.6b when the harness is next free** (it has not been
-run): delete the release test from the already-at-target gate in
+**Mutation still owed against 2.6b.** The case itself now runs and passes in the
+`all` phase; what has not been run is this mutation of it: delete the release test
+from the already-at-target gate in
 `upgrade-docker.sh` — the `containerd_release_matches "$CURRENT_CONTAINERD_REL"`
 conjunct — and confirm 2.6b turns red. The node should then be declared already at
 the target, take the `exit 0` path, and be left on `2.3.4-1.el9` with runc 1.4.3.
@@ -179,8 +180,11 @@ merely exercised — see 2.27/2.28 above for what the neutered build does to the
 **Tier 3 remains mandatory before production.** A single-node Swarm manager draining and
 reactivating itself IS now executed, in the agent-mode phase, along with the cleanup
 script's gates. Nothing else about Swarm is — **worker behaviour of any kind**,
-multi-node operation, overlay reconvergence, mixed-version operation, or the
-destructive half of `clean-swarm-networks.sh`. The claim that a mixed
+multi-node operation, overlay reconvergence, or mixed-version operation. The
+destructive half of `clean-swarm-networks.sh` is now partly exercised — phase 4
+really does delete the namespaces, the key-value store and `docker_gwbridge` on a
+single-node Swarm — with the host-namespace VXLAN loop still unreached and reported
+as a skip. The claim that a mixed
 29.1.5 / 29.8.0 cluster is safe rests on both being Docker 29.x engines, **not** on a
 measurement. See `tests/vm/README.md` for the full list of what the VM tier does and
 does not prove.
@@ -398,6 +402,42 @@ and the harness asserts there are namespaces, a key-value store and a
 
 Neither mutant reproduces anything without the Swarm fixture: it would refuse at the
 `allow-non-swarm` gate long before reaching a stop or a delete.
+
+### 2.43–2.48 — the rollback preflight and the backup selection ⚑
+
+New with `rollback-docker.sh --preflight`, `--config-backup` and `--non-interactive`.
+Automated in `tests/vm/tier2-run.sh agent`, which is **destructive** — it upgrades the
+node first, because a v4 config is what the target containerd generates and 2.48 needs
+something to roll back from, and it resets the baseline afterwards.
+
+The fixture stages two config files off the live path and **asserts their versions
+differ across the boundary** before any case runs; two files that happened to carry
+the same version would make 2.44 and 2.45 pass without testing anything.
+
+| # | Test | From | Pass criteria |
+|---|---|---|---|
+| 2.43 | `--preflight` on a healthy node | S2 | Exit 0, `result=ready`, `mode=preflight`, `next_action=proceed`, `config_rollback_safe=true`, `pkg_state=untouched`. **State:** `assert_untouched_strict` at the target profile |
+| 2.44 | `--preflight` with a v4 config and no usable backup | S2, backups removed, v4 on disk | Exit 1, `result=refused`, `refusal_reason=config-version-blocks-rollback`, `config_version_effective=4`, `config_rollback_safe=false`. **State:** containerd.io **not** downgraded, both services `active`, canary intact, the config file byte-identical. This is 2.27 re-expressed as a preflight — the same guard, on a node nobody has touched |
+| 2.45 | `--config-backup` selects an older loadable backup | S2, newest backup v4, older v3, v4 on disk | Exit 0, `result=ready`, `config_backup_source=flag`, `config_backup_selected` names the older directory, `config_version_effective=3` while `config_version_on_disk=4`. **Paired:** the same node with `--config-backup=newest` refuses, which is what proves the flag did the work |
+| 2.46 | `--config-backup` naming a directory that is not there | S2 | Exit 1, `refusal_reason=config-backup-not-found`, `next_action=supply-flag`, and `config_backup_selected=none` — it must **not** fall back to the newest, which here is the unloadable one. A directory that exists but holds no `config.toml` is refused the same way |
+| 2.47 | Ambiguous selection refuses | S2, two backups | Real run, not a preflight. Exit 1, `refusal_reason=config-backup-ambiguous`, `config_backup_candidates` lists both. Asserted **temporally** — the phase-1 marker count in the rollback log is unchanged, so nothing was stopped — plus `assert_untouched_strict` |
+| 2.48 | Non-interactive rollback completes | S2, one loadable backup | `--non-interactive` without `--status-file` is refused at parse time and writes nothing. With it, `--config-backup=newest` completes: `result=completed`, `pkg_state=installed`, `config_backup_source=flag`, the three rollback packages back at baseline with buildx and compose asserted to be LEFT at target (the rollback bundle carries no plugins), both services `active`, canary intact, and containerd still using the relocated root |
+
+**Mutation-tested**, in `tests/vm/agent-mode-negative-control.sh`:
+
+- **M5** makes phase 0b ignore `--config-backup` and always take the newest, then runs
+  2.45's exact invocation. The mutant selects the v4 backup and refuses a rollback the
+  flag makes safe. The same invocation against the real script reports `ready`, which
+  is the half that proves the mutation is the difference.
+- **M6** raises the guard's threshold so phase 0c can never fire — one mutation, and
+  it covers both halves, because the threshold is what preflight reports *and* what
+  the real run enforces. The mutant preflight reports `ready` for a node whose
+  rollback strands it; following that `ready` into a real run completes the downgrade
+  and leaves containerd refusing to start, with the journal naming the config version.
+
+M6 is the reason 2.44 asserts `result=refused` and the node's state rather than an
+exit code. A rollback that runs to completion and then cannot start containerd also
+exits non-zero — just later, and after the outage.
 
 ### 2.4 — Relocated-root regression, in full
 

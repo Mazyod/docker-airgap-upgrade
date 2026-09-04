@@ -191,9 +191,15 @@ phase 0c would be guarding nothing and should be reconsidered, not kept.
   exercised, and so are the cleanup script's gates. Everything else is untested:
   **worker behaviour of any kind** — a single node is always its own manager, and
   demoting the last manager is refused, so there is no way to make one here —
-  multi-node operation, overlay reconvergence, mixed-version clusters, and the
-  destructive half of `clean-swarm-networks.sh`. That is Tier 3 and needs a real
-  multi-node cluster.
+  multi-node operation, overlay reconvergence, and mixed-version clusters. That is
+  Tier 3 and needs a real multi-node cluster.
+- **The cleanup script's VXLAN deletion loop.** The destructive half of
+  `clean-swarm-networks.sh` IS exercised now, on a real single-node Swarm with an
+  attached overlay network: phase 4 deletes the network namespaces, the libnetwork
+  key-value store and `docker_gwbridge`, and the services come back. But an
+  attachable overlay keeps its VXLAN interface inside the network namespace, so the
+  host-namespace list is empty and that loop never runs. The harness reports it as a
+  visible skip rather than passing quietly.
 - **Real RHEL.** Rocky is a rebuild, not RHEL. Subscription-manager, satellite
   behaviour, and any RHEL-specific packaging differences are out of scope — and the
   satellite SSL problem is the entire reason these scripts use `rpm` over `dnf`.

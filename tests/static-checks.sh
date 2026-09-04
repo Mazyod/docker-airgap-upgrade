@@ -1448,6 +1448,111 @@ else
     bad "could not locate phase 4 in clean-swarm-networks.sh"
 fi
 
+# rollback-docker.sh phase 0c has NO OVERRIDE, and must never grow one.
+#
+# There is no safe way to downgrade into a runtime that cannot start, so the
+# guard is a refusal with no escape hatch. A --force-config, a gate answer, or
+# a "skip the check" branch would each turn the one fail-closed guard in this
+# script into a suggestion. Comments included in the scan on purpose: a comment
+# offering an override is a design decision, not noise.
+r0c=$(grep -n '^CURRENT_PHASE="phase 0c (containerd config version)"' rollback-docker.sh | head -1 | cut -d: -f1)
+# shellcheck disable=SC2016  # a literal grep pattern, not an expansion
+r0c_end=$(grep -n 'if \[ "\$MODE" = "preflight" \]; then' rollback-docker.sh \
+    | awk -F: -v p="${r0c:-0}" '$1 > p {print $1; exit}')
+if [ -n "$r0c" ] && [ -n "$r0c_end" ]; then
+    ovr=$(sed -n "${r0c},${r0c_end}p" rollback-docker.sh \
+        | grep -niE 'force|skip|override|GATE_ANSWERS' || true)
+    if [ -z "$ovr" ]; then
+        ok "rollback-docker.sh phase 0c has no override"
+    else
+        bad "rollback-docker.sh phase 0c contains an override"
+        printf '%s\n' "$ovr" | sed 's/^/       /'
+    fi
+else
+    bad "could not locate phase 0c in rollback-docker.sh (0c@${r0c:-?} end@${r0c_end:-?})"
+fi
+
+# rollback --preflight must be READ-ONLY. Its whole value is that it answers
+# "would a rollback strand this node?" while docker and containerd are still
+# up; a preflight that mutates anything destroys that.
+#
+# Scope: preflight_report plus phases 0, 0b and 0c -- every region a preflight
+# run executes. Comments and plain echo lines are stripped first: phase 0c
+# PRINTS the cp and mv an operator should run, and a grep that reads its own
+# recovery advice as code reports the advice as the crime.
+rp0=$(grep -n '^CURRENT_PHASE="phase 0 (validate payload)"' rollback-docker.sh | head -1 | cut -d: -f1)
+if ! grep -q '^preflight_report() {' rollback-docker.sh; then
+    bad "rollback-docker.sh has no preflight_report to check"
+elif [ -z "$rp0" ] || [ -z "$r0c_end" ]; then
+    bad "could not scope rollback-docker.sh's preflight path (phase0@${rp0:-?} end@${r0c_end:-?})"
+else
+    rpf=$( { awk '/^preflight_report\(\) \{/,/^\}/' rollback-docker.sh
+             sed -n "${rp0},${r0c_end}p" rollback-docker.sh; } \
+        | grep -vE '^[[:space:]]*#' \
+        | grep -vE '^[[:space:]]*echo ([^>]|$)*$')
+    # shellcheck disable=SC2016  # a literal grep pattern, not an expansion
+    rmuts=$(printf '%s\n' "$rpf" | grep -nE 'mkdir|touch[[:space:]]|(^|[^a-z_-])cp[[:space:]]|(^|[^a-z_-])mv[[:space:]]|sed[[:space:]]+-i|(^|[^a-z_-])tee[[:space:]]|systemctl[[:space:]]+(start|stop|restart|enable|disable)|dnf[[:space:]]+(clean|install|remove|upgrade|downgrade)|rpm[[:space:]]+--rebuilddb|(^|[^-])rpm[[:space:]]+-e|(^|[^-])rm[[:space:]]+-|truncate[[:space:]]|chmod[[:space:]]|chown[[:space:]]|(^|[^a-z_-])ln[[:space:]]|containerd[[:space:]]+config[[:space:]]+default' || true)
+    # rpm -Uvh is permitted only with --test, which changes nothing.
+    rrpm=$(printf '%s\n' "$rpf" | grep -E 'rpm -Uvh' | grep -v -- '--test' || true)
+    # Any redirect landing in a FILE. Parameter expansions are blanked first, so
+    # a `>` inside ${x:-<none>} is not read as one.
+    rredir=$(printf '%s\n' "$rpf" | sed 's/\${[^{}]*}/${}/g' \
+        | grep -nE '(^|[^0-9&<>-])>>?[[:space:]]*[^&[:space:]]' \
+        | grep -v '/dev/null' || true)
+    if [ -z "$rmuts" ] && [ -z "$rrpm" ] && [ -z "$rredir" ]; then
+        ok "rollback-docker.sh preflight path contains none of the known mutators"
+    else
+        bad "rollback-docker.sh preflight path contains a mutating command"
+        printf '%s\n%s\n%s\n' "$rmuts" "$rrpm" "$rredir" | grep . | sed 's/^/       /'
+    fi
+fi
+
+# The preflight exit must sit AFTER phase 0c and BEFORE phase 1. Earlier and it
+# skips the config-version guard, which is the check it exists to hoist; later
+# and it has already stopped the services.
+# shellcheck disable=SC2016  # a literal grep pattern, not an expansion
+rpf_exit=$(grep -n 'exit "\$PREFLIGHT_RC"' rollback-docker.sh | head -1 | cut -d: -f1)
+rp1=$(grep -n '^CURRENT_PHASE="phase 1 (stop services)"' rollback-docker.sh | head -1 | cut -d: -f1)
+if [ -n "$rpf_exit" ] && [ -n "$r0c" ] && [ -n "$rp1" ] &&
+   [ "$r0c" -lt "$rpf_exit" ] && [ "$rpf_exit" -lt "$rp1" ]; then
+    ok "rollback-docker.sh preflight exits after phase 0c, before phase 1"
+else
+    bad "rollback-docker.sh preflight exit misplaced (0c@${r0c:-?} exit@${rpf_exit:-?} p1@${rp1:-?})"
+fi
+
+# Phase 0c must judge the SAME file phase 3 restores. They are different files
+# -- the selected backup when one will be restored, the on-disk config
+# otherwise -- and a guard that inspected one while phase 3 restored the other
+# would wave through exactly the config it exists to catch. So require both to
+# branch on the identical condition, and require phase 3 to consume the
+# selection rather than re-globbing for it.
+# shellcheck disable=SC2016  # a literal grep pattern, not an expansion
+SEL_COND='if [ -n "$BACKUP_DIR" ] && [ -f "$BACKUP_DIR/config.toml" ]; then'
+rp3=$(grep -n '^CURRENT_PHASE="phase 3 (containerd config)"' rollback-docker.sh | head -1 | cut -d: -f1)
+rp4=$(grep -n '^CURRENT_PHASE="phase 4 (restart services)"' rollback-docker.sh | head -1 | cut -d: -f1)
+if [ -n "$r0c" ] && [ -n "$r0c_end" ] && [ -n "$rp3" ] && [ -n "$rp4" ]; then
+    # ANCHORED to the statement each condition guards, not merely present.
+    # Phase 0c holds a SECOND copy of the same condition in its recovery-advice
+    # branch, so a bare occurrence test stays green with the real
+    # effective-config selection deleted.
+    # shellcheck disable=SC2016  # literal grep patterns, not expansions
+    c_0c=$(sed -n "${r0c},${r0c_end}p" rollback-docker.sh | grep -A1 -F "$SEL_COND" \
+        | grep -cF 'EFFECTIVE_CONF="$BACKUP_DIR/config.toml"' || true)
+    # shellcheck disable=SC2016  # literal grep patterns, not expansions
+    c_p3=$(sed -n "${rp3},${rp4}p" rollback-docker.sh | grep -A8 -F "$SEL_COND" \
+        | grep -cF 'cp "$BACKUP_DIR/config.toml" /etc/containerd/config.toml' || true)
+    p3_glob=$(sed -n "${rp3},${rp4}p" rollback-docker.sh | grep -vE '^[[:space:]]*#' \
+        | grep -n 'docker-backup-' || true)
+    if [ "${c_0c:-0}" -ge 1 ] && [ "${c_p3:-0}" -ge 1 ] && [ -z "$p3_glob" ]; then
+        ok "rollback-docker.sh phase 0c judges the same config phase 3 restores"
+    else
+        bad "rollback-docker.sh phase 0c and phase 3 can disagree (0c=$c_0c p3=$c_p3)"
+        printf '%s\n' "$p3_glob" | grep . | sed 's/^/       phase 3 re-globs: /'
+    fi
+else
+    bad "could not scope rollback-docker.sh phases 0c and 3"
+fi
+
 # Phase 6 must still ENFORCE what preflight predicts, through the same helpers,
 # so the two cannot answer differently. Preflight predicts; phase 6 enforces.
 p6=$(grep -n '^CURRENT_PHASE="phase 6 (containerd config)"' upgrade-docker.sh | head -1 | cut -d: -f1)

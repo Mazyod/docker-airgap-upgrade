@@ -1078,10 +1078,22 @@ done
 # recover-dnf.sh is in this loop and in no other 1.14 check. It has a parser
 # and a usage text, so this drift is possible there; it has no status file, no
 # gates, no traps and no root check, so nothing else in this section applies.
+# One extractor, used by both this check and the runbook-parity check below.
+# They MUST agree: a flag one of them cannot see is a flag neither reports.
+#
+# Digits and surrounding quotes of either kind are accepted, because `--retry2)`,
+# `"--diagnose")` and `'"'"'--diagnose'"'"')` are all valid case arms that a narrower
+# pattern silently skipped -- an undocumented flag added in any of those
+# shapes left both checks green. Brace-expanded and variable arms remain
+# invisible; do not write one.
+parser_flags() {
+    awk '/^while \[ "\$#" -gt 0 \]; do/,/^done$/' "$1" \
+        | grep -oE "^[[:space:]]*[\"']?-[a-z0-9|=*\"'-]+\)" | tr -d " )\"'" | tr '|' '\n' \
+        | sed 's/=\*$//' | grep -E '^-' | LC_ALL=C sort -u
+}
+
 for s in upgrade-docker.sh rollback-docker.sh clean-swarm-networks.sh recover-dnf.sh; do
-    parsed=$(awk '/^while \[ "\$#" -gt 0 \]; do/,/^done$/' "$s" \
-        | grep -oE '^[[:space:]]*-[a-z|=*-]+\)' | tr -d ' )' | tr '|' '\n' \
-        | sed 's/=\*$//' | grep -E '^-' | LC_ALL=C sort -u)
+    parsed=$(parser_flags "$s")
     documented=$(awk '/^usage\(\) \{/,/^\}/' "$s" \
         | grep -oE '^  -[a-z, -]*[a-z]' | tr ',' '\n' | tr -d ' ' \
         | grep -E '^-' | LC_ALL=C sort -u)
@@ -1094,6 +1106,60 @@ for s in upgrade-docker.sh rollback-docker.sh clean-swarm-networks.sh recover-dn
         [ -n "$unparsed" ] && bad "$s documents flags it does not accept: $(printf '%s' "$unparsed" | tr '\n' ' ')"
     fi
 done
+
+# Every flag every parser accepts must have a row in docs/AGENT-RUNBOOK.md's
+# flag block for that script, and every flag those blocks list must be
+# accepted. The usage check above closes the parser/help-text gap; this closes
+# the parser/runbook one, which is the gap an AGENT falls into -- it is told to
+# read the runbook and not the scripts, so a flag that exists and is
+# undocumented there is a flag it will never use, and a flag documented there
+# and not accepted is a usage error it will hit on a production node.
+#
+# Rows are read from marked blocks rather than from the prose, for the same
+# reason the status keys are: the document quotes docker CLI flags, and a
+# whole-file grep would report --format and --availability as undocumented.
+#
+# The limit, stated so nobody mistakes this for more than it is: it is a PARITY
+# check, not an API-stability one. Deleting a non-gate flag from the parser, the
+# usage text and the marker block in one change leaves all three sets equal and
+# stays green. That is deliberate -- removing a flag is a decision, and this
+# check exists to catch the accident of changing one side only. Gate flags get
+# the stronger treatment: the gate/flag/predictor parity below fails if a gate
+# loses either polarity.
+doc_flags_for() {
+    awk -v want="$1" '
+        $0 ~ "<!-- flags: " want " -->" { on = 1; next }
+        /<!-- \/flags -->/              { on = 0 }
+        # FIRST backticked token of the row only. The second column names other
+        # flags -- "pair it with `--expect-inventory-sha`" -- and taking every
+        # one would credit a flag to whichever script happened to mention it.
+        on && /^\| `-[a-z-]+` \|/ {
+            if (match($0, /`-[a-z-]+`/))
+                print substr($0, RSTART + 1, RLENGTH - 2)
+        }
+    ' docs/AGENT-RUNBOOK.md | LC_ALL=C sort -u
+}
+
+if [ ! -f docs/AGENT-RUNBOOK.md ]; then
+    bad "docs/AGENT-RUNBOOK.md is missing; cannot check flag coverage"
+else
+    for s in upgrade-docker.sh rollback-docker.sh clean-swarm-networks.sh recover-dnf.sh; do
+        parsed=$(parser_flags "$s")
+        documented=$(doc_flags_for "$s")
+        if [ -z "$documented" ]; then
+            bad "AGENT-RUNBOOK.md has no flag block for $s"
+            continue
+        fi
+        undoc=$(comm -23 <(printf '%s\n' "$parsed") <(printf '%s\n' "$documented") | grep . || true)
+        unparsed=$(comm -13 <(printf '%s\n' "$parsed") <(printf '%s\n' "$documented") | grep . || true)
+        if [ -z "$undoc" ] && [ -z "$unparsed" ]; then
+            ok "$s flags all have AGENT-RUNBOOK.md rows ($(printf '%s\n' "$parsed" | grep -c .) flags)"
+        else
+            [ -n "$undoc" ] && bad "$s accepts flags with no runbook row: $(printf '%s' "$undoc" | tr '\n' ' ')"
+            [ -n "$unparsed" ] && bad "AGENT-RUNBOOK.md documents $s flags it does not accept: $(printf '%s' "$unparsed" | tr '\n' ' ')"
+        fi
+    done
+fi
 
 # --preflight must be READ-ONLY. Its whole value is that it converts an abort
 # past the point of no return into a refusal on a healthy node, and a preflight

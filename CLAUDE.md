@@ -24,7 +24,9 @@ All six scripts are currently `bash -n` clean and `shellcheck` clean. Keep them 
 ```bash
 tests/vm/bootstrap-vm.sh      # build the S1 baseline
 tests/vm/build-bundle.sh      # real download-docker-packages.sh run
+tests/vm/preflight-host.sh    # host/guest fitness, incl. the restart-and-remount proof
 tests/vm/tier2-run.sh         # Tier 2 cases: reject / upgrade / rollback
+tests/vm/tier2-run.sh agent   # the agent-mode cases; NOT part of the default phases
 tests/vm/config-version-check.sh  # containerd config v3/v4 boundary + the rollback guard
 tests/vm/negative-control.sh  # prove test 2.4 catches the regression
 tests/vm/agent-mode-negative-control.sh  # prove the agent-mode guard tests can fail
@@ -211,6 +213,7 @@ Package versions (`29.8.0`, `2.3.4`, `0.37.0`, `5.5.1`, rollback `29.1.5`/`2.2.1
 - `README.md` — the version table, the release-date table, and the verification section
 - `RUNBOOK.md` — the target/from header
 - `docs/TEST-PLAN.md` — the version references in the Tier 2 table
+- **`docs/AGENT-RUNBOOK.md` is deliberately NOT on this list.** Static check 1.14 fails if it contains any `x.y.z` literal at all, so it refers to versions as "what this run reported" and points an agent at `docker_ce_expected` / `containerd_io_release_expected` in the status file. A retarget cannot leave it stale, because there is nothing in it to go stale
 
 The two upgrade/rollback scripts now hold their versions in named constants at the top rather than scattered through the body — change the constant, not the occurrences.
 
@@ -247,6 +250,10 @@ metadata, never filenames.
 keys, so **the key names are a contract**: adding one is a minor change, removing or
 repurposing one is not. `tests/static-checks.sh` section 1.14 fails if the keys a script emits
 and the keys `docs/AGENT-RUNBOOK.md` documents disagree in either direction.
+
+**The check compares key NAMES, not value domains.** A new value for an existing key — the
+cleanup's `mode=dry-run` was one — passes Tier 1 silently while the runbook's value column goes
+stale. Widen the column in the same commit that widens the domain; nothing will catch you.
 
 Four properties of the writer are load-bearing and each has a specific failure mode:
 
@@ -337,6 +344,62 @@ one list that silently omitted them would be worse than advertising none.
 `--non-interactive`. A pre-declared answer wins in both modes, so the flag alone would skip the
 post-enumeration confirmation with nothing having seen the inventory — the exact bypass the
 enumerate-after-the-stop ordering exists to prevent.
+
+### The exit-code taxonomy
+
+Nothing here may change without a deliberate decision: an agent branches on these, and so do
+the Tier 2 cases.
+
+| Exit | When | Notes |
+|---|---|---|
+| 0 | the run completed — **or** a decline that changed nothing | the reason exit 0 is ambiguous, and the reason `result` exists. See the decline list below |
+| 1 | most refusals, and the controlled failures | **not** every failure: an unexpected command failure under `set -e` propagates its own status. Exit 1 conflates a safe refusal with a failure after the node was modified; `result`, `refusal_reason` and `pkg_state` separate them |
+| 2 | `clean-swarm-networks.sh` only: cleanup ran, some items could not be removed | pre-dates agent mode. `derive_result` maps it to `completed` and `derive_next_action` to `investigate`. Not success |
+| 3 | **`--non-interactive` or `--preflight` only**: already fully at the target | `result=nothing-to-do`, node untouched. `rollback-docker.sh` has no exit 3 — it has no at-target classification, and inventing one would change its interactive path |
+| 130 / 143 | interrupt, through the INT/TERM traps | recorded as `result=interrupted` |
+
+**`result=refused` with `exit_code=0` is a normal, reachable combination**, and any change that
+makes it unreachable is a breaking change. `derive_result` sets `refused` whenever
+`REFUSAL_REASON` is non-empty, *before* it looks at the status, and these declines all exit 0
+because none of them changes package or network state: `allow-unverified-baseline` in the
+upgrade, `config-backup-declined` in the rollback, and all four cleanup gates
+(`non-swarm-declined`, `drain-unconfirmed`, `stop-declined`, `delete-declined`). `delete-declined`
+is the one that is not free — it is reached after the stop, so its exit 0 follows a
+stop-and-restart cycle. This is the strongest single reason
+the interface tells callers to branch on `result` and never on `$?`.
+
+`rerun-at-target` is the exception in the other direction: its decline sets `RESULT` directly
+and no `REFUSAL_REASON`, so it records `nothing-to-do`, not `refused`. Declining it is not a
+refusal — there was nothing to do — which is why it is the one gate whose unanswered state
+resolves to an exit code rather than to a refusal.
+
+Exit 3 exists **only** in the two new modes. Interactively every code is byte-for-byte what it
+was, which is what keeps `tests/vm/tier2-run.sh`'s interactive-path regression gate meaningful:
+that suite runs the modified scripts with no flags at all and must not move.
+
+### Adding a gate, or any new prompt
+
+A new question is not a prompt any more. It is five things, and section 1.14 enforces the first
+four — the fifth is on you:
+
+1. **A `gate NAME "question" default` call**, in an `if` or `if !` condition. Never a bare call:
+   `gate` returns 1 for no, and `set -e` turns that into an abort.
+2. **`--NAME` and `--no-NAME` parser arms**, spelled out literally, each routing through
+   `set_gate`. Generated arms would accept `--no-anything` and record an answer for a gate that
+   does not exist.
+3. **An entry in that script's `predict_gates`**, in the `req=` or `cond=` assignment — not
+   merely a mention. Add a gate and forget the predictor and preflight reports a clean bill
+   while the real run refuses.
+4. **A row in `docs/AGENT-RUNBOOK.md`**: in the gate table, and in that script's `<!-- flags:
+   ... -->` block for both polarities. The runbook is what an agent reads instead of the
+   scripts, so an undocumented flag is a flag nobody will use.
+5. **A Tier 2 case** that answers it both ways and asserts node state, plus a mutant in
+   `tests/vm/agent-mode-negative-control.sh` if the gate guards anything destructive. A guard
+   test that asserts only an exit code is decoration: the failure mode the guard prevents also
+   exits non-zero, just later and after the damage.
+
+The same rule in reverse: a **status key** may be added freely, but removing or repurposing one
+is a breaking change, and either direction needs its runbook row moved in the same commit.
 
 ### The cleanup dry run and `--expect-inventory-sha`
 

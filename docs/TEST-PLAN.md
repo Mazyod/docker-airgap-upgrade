@@ -7,18 +7,21 @@
 
 | Tier | Status | Evidence |
 |---|---|---|
-| Tier 1 static | **PASSED 226/226** offline | `tests/static-checks.sh`; the 16 RPM URL checks are the one skip and need `--online` |
-| Tier 2 VM | **PASSED 67/67** | `tests/vm/tier2-run.sh` (the `all` phases) — the interactive-path regression gate |
-| Tier 2 agent mode | **PASSED 697/697, 2 skipped** | `tests/vm/tier2-run.sh agent` — cases 2.29 through 2.48. One skip is the worker predictor state, which needs a second node; the other is phase 4's VXLAN loop, which an attachable overlay does not exercise from the host namespace |
+| Tier 1 static | **PASSED 231/231** offline, **247/247** with `--online` | `tests/static-checks.sh`; the 16 RPM URL checks are the one skip offline |
+| Tier 2 VM | **PASSED 67/67** | `tests/vm/tier2-run.sh` (the `all` phases) — the interactive-path regression gate. This is an **assertion** count for the automated cases, not a count of the Tier 2 table below: 2.1, 2.2, 2.13, 2.15 and 2.17 through 2.22 are specified and not automated |
+| Tier 2 agent mode | **PASSED 697, 0 failed, 2 skipped** | `tests/vm/tier2-run.sh agent` — cases 2.29 through 2.48. One skip is the worker predictor state, which needs a second node; the other is phase 4's VXLAN loop, which an attachable overlay does not exercise from the host namespace |
 | Tier 2 config-version boundary | **PASSED 30/30** | `tests/vm/config-version-check.sh` — cases 2.23–2.28 |
 | Tier 2 negative control | **PASSED 3/3** | `tests/vm/negative-control.sh` — mutant loses the relocated root |
-| Tier 2 agent negative control | **PASSED 24/24, 8 mutants** | `tests/vm/agent-mode-negative-control.sh` — M1a, M1b, M2, M3, M4a, M4b, M5 and M6 each reproduce the hazard their paired case exists to catch |
+| Tier 2 agent negative control | **PASSED 24, 0 failed, 8 mutants** | `tests/vm/agent-mode-negative-control.sh` — M1a, M1b, M2, M3, M4a, M4b, M5 and M6 each reproduce the hazard their paired case exists to catch |
 | Tier 1b stubbed | not built | optional; Tier 2 covers most of its intent |
 | Tier 3 Swarm | **NOT RUN** | needs a real multi-node cluster |
 
 Every Tier 2 figure above was produced in one campaign against a bundle rebuilt from
-the checkout under test, on Rocky Linux 9 through the Docker backend, with the
-baseline reset between suites. The agent-mode figure covers the cleanup dry run and
+the checkout under test, on a Rocky Linux 9 guest recreated from scratch through the
+Docker backend, with the baseline reset between suites. `preflight-host.sh` passed
+8/8 on that fresh guest before any case ran. The bundle was 334 MB, sha256
+`a00715919c1dbd8059e75aaf8958a7daf8eca1d637066bb41530465c2a91a507`, carrying
+`containerd.io-2.3.4-2.el8` and `containerd.io-2.3.4-2.el9`. The agent-mode figure covers the cleanup dry run and
 the rollback preflight added in the last two slices; it was 486 before them.
 
 The `agent` phase is **not part of `all`** — it runs only as `tests/vm/tier2-run.sh
@@ -48,7 +51,7 @@ both exit non-zero.
 
 | # | Test | From | Pass criteria |
 |---|---|---|---|
-| 2.6a ✅ | **Payload gate.** Bundle carries `containerd.io-2.3.4-1` | S1, `rhel9/` containerd RPM swapped for the `-1` build | `upgrade-docker.sh` exits non-zero **in phase 0**, naming the containerd release and the runc difference; **and** `rpm -q containerd.io` still reports the S1 baseline `2.2.1-1.el9`; **and** `docker`, `docker.socket` and `containerd` are all still `active`; **and** the canary data under the relocated root is intact. **Automated in `tier2-run.sh`, 11 assertions, passing.** |
+| 2.6a ✅ | **Payload gate.** Bundle carries `containerd.io-2.3.4-1` | S1, `rhel9/` containerd RPM swapped for the `-1` build | `upgrade-docker.sh` exits non-zero **in phase 0**, naming the containerd release and the runc difference; **and** `rpm -q containerd.io` still reports the S1 baseline `2.2.1-1.el9`; **and** `docker`, `docker.socket` and `containerd` are all still `active`; **and** the canary data under the relocated root is intact. **Automated in `tier2-run.sh`, 10 assertions, passing.** |
 | 2.6b ✅ | **Already-at-target gate.** Node is on every target version but the wrong containerd build | S1 upgraded to the target, then `containerd.io` alone downgraded to the real upstream `-1` build with `rpm -Uvh --oldpackage` | The script must **not** report "already fully at the target" and exit 0. It takes the partial-upgrade branch, runs the transaction, and phase 9 reports `containerd.io release 2.el9`; **and** `rpm -q containerd.io` reports `2.3.4-2.el9` and `runc --version` is 1.5.1 afterwards; **and** docker and containerd are active with the canary data intact. **Automated in `tier2-run.sh`, 11 assertions, passing.** |
 
 The `-1` build is a real upstream RPM, downloaded in the guest with `dnf download`,
@@ -68,8 +71,8 @@ originally proposed. Same starting state, and no mutant of the script under test
 ever run — which matters, because a case that requires disabling the guard to set
 itself up cannot then be trusted to prove the guard works.
 
-**Mutation still owed against 2.6b.** The case itself now runs and passes in the
-`all` phase; what has not been run is this mutation of it: delete the release test
+**Mutation executed against 2.6b**, at `093a927`; the captured output is further
+down this document. The mutation is: delete the release test
 from the already-at-target gate in
 `upgrade-docker.sh` — the `containerd_release_matches "$CURRENT_CONTAINERD_REL"`
 conjunct — and confirm 2.6b turns red. The node should then be declared already at
@@ -197,13 +200,27 @@ does not prove.
   `systemctl`, `docker`, `ctr` stubbed on `PATH`. Runs the **real scripts** and
   exercises their failure branches deterministically. Does not prove real RPM or
   systemd behaviour.
-- **Tier 2 — RHEL VM.** Real packages, real systemd. Minimum bar for rollout.
-- **Tier 3 — production-like Swarm.** Drain/reactivate, overlay reconvergence,
-  mixed-version operation, rollback in a live cluster.
+- **Tier 2 — RHEL-like node.** Real packages, real systemd, real rpm transactions.
+  Minimum bar for rollout. **As executed it is Rocky Linux 9 through the Docker
+  backend, not RHEL and not a machine** — see `tests/vm/README.md`. Rocky is a
+  rebuild, so subscription-manager and satellite behaviour are out of scope, and
+  the satellite SSL problem is the entire reason these scripts use `rpm` over
+  `dnf`. The container backend has no reboot semantics, no kernel command line and
+  no real block devices, and shares the host's kernel.
+- **Tier 3 — production-like Swarm, on real hardware.** Drain/reactivate, worker
+  behaviour of any kind, overlay reconvergence, mixed-version operation, rollback
+  in a live cluster — and everything Tier 2 structurally cannot reach: real RHEL,
+  GPU nodes, and bare metal.
 
 Tier 1 executes no upgrade logic. Tier 1b executes the orchestration but not the
 system calls underneath it. **Neither authorizes a rollout; Tier 2 on the matching
 RHEL major is the minimum, and Tier 3 gates the node-by-node claim.**
+
+**The Tier 3 boundary, stated once so the three documents agree.** Untested
+everywhere: multi-node Swarm, **worker** behaviour of any kind, overlay
+reconvergence, mixed-version clusters, real RHEL, GPU, bare metal, and the
+cleanup script's VXLAN deletion loop. `README.md` and `tests/vm/README.md` state
+the same list; if they ever diverge, this is the one to believe.
 
 ---
 
@@ -269,7 +286,7 @@ cheap, and none of it requires RHEL.
 
 ---
 
-## Tier 2 — RHEL VM
+## Tier 2 — RHEL-like node (executed on Rocky 9)
 
 Run on **both** RHEL 8 and RHEL 9.
 
@@ -300,9 +317,9 @@ in place. Clear `/var/log/docker-*.log` before any canonical run.
 | 2.12 | Missing plugins — core RPMs only | S1 | Fails in phase 0; installed plugins are not silently left stale |
 | 2.6a | Wrong containerd **build** — the real upstream `containerd.io-2.3.4-1`, whose `%{VERSION}` is identical to `-2` | S1 | Fails in phase 0 on the RPM **release**, naming the runc difference; node untouched, including `containerd.io` still `2.2.1-1.el9` exactly |
 | 2.13 | Transaction rejection — a complete, correct set that `rpm --test` refuses (e.g. an installed package requiring the newer containerd) | S1 | Fails at the dry run, distinct from the inventory gate |
-| 2.14 | Idempotent re-run | S2 | Detects already-at-target and asks whether to re-run. The harness runs it with **stdin closed**, so the prompt takes the EOF refusal and the run exits **1** with the node untouched — the assertion is on the already-at-target message, not on the status. Exit 0 on a typed "no" is case **2.29j**, which answers on a real stream; the clean machine-readable form is case **2.35**, `--non-interactive` exiting **3** with `result=nothing-to-do` |
+| 2.14 | Idempotent re-run | S2 | The harness asserts one thing: that the run prints the already-at-target message. It runs with **stdin closed**, so the prompt takes the EOF refusal and the process exits 1 — neither the status nor the node state is captured here. The earlier spec said "exits 0 on no", which was wrong in both directions. Exit 0 on a typed "no", with the state asserted, is case **2.29j**; the machine-readable form is case **2.35**, `--non-interactive` exiting **3** with `result=nothing-to-do` |
 | 2.15 | Partial state | S2 clone, containerd.io downgraded to 2.2.1 | Reports partial, proceeds, completes |
-| 2.16 | Rollback | clean S2 | Exits 0; all three asserts show 29.1.5/2.2.1; **same container IDs, image accessible, volume data intact, app responds, config unchanged** |
+| 2.16 | Rollback | clean S2 | Automated with five assertions: the rollback completes, `docker-ce` and `containerd.io` are back at the rollback versions, docker is running, and the canary volume data on the relocated root is intact. Container-ID identity, image accessibility, application response and config identity are **specified and not automated** — check them by hand when it matters |
 | 2.17 | Rollback resumability | S2 clone with containerd.io already at 2.2.1 | `--replacepkgs` lets the rerun succeed rather than "already installed" |
 | 2.18 | Rollback payload gate | S2 clone, `docker-ce-cli` removed from rollback dir | Fails in phase 0 before stopping services |
 | 2.19 | Interrupted transaction | S1 clone, **discard afterwards** | Trap reports package state as UNKNOWN and does not claim packages are unchanged. Do the stubbed version (1b.13) first; killing a real rpm transaction risks the rpmdb |
@@ -366,6 +383,73 @@ FAIL D8  refusal did not identify the backup as the offending config
 D7 passing there is the whole point: the mutant's non-zero exit comes from the
 rollback completing and *then* failing to start containerd. Any guard test that
 checks only an exit code is measuring the outage it was meant to prevent.
+
+### 2.29–2.38 — agent mode: the run record, `--preflight`, and the gates ⚑
+
+New with `--status-file`, `--non-interactive`, `--preflight`, `gate()` and the gate
+flags. Automated in `tests/vm/tier2-run.sh agent`, which is **destructive**: it upgrades
+the node, builds a real single-node Swarm with `docker swarm init`, and resets the
+baseline. The `agent` phase is not part of `all` and carries its own figure.
+
+**The interactive path is the regression gate.** `tests/vm/tier2-run.sh` with its default
+phases runs the same modified scripts with **no flags at all**, and its count must not
+move. A change to agent mode that shifts it is a change to the interactive path,
+whatever it was meant to be.
+
+**The Swarm fixture is asserted before the gate cases run.** Without it the drain,
+task-count and reactivation gates are never reached and every case below would pass
+vacuously.
+
+| # | Test | From | Pass criteria |
+|---|---|---|---|
+| 2.29a | Zero arguments behave exactly as before | S1 | The unflagged run still completes; packages at the target profile, containerd config unchanged, canary intact |
+| 2.29b | The record of a successful run | S1 | `result=completed`, `exit_code=0`, `pkg_state=installed`, `services_stopped=false`, `next_action=none`, `mode=interactive`, `log_started=true`, `containerd_root` is the relocated path |
+| 2.29c | The record of a phase-0 refusal | S1, corrupted payload | `result=refused`, `pkg_state=untouched`, `services_stopped=false`, record terminated, plus `assert_untouched_strict` at the baseline profile. The `refusal_reason=payload-invalid` mapping is asserted seven times over in 2.30b rather than here |
+| 2.29d | A non-root invocation | S1 | Refused with `refusal_reason=not-root`, `next_action=rerun-as-root`, `log_started=false` — and it **does** write a record |
+| 2.29e | A usage error writes **nothing** | S1 | Exit 1, no status file at the path, so a reused path still holds the previous run's record |
+| 2.29f | `run_id` differs between runs | S1 | Two runs at the same path produce two different `run_id` values, which is what makes the "check `run_id` before trusting a reused path" rule usable. The terminator is asserted on the surviving record; the first is overwritten by the second, which is the behaviour being demonstrated |
+| 2.29g | Every documented key is present | S1 | Not merely the terminator: each key the runbook documents appears in the record |
+| 2.29h | An unwritable status path refuses first | S1 | Exit 1 before anything is stopped or installed; the check is the startup write itself |
+| 2.29i | Rollback and cleanup write records too | S1 | Driven through the non-root refusal, the one path both share: each record names its own `script`, carries `refusal_reason=not-root` and `result=refused`, and terminates. Both nodes pass `assert_untouched_strict`, and the cleanup additionally leaves the seeded namespace object in place. It is a per-key check, not a schema validation |
+| 2.29j | An at-target decline is not a completed upgrade | S2 | Answered "no" on a **real** stream, not a closed one: exit 0, `result=nothing-to-do`, `pkg_state=untouched`, and explicitly **not** `completed` |
+| 2.30a | `--preflight` on a healthy node | S1 | Exit 0, `result=ready`; phase 4 never ran and no backup directory was created |
+| 2.30b | `--preflight` refuses the phase-0 corruptions | S1 variants | Seven corruptions — wrong bundle, duplicates, corrupt RPM, wrong release, empty directory, stale plugins, missing plugins — each giving exit 1, `result=refused`, `refusal_reason=payload-invalid`, `next_action=rebuild-bundle` and `assert_untouched_strict`. The containerd release-suffix case is 2.6a and the `rpm --test` rejection is 2.13; neither is in this loop |
+| 2.30b2 | A bare `--preflight` writes no status file | S1 | It must not invent a default path |
+| 2.30c | **The hoist.** A relocated root that does not exist | S1, `config.toml` repointed at an absent path | Preflight refuses with `relocated-root-missing` and `next_action=fix-mount`, on a node with every service running — and does **not** create the missing directory. The harness repoints the config rather than unmounting the filesystem: on a production node the usual cause is an unmounted filesystem, and the guard reads the same way either way |
+| 2.30d | `--preflight` on an already-upgraded node | S2 | Exit 3, `result=nothing-to-do`, and no failure report printed |
+| 2.30d2 | At target **and** a missing relocated root | S2, `config.toml` repointed at an absent path | Still exit 3, `result=nothing-to-do`: the at-target classification wins over the relocated-root refusal. Asserted on exit, `result`, `refusal_reason` and the root not having been created — not a full state assertion, because the case deliberately modified the config and restores it afterwards |
+| 2.30e | `--preflight` is read-only with a v4 config on disk | S2 + v4 config | A rollback-unsafe config is **reported**, not refused — the upgrade is not blocked by it |
+| 2.30f | An absent config is `unknown`, never rollback-safe | S2, config removed | Preflight does not refuse and does **not** generate a config |
+| 2.31 | An unanswered gate fails closed | S1 + Swarm fixture | Exit 1, `result=refused`, `refusal_reason=gate-unanswered:drain-self`, `next_action=supply-flag`, `pkg_state=untouched`; the message names both `--drain-self` and `--no-drain-self` |
+| 2.32 | `--non-interactive` never reads stdin | S1 + fixture | The same invocation with a live `yes y` stream still refuses: exit 1, `drain_performed=false`, node untouched. This is the case that proves the prompt helper is **not reached** rather than auto-answered |
+| 2.33 | `--non-interactive` without `--status-file` | S1 | Refused at parse time, naming the missing flag, and **no** status file appears |
+| 2.33a | Contradictory flags are refused, not ordered | S1 | `--drain-self --no-drain-self` exits 1 naming the contradiction |
+| 2.34 | A full non-interactive upgrade, end to end | S1 + fixture | `result=completed`, `mode=non-interactive`, `pkg_state=installed`, `swarm_role=manager`, `node_availability_before=active`, `node_availability_after=active`, `drain_performed=true`, and the node really is back `active` |
+| 2.35 | Already at target under `--non-interactive` | S2 | Exit **3**, `result=nothing-to-do`, `node_class=at-target`, `pkg_state=untouched`, empty `refusal_reason`, `gates_required` names `rerun-at-target`. Asserted **temporally** — the phase-4 marker count is unchanged, so nothing was stopped |
+| 2.36a–j | The gate predictor, one node state at a time | S1/S2 + fixture | Ten states — active manager with `--drain-self`, with `--no-drain-self`, with neither; already-drained manager with and without the drain flag; paused manager; non-Swarm host; at-target with and without `--rerun-at-target` — each asserting the exact `gates_required` and `gates_conditional`. The **worker** state is the one skip: a single node is always its own manager |
+| 2.37 | A conditional gate is reported, not refused | S1 + fixture | `--preflight --non-interactive --drain-self --reactivate` with `proceed-with-tasks` unanswered exits **0**: `result=ready`, `next_action=proceed`, `gates_conditional=proceed-with-tasks`, `gates_unanswered=proceed-with-tasks`, `gates_answered=drain-self:y,reactivate:y` |
+| 2.38 | `--confirm-delete` alone is refused under `--non-interactive` | S1 + Swarm fixture | Exit 1, `refusal_reason=inventory-sha-required`, `next_action=rerun-dry-run`, `deleted=false`. Asserted **temporally** — the phase-2 marker count is unchanged, so services were never stopped — and the seeded namespace object survives. The **interactive** half of "in every mode" is case 2.41, which runs the same refusal with a live `yes y` stream |
+| 2.38a | An unanswered cleanup gate refuses before anything stops | S1 + fixture | Exit 1 even with a `yes y` stream attached; `refusal_reason=gate-unanswered:allow-non-swarm`, `deleted=false`, phase 2 never ran, the seeded object survives |
+| 2.38b | Every cleanup gate answered runs unattended | S1 + fixture | Exit 0 with all four gates answered by flag, the last one `--no-confirm-delete`: `gates_answered=allow-non-swarm:y,assume-drained:y,confirm-stop:y,confirm-delete:n`, `refusal_reason=delete-declined`, `deleted=false`. It really did stop services and bring them back — the phase-2 marker count moved — and `services_stopped=false` afterwards because the run restored them |
+
+**Mutation-tested**, in `tests/vm/agent-mode-negative-control.sh`:
+
+- **M1a** moves the status write after `on_exit`'s `rc == 0` short-circuit. The mutant's
+  successful run reports `result=running` for ever, which is what case 2.29b's
+  `result=completed` assertion catches.
+- **M1b** removes the `STATUS_OK` accumulator and makes one key's write fail. The mutant
+  publishes a **truncated** record that still ends `status_complete=1` — a last-line check
+  alone would pass it, which is why the writer requires both.
+- **M2** deletes the hoisted relocated-root check from `preflight_report`. The mutant
+  reports `ready` on a node the real run refuses, and the control follows that answer
+  through to the upgrade to show what believing it costs: the node ends with packages
+  replaced and services down.
+- **M3** makes `gate()` fall through to `prompt_yes_no` under `--non-interactive`, run
+  with a live `yes y` stream. The mutant drains and upgrades the node, which is exactly
+  what case 2.32 asserts cannot happen.
+- **M4a**, **M4b** are described with cases 2.40 and 2.41 below.
+- **M5** makes rollback phase 0b ignore `--config-backup`; **M6** neuters phase 0c's guard
+  and reaches it through `--preflight`. Both are described with cases 2.44–2.45.
 
 ### 2.39–2.42 — the cleanup dry run and the inventory hash ⚑
 
@@ -533,8 +617,10 @@ first, observe under real traffic for an agreed period, then proceed.
 `recover-dnf.sh` still has **no dynamic test**. It is production recovery code that
 stops services, changes packages, uses a bare readiness sleep (no `ctr` polling), has
 no failure trap, and assumes a `docker-local` repo that does not exist on air-gapped
-hosts. Only one defect was fixed (v1.2.2: a bare `read` under `set -e` killed the
-script with no message on EOF, after `dnf clean all` and `rpm --rebuilddb` had already
-run). Treat it as unverified: do not run it on a production node without first
-exercising it in a VM. Bringing it to the standard of the other scripts is follow-up
+hosts. Two changes have been made to it and neither is dynamically tested: v1.2.2 fixed
+a bare `read` under `set -e` that killed the script with no message on EOF, after
+`dnf clean all` and `rpm --rebuilddb` had already run; v1.3.0 added
+`--run-option-a` / `--no-run-option-a`, `--help` and `--version`, checked only by the
+Tier 1 usage-and-runbook parity checks. Treat it as unverified: do not run it on a
+production node without first exercising it in a VM. Bringing it to the standard of the other scripts is follow-up
 work, deliberately out of scope here.

@@ -25,7 +25,14 @@ phase 0c detects this and stops before touching anything. Don't run that command
 
 > **Driving this from an agent rather than by hand?** `docs/AGENT-RUNBOOK.md` is the
 > operating guide: the gate flags, `--preflight`, the `--status-file` record and the
-> decision table, in one document. This file stays the human procedure and the timings.
+> decision table, in one document. Its first five sections are the whole **upgrade**
+> procedure; the rollback and the cleanup have their own sections. This file stays the
+> human procedure and the timings.
+>
+> **Found a `key=value` file on a node and wondering what it is?** That is an agent
+> run record, written by `--status-file`. Its last line is `status_complete=1`; without
+> that line the record is incomplete and means nothing. `result`, `refusal_reason` and
+> `pkg_state` say what happened, and `docs/AGENT-RUNBOOK.md` has the full key reference.
 
 ---
 

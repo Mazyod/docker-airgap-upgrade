@@ -121,10 +121,13 @@ tests/vm/build-bundle.sh      # run the real download script inside the VM (~333
 tests/vm/tier2-run.sh         # execute the Tier 2 cases
 tests/vm/config-version-check.sh  # containerd config v3/v4 boundary + rollback guard
 tests/vm/negative-control.sh  # prove test 2.4 would catch the regression
+tests/vm/tier2-run.sh agent   # the agent-mode cases -- a SEPARATE phase, not part of `all`
+tests/vm/agent-mode-negative-control.sh  # prove the agent-mode guard tests can fail
 tests/vm/teardown-vm.sh       # delete the machine
 ```
 
-Between destructive runs:
+Every one of those after `build-bundle.sh` is destructive in its own way, so reset
+the baseline between them:
 
 ```bash
 tests/vm/reset-baseline.sh    # back to S1 in seconds
@@ -142,9 +145,10 @@ tests/vm/bootstrap-vm.sh --recreate   # nuke and rebuild, if state has drifted
 | `bootstrap-vm.sh` | Creates the machine and builds the **S1 baseline** (see below). |
 | `preflight-host.sh` | Restarts the guest and proves the relocated root survives it. Run by `bootstrap-vm.sh`. |
 | `build-bundle.sh` | Runs the real `download-docker-packages.sh` in the VM and records the artifact SHA-256. |
-| `tier2-run.sh` | The Tier 2 cases: `reject`, `upgrade`, `rollback`, or all. |
+| `tier2-run.sh` | The Tier 2 cases: `reject`, `upgrade`, `rollback`, or all — plus `agent`, which is a separate phase that `all` does not run. |
 | `config-version-check.sh` | The containerd 2.2 → 2.3 config-version boundary, and `rollback-docker.sh` phase 0c. Destructive; reset afterwards. |
 | `negative-control.sh` | Builds a one-line mutant with the old phase 6 and proves it destroys the config. |
+| `agent-mode-negative-control.sh` | Eight mutants, each neutering one agent-mode guard, each proving the paired Tier 2 case would catch it. Destructive; reset afterwards. |
 | `reset-baseline.sh` | Reconstructs S1 without recreating the machine. |
 | `vm-write-manifest.sh` | Runs **inside** the VM; records the pre-upgrade truth. |
 | `teardown-vm.sh` | Deletes the machine. |

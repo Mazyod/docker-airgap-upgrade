@@ -236,7 +236,7 @@ validation, the `rpm --test` dry run, the backup selection and the config-versio
 exits 0 or 1 without touching the node. That answers "would a rollback strand this node?"
 before anyone needs the answer, rather than after the services are down.
 
-**Running these from an agent rather than by hand?** Read `docs/AGENT-RUNBOOK.md`, which covers the gates and their flags, the status file, the exit codes and the decision table in one place. `upgrade-docker.sh` and `clean-swarm-networks.sh` run unattended with `--non-interactive` plus the gate flags; `rollback-docker.sh` runs unattended with `--non-interactive` and `--config-backup`. (`recover-dnf.sh` is the exception: it does not refuse a closed stdin — it skips its Option A and exits 0.)
+**Running these from an agent rather than by hand?** Read `docs/AGENT-RUNBOOK.md`. Its first five sections are the whole **upgrade** procedure — the standing rule, the exact command sequence with a flag table by Swarm role, the decision table keyed on `result` and `refusal_reason`, and the never-do list. The rollback and the network cleanup are remedies rather than steps and have their own sections below its Reference divider, along with the full key and flag tables. `upgrade-docker.sh` and `clean-swarm-networks.sh` run unattended with `--non-interactive` plus the gate flags; `rollback-docker.sh` runs unattended with `--non-interactive` and `--config-backup`. `recover-dnf.sh` takes `--run-option-a` / `--no-run-option-a` and is the one exception to the end-of-file rule: it does not refuse a closed stdin, it skips its Option A and exits 0.
 
 ## Usage
 
@@ -396,17 +396,25 @@ would silently orphan every image and snapshot on the node.
 
 | Tier | Status for 29.8.0 | How |
 |---|---|---|
-| Static | **226/226** offline | `./tests/static-checks.sh`; add `--online` for the 16 RPM URL checks |
-| VM (real execution) | **67/67** | `./tests/vm/bootstrap-vm.sh && ./tests/vm/build-bundle.sh && ./tests/vm/tier2-run.sh` |
-| VM agent mode | **697/697, 2 skipped** | `./tests/vm/tier2-run.sh agent` |
-| VM config-version boundary | **30/30** | `./tests/vm/config-version-check.sh` |
-| Negative control | **3/3** | `./tests/vm/negative-control.sh` |
-| Agent negative control | **24/24, 8 mutants** | `./tests/vm/agent-mode-negative-control.sh` |
+| Static | **231/231** offline, **247/247** online | `./tests/static-checks.sh`; add `--online` for the 16 RPM URL checks |
+| Host/guest preflight | **8 passed, 0 failed** | `./tests/vm/preflight-host.sh`, run by `bootstrap-vm.sh` |
+| VM (real execution) | **67 passed, 0 failed** | `./tests/vm/bootstrap-vm.sh && ./tests/vm/build-bundle.sh && ./tests/vm/tier2-run.sh` |
+| VM agent mode | **697 passed, 0 failed, 2 skipped** | `./tests/vm/tier2-run.sh agent` |
+| VM config-version boundary | **30 passed, 0 failed** | `./tests/vm/config-version-check.sh` |
+| Negative control | **3 passed, 0 failed** | `./tests/vm/negative-control.sh` |
+| Agent negative control | **24 passed, 0 failed, 8 mutants** | `./tests/vm/agent-mode-negative-control.sh` |
 | Multi-node Swarm | **not run** | needs a multi-node cluster — see `docs/TEST-PLAN.md` Tier 3 |
 
-The VM rows were measured on Rocky Linux 9 via the Docker backend, against a bundle
-rebuilt from the checkout under test, with the baseline reset between suites. The `agent` phase is a separate invocation
-(`tier2-run.sh agent`) and carries its own figure; the two are not additive. See
+Every VM row was measured in one campaign on Rocky Linux 9 via the Docker backend,
+against a bundle rebuilt from the checkout under test, on a guest recreated from
+scratch, with the baseline reset between suites. The bundle was
+`docker-upgrade-bundle.tar.gz`, 334 MB, sha256
+`a00715919c1dbd8059e75aaf8958a7daf8eca1d637066bb41530465c2a91a507`, carrying
+`containerd.io-2.3.4-2` for both RHEL majors. The `agent` phase is a separate
+invocation (`tier2-run.sh agent`) and carries its own figure; the two are not
+additive, and neither is a superset of the other. The two skips in the agent phase
+are the worker predictor state, which needs a second node, and phase 4's VXLAN loop,
+which an attachable overlay does not exercise from the host namespace. See
 `docs/TEST-PLAN.md`.
 
 The runc swap was verified directly on the node: `containerd.io-2.3.4-2` ships runc
@@ -434,6 +442,15 @@ What is still untested there is the VXLAN deletion loop — an attachable overla
 VXLAN inside the network namespace, so the host-namespace list is empty and the harness
 reports that as a skip rather than passing silently — and overlay reconvergence, which needs
 more than one node.
+
+**What no tier here reaches.** The Tier 2 rows above ran on Rocky Linux 9 — a RHEL
+rebuild, not RHEL — through a privileged systemd container that shares this host's
+kernel. So none of the following is tested anywhere in this repo: multi-node Swarm,
+**worker** behaviour of any kind, overlay reconvergence, mixed-version clusters, real
+RHEL (subscription-manager and satellite behaviour, which is the entire reason these
+scripts use `rpm` over `dnf`), GPU nodes, bare metal, and the cleanup script's VXLAN
+deletion loop. `docs/TEST-PLAN.md` states that boundary once and
+`tests/vm/README.md` repeats it in detail.
 
 Tier 3 in `docs/TEST-PLAN.md` is still mandatory before a production rollout, and
 specifically 3.3/3.4 are what authorize rolling node by node.

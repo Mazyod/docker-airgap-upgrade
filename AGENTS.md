@@ -1,5 +1,20 @@
 # AGENTS.md
 
+**Two audiences, two documents. Pick one.**
+
+| You are | Read |
+|---|---|
+| **Changing these scripts** | **[CLAUDE.md](CLAUDE.md)** — the invariants, the phase structure, the version-sync list, the release practice |
+| **Operating a node** — running an upgrade, a rollback, or the network cleanup on a real host | **[docs/AGENT-RUNBOOK.md](docs/AGENT-RUNBOOK.md)** — the prompts, the exit codes, the decision table, the never-do list |
+
+They do not overlap much. `CLAUDE.md` is 21 KB about editing scripts and says almost
+nothing about running them; the runbook says nothing about editing. Reading the wrong
+one costs a lot of context and answers the wrong question.
+
+The rest of this file is for the first audience.
+
+---
+
 This repository's working instructions live in **[CLAUDE.md](CLAUDE.md)** — read it in
 full before changing anything. It is agent-agnostic despite the filename, and it is the
 single source of truth for:

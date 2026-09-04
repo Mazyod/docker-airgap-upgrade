@@ -180,6 +180,8 @@ containerd bump they are inert or harmful. All three remain in git history at
 
 Script versions drift on purpose — only scripts that actually changed get bumped.
 
+**Running these from an agent rather than by hand?** Read `docs/AGENT-RUNBOOK.md`, which covers the prompts, the ambiguous exit codes and the failure decision table in one place. Note that the upgrade, rollback and network-cleanup scripts are interactive today and refuse a closed stdin, so an agent needs a real terminal. (`recover-dnf.sh` is the exception: it skips its Option A and exits 0.)
+
 ## Usage
 
 ### Step 1: Get the bundle

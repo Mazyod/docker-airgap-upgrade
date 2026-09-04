@@ -55,7 +55,7 @@ machine-readable. Later slices replace those sections as they replace the behavi
 
 | File | Change |
 |---|---|
-| `docs/AGENT-RUNBOOK.md` | new, ~200 lines, structure per the spec's outline |
+| `docs/AGENT-RUNBOOK.md` | new, structure per the spec's outline. Estimated ~200 lines; it landed at ~410 after review, because describing today's interface accurately took more room than describing it approximately |
 | `AGENTS.md` | +8 lines at the top: a two-way fork |
 | `tests/static-checks.sh` | new section 1.14, check 1.14.7 |
 | `README.md` | one line pointing at the new document |
@@ -784,5 +784,7 @@ None — no script changes.
       asserted non-empty before any case runs.
 - [ ] Codex has reviewed every slice diff, and each finding is either fixed or recorded with a
       reason for declining.
-- [ ] A GitHub release is cut for the shipment, per `docs/RELEASING.md` — the deliverable is
-      the bundle, and a tag alone does not record which packages an operator installed.
+- [ ] Everything in this plan ships in **one release**, cut by the orchestrator **after slice
+      8**, not by any individual slice. No slice tags or releases on its own. The release
+      follows `docs/RELEASING.md`: the deliverable is the bundle, and a tag alone does not
+      record which packages an operator installed.

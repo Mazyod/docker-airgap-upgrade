@@ -743,6 +743,60 @@ for s in upgrade-docker.sh clean-swarm-networks.sh; do
 done
 
 #############################################
+head_ "1.14  Agent-mode contract"
+#############################################
+# docs/AGENT-RUNBOOK.md is the entry point for an agent operating a node.
+# It must carry NO package version literals: the moment it names one, it joins
+# the eight-file version-sync list in CLAUDE.md, and a retarget that forgets it
+# ships an agent a version that is quietly wrong. It refers to versions as
+# "what this run reported" instead.
+#
+# The pattern also matches three-part section numbers, so the runbook does not
+# use them. That is deliberate -- a blanket ban is easier to reason about than
+# a heuristic that tries to tell a version from a heading, and it cannot be
+# defeated by a version sitting somewhere the heuristic did not expect.
+if [ ! -f docs/AGENT-RUNBOOK.md ]; then
+    bad "docs/AGENT-RUNBOOK.md is missing"
+else
+    # grep exits 0 for a match, 1 for none, and >1 for a real error. A blanket
+    # `|| true` would turn an unreadable file into "no matches" -- a false PASS
+    # on exactly the check whose job is to fail. Separate the three.
+    vlits=$(grep -nE '[0-9]+\.[0-9]+\.[0-9]+' docs/AGENT-RUNBOOK.md)
+    vrc=$?
+    if [ "$vrc" -gt 1 ]; then
+        bad "could not read docs/AGENT-RUNBOOK.md (grep exit $vrc)"
+    elif [ "$vrc" -eq 1 ]; then
+        ok "docs/AGENT-RUNBOOK.md has no version literals"
+    else
+        bad "docs/AGENT-RUNBOOK.md contains version literals"
+        printf '%s\n' "$vlits" | sed 's/^/       /'
+    fi
+fi
+
+# AGENTS.md must fork by audience. Sending an operator to CLAUDE.md costs it
+# 21 KB about editing scripts it is not editing.
+#
+# Requiring the operator row itself, not merely the filename: a mention in a
+# comment, or a sentence saying operators should NOT read it, would satisfy a
+# bare filename grep while the fork was gone.
+# Requiring the role label and its link on the SAME row. Searching for the
+# three fragments separately would pass on an AGENTS.md whose operator row had
+# been deleted, because a CLAUDE.md link appears further down the file anyway.
+fork_missing=""
+grep -qF '| **Changing these scripts** | **[CLAUDE.md](CLAUDE.md)**' AGENTS.md \
+    || fork_missing="$fork_missing editor-row"
+grep -qF '| **Operating a node**' AGENTS.md \
+    || fork_missing="$fork_missing operator-row"
+grep -F '| **Operating a node**' AGENTS.md \
+    | grep -qF '**[docs/AGENT-RUNBOOK.md](docs/AGENT-RUNBOOK.md)**' \
+    || fork_missing="$fork_missing operator-row-link"
+if [ -z "$fork_missing" ]; then
+    ok "AGENTS.md forks by audience; both rows link their document"
+else
+    bad "AGENTS.md audience fork is incomplete:$fork_missing"
+fi
+
+#############################################
 head_ "1.3  Upstream package availability"
 #############################################
 if [ "$ONLINE" = false ]; then

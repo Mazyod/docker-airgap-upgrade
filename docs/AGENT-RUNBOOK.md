@@ -16,10 +16,10 @@ window. An upgrade that proceeds on a false attestation costs whatever was runni
 
 ## What this interface is today, honestly
 
-**You no longer need a terminal for the upgrade or the network cleanup.** Every question
-those two ask is now a named gate with a flag for each answer, and `--non-interactive` turns
-an unanswered gate into a refusal instead of a prompt. `rollback-docker.sh` still needs a
-terminal; its one question becomes a flag in a later change.
+**You no longer need a terminal for any of the three.** Every question the upgrade and the
+cleanup ask is a named gate with a flag for each answer, and `--non-interactive` turns an
+unanswered gate into a refusal instead of a prompt. The rollback has one question, a value
+rather than a yes/no, answered by `--config-backup`.
 
 Under `--non-interactive` the prompt helper is **never reached**. Not reached and
 auto-answered — never reached. A wrapper piping `/dev/null`, or `yes y`, still cannot answer
@@ -461,7 +461,7 @@ reaches that question, so its reactivation stays required whatever the drain fla
 An unrecognised argument is now a usage error: it exits 1 with a message and writes no status
 file. It used to be ignored silently.
 
-`recover-dnf.sh` and the two build-host scripts take no flags.
+`recover-dnf.sh` takes `--run-option-a`, `--no-run-option-a`, `--help` and `--version`, and nothing else — no status file, no `--non-interactive`, no `--preflight`. `download-docker-packages.sh` and `simulate-upgrade.sh` take no flags at all: neither has a prompt, neither runs on a production node, and neither is in scope here.
 
 ### The status file
 
@@ -933,9 +933,13 @@ it will delete, asks, and restores services if you decline. It exits **2** when 
 completed but some items could not be removed — treat 2 as "not done", not as success. Without
 a terminal it takes two passes; see the two-pass procedure in the flag section.
 
-**`recover-dnf.sh`** is a diagnostic. It does **not** refuse end-of-file: with stdin closed it
-skips its Option A and exits 0. That is safe but it is not read-only — by the time it asks, it
-has already run `dnf clean all` and `rpm --rebuilddb`.
+**`recover-dnf.sh`** is a diagnostic, and it is the **one script that fails open** at
+end-of-file. With stdin closed it skips its Option A and exits 0 rather than refusing. That is
+safe because declining Option A changes nothing, and it is the safe direction — but it is not
+read-only: by the time it asks, it has already run `dnf clean all` and `rpm --rebuilddb`.
+`--no-run-option-a` states the decline explicitly and is what an unattended caller should pass;
+`--run-option-a` pre-answers yes and you should not pass it on a production air-gapped node —
+see the never-do list.
 
 ## Never do this
 
@@ -1004,9 +1008,8 @@ Stop and report. Do not improvise on a disconnected production node.
   sits at the end and older runs sit above it. They contain ANSI escapes.
 - Backups are `/root/docker-backup-<timestamp>/`, named so that lexical order is chronological.
 
-A note on what does not exist yet. There is no `--yes`, and there never will be: a blanket
-consent flag is exactly what the per-gate flags replace. `rollback-docker.sh` has no
-`--non-interactive` and no gate flags — run it on a terminal. `clean-swarm-networks.sh` has no
-`--dry-run` and no way to supply an inventory hash yet, which is why `--confirm-delete` is
-refused on its own. Do not invent flags: an unrecognised argument is a usage error, so a
-misspelled one fails loudly instead of being ignored.
+A note on what does not exist. There is no `--yes`, and there never will be: a blanket consent
+flag is exactly what the per-gate flags replace. `rollback-docker.sh` has no gate flags, because
+its one question is a value — `--config-backup` — rather than a yes/no. `--confirm-delete` has no
+form that works on its own, in any mode. Do not invent flags: an unrecognised argument is a
+usage error, so a misspelled one fails loudly instead of being ignored.

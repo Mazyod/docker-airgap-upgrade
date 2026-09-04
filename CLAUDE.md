@@ -428,7 +428,7 @@ Every script except `simulate-upgrade.sh` declares `VERSION="x.y.z"` on ~line 4 
 | `rollback-docker.sh` | 2.3.0 |
 | `download-docker-packages.sh` | 2.3.0 |
 | `clean-swarm-networks.sh` | 1.3.0 |
-| `recover-dnf.sh` | 1.2.2 |
+| `recover-dnf.sh` | 1.3.0 |
 
 Commit subjects carry the new version in parens, e.g. `Fix NVIDIA toolkit upgrade failures (v1.2.2)`, with a bullet list body.
 

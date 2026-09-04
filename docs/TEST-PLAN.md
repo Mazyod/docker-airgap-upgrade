@@ -300,7 +300,7 @@ in place. Clear `/var/log/docker-*.log` before any canonical run.
 | 2.12 | Missing plugins — core RPMs only | S1 | Fails in phase 0; installed plugins are not silently left stale |
 | 2.6a | Wrong containerd **build** — the real upstream `containerd.io-2.3.4-1`, whose `%{VERSION}` is identical to `-2` | S1 | Fails in phase 0 on the RPM **release**, naming the runc difference; node untouched, including `containerd.io` still `2.2.1-1.el9` exactly |
 | 2.13 | Transaction rejection — a complete, correct set that `rpm --test` refuses (e.g. an installed package requiring the newer containerd) | S1 | Fails at the dry run, distinct from the inventory gate |
-| 2.14 | Idempotent re-run | S2 | Detects already-at-target, exits 0 on "no" |
+| 2.14 | Idempotent re-run | S2 | Detects already-at-target and asks whether to re-run. The harness runs it with **stdin closed**, so the prompt takes the EOF refusal and the run exits **1** with the node untouched — the assertion is on the already-at-target message, not on the status. Exit 0 on a typed "no" is case **2.29j**, which answers on a real stream; the clean machine-readable form is case **2.35**, `--non-interactive` exiting **3** with `result=nothing-to-do` |
 | 2.15 | Partial state | S2 clone, containerd.io downgraded to 2.2.1 | Reports partial, proceeds, completes |
 | 2.16 | Rollback | clean S2 | Exits 0; all three asserts show 29.1.5/2.2.1; **same container IDs, image accessible, volume data intact, app responds, config unchanged** |
 | 2.17 | Rollback resumability | S2 clone with containerd.io already at 2.2.1 | `--replacepkgs` lets the rerun succeed rather than "already installed" |

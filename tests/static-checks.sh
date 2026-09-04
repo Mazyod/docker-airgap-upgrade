@@ -1074,7 +1074,11 @@ done
 # drift-checked for byte-identity across the three scripts, which stopped being
 # meaningful the moment their interfaces diverged -- and byte-identity never
 # proved the text matched the parser anyway.
-for s in upgrade-docker.sh rollback-docker.sh clean-swarm-networks.sh; do
+#
+# recover-dnf.sh is in this loop and in no other 1.14 check. It has a parser
+# and a usage text, so this drift is possible there; it has no status file, no
+# gates, no traps and no root check, so nothing else in this section applies.
+for s in upgrade-docker.sh rollback-docker.sh clean-swarm-networks.sh recover-dnf.sh; do
     parsed=$(awk '/^while \[ "\$#" -gt 0 \]; do/,/^done$/' "$s" \
         | grep -oE '^[[:space:]]*-[a-z|=*-]+\)' | tr -d ' )' | tr '|' '\n' \
         | sed 's/=\*$//' | grep -E '^-' | LC_ALL=C sort -u)

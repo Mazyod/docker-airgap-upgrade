@@ -9,9 +9,16 @@ that stops the wrong service or a config that gets silently regenerated.
 
 ## Requirements
 
-[OrbStack](https://orbstack.dev) (`brew install orbstack`). It provides Linux
-machines with systemd as PID 1 and x86_64 emulation via Rosetta, which is what
+**macOS + [OrbStack](https://orbstack.dev)** (`brew install orbstack`). It provides
+Linux machines with systemd as PID 1 and x86_64 emulation via Rosetta, which is what
 makes this possible on Apple Silicon.
+
+This harness does **not** currently run anywhere else. `lib.sh` reaches the guest
+through exactly four `orbctl` wrappers — `need_orbctl`, `vm_exists`, `vm`, `vm_try` —
+and no other file in `tests/vm/` touches the hypervisor, so those four are the entire
+port surface. A Linux host with Docker and `/dev/kvm` could back them with a privileged
+systemd container or a KVM guest, and would not need x86_64 emulation at all. That port
+has not been written or validated. Until it is, Tier 2 runs on a Mac or it does not run.
 
 ## Quick start
 

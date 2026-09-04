@@ -32,6 +32,8 @@ tests/vm/reset-baseline.sh    # back to S1 between destructive runs
 
 The S1 baseline deliberately puts containerd's root on a **separate XFS filesystem at `/data/containerd`** with real images, containers and volume data on it. That is the configuration the pre-v2.0.0 phase 6 destroyed, and it is the only way to test it. See `tests/vm/README.md` for what this proves and — importantly — what it does not (no Swarm, not real RHEL, no GPU, not bare metal).
 
+**The harness only runs on macOS with OrbStack installed.** `tests/vm/lib.sh` shells out to `orbctl` through four helpers (`need_orbctl`, `vm_exists`, `vm`, `vm_try`); nothing else in `tests/vm/` touches the hypervisor. On a Linux host with Docker and `/dev/kvm` those four helpers are the whole port surface — a privileged systemd container or a KVM guest would do — but that port has not been written or validated, so **Tier 2 is currently unrunnable off a Mac.** Say so plainly rather than reporting Tier 2 as skipped for an unrelated reason.
+
 `simulate-upgrade.sh` remains a separate dnf-path smoke test. It is **not** the same code path as `upgrade-docker.sh` (see below), so passing it does not prove the air-gapped path works.
 
 ## Two different install strategies (important)
@@ -86,6 +88,24 @@ Consequences that the scripts encode, and that must not be "simplified" away:
 - **`docker-buildx-plugin` and `docker-compose-plugin` version independently** of docker-ce. Don't pin them to the docker-ce version.
 
 ## Version constants are duplicated — change all of them together
+
+**Before changing a single constant, list what upstream actually has.** The version pinned
+in this repo reads as authoritative and usually is not: the gap between building a bundle
+and hand-carrying it to a disconnected server is long enough for two or three Docker point
+releases, and bundles here have gone stale before shipping more than once.
+
+```bash
+curl -s https://download.docker.com/linux/rhel/9/x86_64/stable/Packages/ \
+  | grep -oE 'docker-ce-[0-9][^"<]*\.rpm' | sort -V -u | tail
+```
+
+Repeat for `containerd.io`, `docker-buildx-plugin`, `docker-compose-plugin`, and for
+`rhel/8`. Then check the *dependency*, not just the highest number — `docker-ce` 29.7.2
+only requires `containerd.io >= 2.1.5`, so taking the newest containerd is a **choice**,
+and crossing a containerd minor has real consequences (see the config-version section).
+Check release dates too: "latest" and "settled" are different things, and putting a
+two-day-old plugin on a fleet that cannot be patched is a decision to surface, not to make
+silently.
 
 Package versions (`29.7.2`, `2.3.3`, `0.36.1`, `5.5.0`, rollback `29.1.5`/`2.2.1`) appear in:
 
@@ -178,5 +198,6 @@ Exits 2 when cleanup was incomplete, so a wrapper checking `$?` doesn't record a
 - **Every script that calls a helper must also define it.** These are standalone files; there is no shared library. `rollback-docker.sh` once called `prompt_yes_no` without defining it, and because the call sat in an `if !` condition the missing command's exit 127 inverted to "abort", exiting **0** — a silent no-op emergency rollback that reported success. `bash -n` cannot see this and shellcheck does not flag unresolved commands, so `tests/static-checks.sh` check 1.12 enforces it.
 - **Compare Swarm state exactly, never `grep -q "active"`** — a non-Swarm host reports `inactive`, which contains `active`.
 - **Any new harness check must be mutation-tested.** A check that greps for a function *name* passes even when the definition is deleted, because the call site supplies the string. Break the thing deliberately and confirm the harness fails and exits non-zero before trusting it.
+- **A guard test must assert state, not the exit code.** For any guard whose job is to *refuse* a destructive operation, "the script exited non-zero" proves nothing — the failure mode the guard exists to prevent also exits non-zero, just later and after the damage. A neutered `rollback-docker.sh` phase 0c ran the downgrade to completion and then failed to start containerd; its exit status was identical to a clean refusal. Assert the things the guard was protecting — package versions unchanged, services still `active`, canary data intact — alongside the status. A guard test that cannot fail is decoration.
 - EXIT traps do `local rc=$?` first, `[ "$rc" -eq 0 ] && exit 0`, and end with `exit "$rc"`. Paired with `trap 'exit 130' INT` / `trap 'exit 143' TERM` so signals route through the same reporting.
 - Scripts assume GNU userland (`grep -oP`, `findmnt`, `xfs_info`) with fallbacks where it mattered — don't test behavior against macOS tooling.

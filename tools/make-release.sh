@@ -51,10 +51,11 @@ NOTES="$OUT_DIR/release-notes-${TAG}.md"
 #############################################
 step "Preflight"
 #############################################
-command -v gh >/dev/null 2>&1 || die "gh CLI not installed (brew install gh)"
+command -v gh >/dev/null 2>&1 || die "gh CLI not installed (macOS: brew install gh; Linux: see cli.github.com)"
 gh auth status >/dev/null 2>&1 || die "gh is not authenticated (gh auth login)"
-need_orbctl
+need_backend
 vm_exists || die "VM '$VM_NAME' not found. Run tests/vm/bootstrap-vm.sh first."
+echo "  backend: $HARNESS_BACKEND"
 
 [ -n "$(git status --porcelain)" ] && die "working tree is dirty -- commit or stash first"
 
@@ -117,9 +118,9 @@ vm "cat $BUNDLE_VM" > "$OUT_BUNDLE" || die "failed to copy the bundle out"
 [ -s "$OUT_BUNDLE" ] || die "copied bundle is empty"
 
 VM_SHA=$(vm "sha256sum $BUNDLE_VM | cut -d' ' -f1" | tr -d '\r\n')
-MAC_SHA=$(shasum -a 256 "$OUT_BUNDLE" | cut -d' ' -f1)
-[ "$VM_SHA" = "$MAC_SHA" ] || die "checksum mismatch after copy (VM=$VM_SHA mac=$MAC_SHA)"
-echo "  $(du -h "$OUT_BUNDLE" | cut -f1)  sha256 ${MAC_SHA:0:16}...  (verified end to end)"
+HOST_SHA=$(sha256sum "$OUT_BUNDLE" | cut -d' ' -f1)
+[ "$VM_SHA" = "$HOST_SHA" ] || die "checksum mismatch after copy (VM=$VM_SHA host=$HOST_SHA)"
+echo "  $(du -h "$OUT_BUNDLE" | cut -f1)  sha256 ${HOST_SHA:0:16}...  (verified end to end)"
 
 #############################################
 step "Composing release notes"
@@ -143,7 +144,7 @@ step "Composing release notes"
     echo "## Verify before use"
     echo ""
     echo "\`\`\`bash"
-    echo "sha256sum -c <<< '$MAC_SHA  $(basename "$OUT_BUNDLE")'"
+    echo "sha256sum -c <<< '$HOST_SHA  $(basename "$OUT_BUNDLE")'"
     echo "\`\`\`"
     echo ""
     echo "## Provenance"

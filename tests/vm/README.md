@@ -40,6 +40,24 @@ outside that core. (Earlier revisions of this file and of `CLAUDE.md` claimed th
 surface was *four* helpers. It never was: create and delete were raw `orbctl` calls
 sitting in `bootstrap-vm.sh` and `teardown-vm.sh`, outside any helper.)
 
+Two helpers sit **above** the backend, in `lib.sh`, and are written once for both:
+
+- `vm_wait_systemd_settled` — polls `systemctl is-system-running` for up to 120 s and
+  accepts `running` or `degraded`, `degraded` being normal for a guest with pruned
+  units. It replaced two copies that had already drifted in how they parsed the answer.
+- `vm_cp_verified <dst_dir> <file>…` — copies files into the guest and compares each
+  destination's SHA-256 against the host's copy. Both backends expose the repo at the
+  identical absolute path, so every transfer is a plain `cp`; that path being the same
+  tree is an *assumption* the digest turns into a fact. A forwarded or Desktop daemon
+  can hold an older checkout there, and a partial copy exits 0. Every transfer site
+  uses it: `bootstrap-vm.sh`, `build-bundle.sh`, `tools/make-release.sh` and
+  `stage_manifest_writer`.
+
+The container backend additionally re-checks one sentinel file on every wake. That is
+deliberate duplication rather than dead weight: `tier2-run.sh`,
+`config-version-check.sh`, `negative-control.sh` and `preflight-host.sh` transfer no
+files at all, so it is the only repo-mount verification those runs get.
+
 ### What the container backend costs
 
 `--privileged` is genuine host access, not a VM boundary, and two of its effects reach

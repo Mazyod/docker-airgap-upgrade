@@ -148,7 +148,10 @@ docker version | grep -A2 Server        # 29.8.0
 containerd --version                    # 2.3.4
 runc --version                          # 1.5.1
 rpm -q docker-ce docker-ce-cli containerd.io
-rpm -q containerd.io --queryformat '%{VERSION}-%{RELEASE}\n'   # 2.3.4-2.el9
+rpm -q containerd.io --queryformat '%{VERSION}-%{RELEASE}\n'   # 2.3.4-2.el<major>
+# <major> is THIS host's RHEL major -- 2.3.4-2.el8 on RHEL 8, 2.3.4-2.el9 on
+# RHEL 9. The upgrade builds the same string from `rpm -E %rhel`, so an el8 node
+# reporting el8 is correct, not a failed upgrade.
 
 # containerd config was preserved, not regenerated
 grep '^root' /etc/containerd/config.toml   # must match what you recorded in 3.2

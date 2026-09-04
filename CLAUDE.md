@@ -111,11 +111,25 @@ Consequences the scripts encode:
   grep in 1.4b. Extract the real functions, never reimplement them; a copy is the next
   thing to drift. Note what 1.4b can and cannot do: it catches negation, a discarded
   exit status, a transformed input and a duplicate definition, but no text check can
-  prove a call site is wired to a real node. Tier 2 case 2.6a is what closes that.
+  prove a call site is wired to a real node. Tier 2 cases 2.6a and 2.6b are what close
+  that.
 
-The phase 0 release assertion **has now run in Tier 2**: case 2.6a stages the real upstream
-RPM of the wrong build, and asserts the run is refused on the release, that the refusal
-explains the runc difference, and that it happens in phase 0 before the Swarm drain.
+**Tier 2 status of the release guard.** Case **2.6a** — phase 0 refusing a payload
+built from `containerd.io-2.3.4-1` — is automated in `tests/vm/tier2-run.sh` and
+passing; it stages the real upstream `-1` RPM and asserts the node's packages,
+services and canary data are untouched. Case **2.6b** — the already-at-target gate,
+which decides there is nothing to do *before* phase 9 ever runs — is now written
+in `tier2-run.sh` too but has **not been executed**; it downgrades containerd.io
+alone to the `-1` build and re-runs the correct bundle. Do not report either as
+verified beyond what `docs/TEST-PLAN.md`'s execution status says, and update that
+table and this paragraph together.
+
+The one part of the guard no Tier 2 case can reach is **phase 9's own release
+check**: every scenario the harness can build installs the right release from a
+valid bundle, so its failure branch never executes. Deleting its `VERIFY_FAILED=1`
+left Tier 1 at 133/133 and Tier 2 green. `tests/static-checks.sh` 1.4b now pins
+that assignment by text; it is the only thing standing between that mutation and a
+green suite, so do not "simplify" it away.
 
 ### The containerd config version is asymmetric — this is the sharp edge
 
@@ -165,14 +179,29 @@ Check release dates too: "latest" and "settled" are different things, and puttin
 two-day-old plugin on a fleet that cannot be patched is a decision to surface, not to make
 silently.
 
+**The RPM `%{RELEASE}` moves too, and it is not always `1`.** containerd.io 2.3.4
+was published as both `-1` and `-2`, so four more constants have to move with the
+versions, and none of them is a version string a mechanical bump would find:
+
+| Constant | File | What it is |
+|---|---|---|
+| `WANT_CONTAINERD_RELEASE` | `tests/static-checks.sh` | the expectation the rest of Tier 1 is checked against — change this one first |
+| `EXPECTED_CONTAINERD_RELEASE` | `upgrade-docker.sh` | what phase 0, the already-at-target gate and phase 9 all assert |
+| `TARGET_CONTAINERD_RELEASE` | `tests/vm/lib.sh` | how the harness names containerd RPM paths, and half of the release title |
+| `WRONG_CONTAINERD_RELEASE` | `tests/vm/lib.sh` | the OTHER upstream build, staged by cases 2.6a and 2.6b. A target version upstream published only once leaves this with no valid value; both cases then fail loudly rather than passing vacuously, and that is the signal to retire them for that target |
+
+`TARGET_RUNC` / `WRONG_RUNC` in `tests/vm/lib.sh` are fixtures tied to those two
+builds and move with them. `rollback-docker.sh` asserts `%{VERSION}` only: the
+29.1.5 / 2.2.1 rollback set was published once.
+
 Package versions (`29.8.0`, `2.3.4`, `0.37.0`, `5.5.1`, rollback `29.1.5`/`2.2.1`) appear in:
 
 - `download-docker-packages.sh` — four download loops (rhel8, rhel9, rollback-rhel8, rollback-rhel9)
 - `upgrade-docker.sh` — `EXPECTED_DOCKER_VERSION` / `EXPECTED_CONTAINERD_VERSION` constants, plus the header and banner
 - `rollback-docker.sh` — `ROLLBACK_DOCKER_VERSION` / `ROLLBACK_CONTAINERD_VERSION` constants, plus the header and banner
 - `simulate-upgrade.sh` — its own download loop, the `dnf install` pins, and the `assert_pkg` calls
-- `tests/static-checks.sh` — `WANT_DOCKER` / `WANT_CONTAINERD` / `WANT_BUILDX` / `WANT_COMPOSE`
-- `tests/vm/lib.sh` — `TARGET_*` (and `BASELINE_*` when the *starting* version moves). `tools/make-release.sh` sources this file, so the release title follows automatically
+- `tests/static-checks.sh` — `WANT_DOCKER` / `WANT_CONTAINERD` / `WANT_BUILDX` / `WANT_COMPOSE` / `WANT_CONTAINERD_RELEASE`
+- `tests/vm/lib.sh` — `TARGET_*` including `TARGET_CONTAINERD_RELEASE`, plus `WRONG_CONTAINERD_RELEASE`, `TARGET_RUNC` / `WRONG_RUNC`, and `BASELINE_*` when the *starting* version moves. `tools/make-release.sh` sources this file, so the release title follows automatically — check 1.4b now compares all five `TARGET_*` against `WANT_*`, because a forgotten constant here used to pass Tier 1 and follow automatically into a wrong release title
 - `README.md` — the version table, the release-date table, and the verification section
 - `RUNBOOK.md` — the target/from header
 - `docs/TEST-PLAN.md` — the version references in the Tier 2 table
@@ -255,7 +284,7 @@ Every script except `simulate-upgrade.sh` declares `VERSION="x.y.z"` on ~line 4 
 
 | Script | Version |
 |---|---|
-| `upgrade-docker.sh` | 2.3.0 |
+| `upgrade-docker.sh` | 2.3.1 |
 | `rollback-docker.sh` | 2.2.0 |
 | `download-docker-packages.sh` | 2.3.0 |
 | `clean-swarm-networks.sh` | 1.1.0 |

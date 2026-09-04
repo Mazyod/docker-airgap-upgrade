@@ -69,7 +69,23 @@ If you would rather ship something weathered, docker-ce 29.8.0 with containerd.i
 2.3.3-1, buildx 0.36.1 and compose 5.5.0 also satisfies every dependency
 (`docker-ce` 29.8.0 requires only `containerd.io >= 2.1.5`) and keeps three of the
 five packages on builds this repo has already tested. Change `WANT_*` in
-`tests/static-checks.sh` first and let the failures name the rest.
+`tests/static-checks.sh` first and let the failures name the rest — with three
+caveats the failures will *not* explain:
+
+- **2.3.3, 0.36.1 and 5.5.0 are on check 1.5's stale-literal denylist** (the two
+  `pattern=` lines in `tests/static-checks.sh`, in the `1.5 No stale version
+  literals` section). Adopting them produces Tier 1 failures reading "stale
+  literal in live code" for the very versions you were told to adopt. Roll the
+  list: whatever target is being replaced becomes stale the moment it is
+  replaced, and whatever you adopt must come off it.
+- **`WANT_CONTAINERD_RELEASE` and `TARGET_CONTAINERD_RELEASE` go back to `1`.**
+  containerd.io 2.3.3 was published upstream once, so `-1` is the only build.
+- **`WRONG_CONTAINERD_RELEASE` in `tests/vm/lib.sh` has no valid value.** It
+  names the *other* build of the target version, and 2.3.3 has none. Case 2.6a
+  fails loudly rather than passing vacuously when it equals the target release,
+  which is correct and which means 2.6a has nothing to test on that
+  configuration — 2.6b likewise. Nothing in `tests/static-checks.sh` mentions
+  this constant, so Tier 1 will not warn you.
 
 ## Versions
 
@@ -172,7 +188,7 @@ containerd bump they are inert or harmful. All three remain in git history at
 | Script | Version | Purpose | Run On |
 |---|---|---|---|
 | `download-docker-packages.sh` | 2.3.0 | Download all packages, build the bundle | Online RHEL server |
-| `upgrade-docker.sh` | 2.3.0 | Perform the upgrade | Air-gapped servers |
+| `upgrade-docker.sh` | 2.3.1 | Perform the upgrade | Air-gapped servers |
 | `rollback-docker.sh` | 2.2.0 | Roll back to 29.1.5 | Failed upgrade recovery |
 | `clean-swarm-networks.sh` | 1.1.0 | Reset orphaned overlay network state | Node that can't rejoin overlays |
 | `recover-dnf.sh` | 1.2.2 | Fix dependency issues | Servers with broken dnf |
@@ -304,7 +320,10 @@ runc --version          # Should show 1.5.1
 
 # Packages, including the containerd.io RELEASE -- 2.3.4 shipped as -1 and -2
 rpm -q docker-ce docker-ce-cli containerd.io
-rpm -q containerd.io --queryformat '%{VERSION}-%{RELEASE}\n'   # want 2.3.4-2.el9
+rpm -q containerd.io --queryformat '%{VERSION}-%{RELEASE}\n'   # want 2.3.4-2.el<major>
+
+# ...where <major> is THIS host's RHEL major: 2.3.4-2.el8 on RHEL 8 and
+# 2.3.4-2.el9 on RHEL 9. The script builds the same string from `rpm -E %rhel`.
 
 # containerd config was preserved, not regenerated
 grep '^root' /etc/containerd/config.toml
@@ -340,16 +359,23 @@ would silently orphan every image and snapshot on the node.
 
 | Tier | Status for 29.8.0 | How |
 |---|---|---|
-| Static | **149/149** | `./tests/static-checks.sh --online` |
-| VM (real execution) | **56/56** | `./tests/vm/bootstrap-vm.sh && ./tests/vm/build-bundle.sh && ./tests/vm/tier2-run.sh` |
+| Static | **154/154** | `./tests/static-checks.sh --online` |
+| VM (real execution) | **re-run owed** | `./tests/vm/bootstrap-vm.sh && ./tests/vm/build-bundle.sh && ./tests/vm/tier2-run.sh` |
 | VM config-version boundary | **30/30** | `./tests/vm/config-version-check.sh` |
 | Negative control | **3/3** | `./tests/vm/negative-control.sh` |
 | Swarm | **not run** | needs a multi-node cluster — see `docs/TEST-PLAN.md` Tier 3 |
 
-All four ran against a bundle rebuilt from this checkout, on Rocky Linux 9 via the
-Docker backend. The runc swap was verified directly on the node: `containerd.io-2.3.4-2`
-ships runc 1.5.1 and `-1` ships 1.4.3. Case 2.6a stages the real upstream `-1` RPM and
-proves phase 0 refuses it with the node untouched.
+The VM rows were measured on Rocky Linux 9 via the Docker backend, against a bundle
+rebuilt from the checkout at commit `8d4dcf4`. `tier2-run.sh` last printed 56/56
+there; its assertion set has changed since — case 2.6b was added and case 2.3 now
+asserts the installed `%{VERSION}-%{RELEASE}` and `runc` — and it has not been
+re-run, so the old figure is not quoted as if it covered the current tree. See
+`docs/TEST-PLAN.md`.
+
+The runc swap was verified directly on the node: `containerd.io-2.3.4-2` ships runc
+1.5.1 and `-1` ships 1.4.3. Case 2.6a stages the real upstream `-1` RPM and proves
+phase 0 refuses it with the node untouched; case 2.6b covers the other side of that
+guard, the already-at-target gate.
 
 The VM tier runs the real scripts against Rocky Linux 9 (x86_64, systemd) — an
 OrbStack machine on macOS, or a privileged systemd container on a Linux host with

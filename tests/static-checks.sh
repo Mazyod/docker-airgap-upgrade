@@ -105,24 +105,49 @@ check_contains simulate-upgrade.sh "$WANT_DOCKER"     "simulate-upgrade.sh targe
 check_contains simulate-upgrade.sh "$WANT_CONTAINERD" "simulate-upgrade.sh targets $WANT_CONTAINERD"
 check_contains README.md           "$WANT_DOCKER"     "README references $WANT_DOCKER"
 
-# Both el8 and el9 must be covered for every upgrade package.
+# The package set, as name:version:release, in ONE place.
+#
+# Both el8 and el9 must be covered for every upgrade package, and the same five
+# have to resolve upstream in check 1.3. Those were two hand-maintained lists
+# that had to be kept in agreement by eye; 1.3's hard-coded "-1" per package was
+# exactly the mistake the release suffix below exists to prevent.
 #
 # The RELEASE suffix is carried per package rather than hard-coded to 1. It used
 # to be 1 for everything, which made "-1" invisible boilerplate; containerd.io
 # 2.3.4 ships as -1 and -2 and only -2 is wanted, so a mechanical version bump
 # that left the suffix alone would name an RPM that is real but WRONG.
-for spec in "docker-ce-$WANT_DOCKER:1" \
-            "docker-ce-cli-$WANT_DOCKER:1" \
-            "containerd.io-$WANT_CONTAINERD:$WANT_CONTAINERD_RELEASE" \
-            "docker-buildx-plugin-$WANT_BUILDX:1" \
-            "docker-compose-plugin-$WANT_COMPOSE:1"; do
-    pkg="${spec%:*}"
-    rel="${spec##*:}"
-    for el in el8 el9; do
-        if grep -q "$pkg-$rel\.$el\.x86_64\.rpm" download-docker-packages.sh; then
-            ok "download loop has $pkg-$rel ($el)"
+WANT_PKGS=(
+    "docker-ce:$WANT_DOCKER:1"
+    "docker-ce-cli:$WANT_DOCKER:1"
+    "containerd.io:$WANT_CONTAINERD:$WANT_CONTAINERD_RELEASE"
+    "docker-buildx-plugin:$WANT_BUILDX:1"
+    "docker-compose-plugin:$WANT_COMPOSE:1"
+)
+# The rollback set, checked upstream by 1.3 only -- the download loops for it are
+# covered by the plain version greps above. Published once, so every release is 1.
+WANT_ROLLBACK_PKGS=(
+    "docker-ce:$WANT_ROLLBACK_DOCKER:1"
+    "docker-ce-cli:$WANT_ROLLBACK_DOCKER:1"
+    "containerd.io:$WANT_ROLLBACK_CONTAINERD:1"
+)
+# name:version:release -> the exact RPM filename for one RHEL major.
+pkg_rpm_name() {
+    local spec="$1" major="$2" rest
+    rest="${spec#*:}"
+    printf '%s-%s-%s.el%s.x86_64.rpm' \
+        "${spec%%:*}" "${rest%%:*}" "${rest##*:}" "$major"
+}
+
+for spec in "${WANT_PKGS[@]}"; do
+    for major in 8 9; do
+        rpm_name=$(pkg_rpm_name "$spec" "$major")
+        # Escape the dots: an unescaped version string is a regex matching more
+        # than it should, and a check that over-matches fails open.
+        rpm_re=$(printf '%s' "$rpm_name" | sed 's/\./\\./g')
+        if grep -q "$rpm_re" download-docker-packages.sh; then
+            ok "download loop has $rpm_name"
         else
-            bad "download loop MISSING $pkg-$rel ($el)"
+            bad "download loop MISSING $rpm_name"
         fi
     done
 done
@@ -1003,21 +1028,17 @@ head_ "1.3  Upstream package availability"
 if [ "$ONLINE" = false ]; then
     skip "URL checks (pass --online to run)"
 else
+    # Built from the same WANT_PKGS table as the download-loop check above, so
+    # the URL probed and the filename the bundle fetches cannot disagree. This
+    # loop used to hard-code "-1" per package, which meant it would have happily
+    # confirmed the existence of the WRONG containerd build.
     BASE="https://download.docker.com/linux/rhel"
-    for rel in 8 9; do
-        for pkg in \
-            "docker-ce-$WANT_DOCKER-1.el$rel.x86_64.rpm" \
-            "docker-ce-cli-$WANT_DOCKER-1.el$rel.x86_64.rpm" \
-            "containerd.io-$WANT_CONTAINERD-$WANT_CONTAINERD_RELEASE.el$rel.x86_64.rpm" \
-            "docker-buildx-plugin-$WANT_BUILDX-1.el$rel.x86_64.rpm" \
-            "docker-compose-plugin-$WANT_COMPOSE-1.el$rel.x86_64.rpm" \
-            "docker-ce-$WANT_ROLLBACK_DOCKER-1.el$rel.x86_64.rpm" \
-            "docker-ce-cli-$WANT_ROLLBACK_DOCKER-1.el$rel.x86_64.rpm" \
-            "containerd.io-$WANT_ROLLBACK_CONTAINERD-1.el$rel.x86_64.rpm"
-        do
+    for major in 8 9; do
+        for spec in "${WANT_PKGS[@]}" "${WANT_ROLLBACK_PKGS[@]}"; do
+            pkg=$(pkg_rpm_name "$spec" "$major")
             code=$(curl -sIL -o /dev/null -w '%{http_code}' --max-time 25 \
-                "$BASE/$rel/x86_64/stable/Packages/$pkg" || echo "000")
-            if [ "$code" = "200" ]; then ok "el$rel $pkg"; else bad "el$rel $pkg (HTTP $code)"; fi
+                "$BASE/$major/x86_64/stable/Packages/$pkg" || echo "000")
+            if [ "$code" = "200" ]; then ok "el$major $pkg"; else bad "el$major $pkg (HTTP $code)"; fi
         done
     done
 fi

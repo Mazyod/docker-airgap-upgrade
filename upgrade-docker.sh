@@ -1,7 +1,7 @@
 #!/bin/bash
 # upgrade-docker.sh
 # Run on each AIR-GAPPED server to upgrade Docker 29.1.5 → 29.8.0
-VERSION="2.3.0"
+VERSION="2.3.1"
 #
 # Prerequisites:
 # - Extract docker-upgrade-bundle.tar.gz to /opt/
@@ -18,7 +18,7 @@ VERSION="2.3.0"
 # to avoid SSL certificate issues with corporate satellite servers
 # (e.g., "SSL certificate problem: EE certificate key too weak")
 #
-# SCOPE OF THIS VERSION (2.3.0)
+# SCOPE OF THIS VERSION (2.3.1)
 #
 # This upgrade crosses containerd 2.2.1 -> 2.3.4: a MINOR containerd bump, not
 # the 1.7 -> 2.x MAJOR boundary the 28.5.1 -> 29.1.5 migration crossed. 2.3 is
@@ -983,22 +983,23 @@ check_version "docker-compose-plugin" "$FOUND_COMPOSE"    "$EXPECTED_COMPOSE_VER
 check_containerd_release() {
     local found="$1" want="$2"
 
-    if [ -z "$found" ]; then
-        # Either no containerd.io in the payload, or one whose earlier checks
-        # rejected it (arch, el-major, duplicate) and `continue`d before the
-        # release was recorded. check_version has already said which; this
-        # exists so an empty string can never be mistaken for agreement.
-        echo -e "${RED}  ERROR: containerd.io RPM release is empty (expected ${want}.el${RHEL_VER})${NC}"
-        PKG_ERRORS=$((PKG_ERRORS + 1))
-        return
-    fi
-
     if containerd_release_matches "$found" "$want" "$RHEL_VER"; then
         echo -e "  ${GREEN}✓ containerd.io release $found${NC}"
         return
     fi
 
-    echo -e "${RED}  ERROR: containerd.io release is $found, expected ${want}.el${RHEL_VER}${NC}"
+    # ONE refusal, for every shape that is not the wanted one -- including an
+    # empty release. containerd_release_matches already refuses an empty string,
+    # so a separate branch for it duplicated the predicate rather than adding
+    # anything, and the two messages had drifted apart.
+    echo -e "${RED}  ERROR: containerd.io release is ${found:-<none>}, expected ${want}.el${RHEL_VER}${NC}"
+    if [ -z "$found" ]; then
+        # No containerd.io in the payload at all, or one an earlier check
+        # rejected (arch, el-major, duplicate) and `continue`d past before the
+        # release was recorded. check_version has already said which.
+        echo "         containerd.io is missing from the payload, or an earlier check"
+        echo "         rejected it before its release could be read."
+    fi
     echo "         containerd.io $EXPECTED_CONTAINERD_VERSION was published more than once."
     echo "         Release -1 carries runc 1.4.3; -2 carries runc 1.5.1."
     echo "         This bundle has the wrong build. Re-download it."

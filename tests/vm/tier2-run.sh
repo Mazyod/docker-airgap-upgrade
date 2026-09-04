@@ -427,21 +427,33 @@ sleep 3" >/dev/null 2>&1; then
     SETUP_2_6B=failed
 fi
 
-# The precondition, asserted rather than assumed, and it GATES the case. A setup
-# that half-applied -- the downgrade done, containerd not restarted -- would
-# otherwise let the assertions below run against a node in an unknown state and
-# report on a scenario that never existed. This script has no errexit, so the
-# gate has to be explicit.
+# The precondition, asserted rather than assumed, and it GATES the case.
+#
+# assert_vm_eq cannot do this job: it increments FAIL and returns, so a setup
+# that half-applied -- the downgrade done, containerd not restarted -- would be
+# reported and then the case would carry on describing a scenario that never
+# existed. This variant flips the gate as well.
+setup_assert_2_6b() {
+    local label="$1" cmd="$2" want="$3" got
+    got=$(vm_try "$cmd" | tr -d '\r' | tail -1)
+    if [ "$got" = "$want" ]; then
+        ok "$label"
+    else
+        bad "$label (got '$got', want '$want')"
+        SETUP_2_6B=failed
+    fi
+}
+
 if [ "$SETUP_2_6B" = ok ]; then
-    assert_vm_eq "2.6b setup: node is on the wrong build $TARGET_CONTAINERD-$WRONG_CONTAINERD_RELEASE.el9" \
+    setup_assert_2_6b "2.6b setup: node is on the wrong build $TARGET_CONTAINERD-$WRONG_CONTAINERD_RELEASE.el9" \
         "rpm -q containerd.io --queryformat '%{VERSION}-%{RELEASE}'" \
         "$TARGET_CONTAINERD-$WRONG_CONTAINERD_RELEASE.el9"
-    assert_vm_eq "2.6b setup: docker-ce is still at the target $TARGET_DOCKER" \
+    setup_assert_2_6b "2.6b setup: docker-ce is still at the target $TARGET_DOCKER" \
         "rpm -q docker-ce --queryformat '%{VERSION}'" "$TARGET_DOCKER"
-    assert_vm_eq "2.6b setup: runc is the wrong build's $WRONG_RUNC" \
+    setup_assert_2_6b "2.6b setup: runc is the wrong build's $WRONG_RUNC" \
         "runc --version 2>/dev/null | head -1 | awk '{print \$3}'" "$WRONG_RUNC"
 else
-    skip "2.6b assertions (setup failed -- see above)"
+    skip "2.6b setup assertions (staging failed -- see above)"
 fi
 
 # The corrective run happens either way: it is what returns the node to the
@@ -449,15 +461,17 @@ fi
 restore_pkgs
 out=$(run_upgrade)
 
+# What the run SAID is only meaningful if the node really was on the wrong build,
+# so those checks are gated on the setup.
 if [ "$SETUP_2_6B" != ok ]; then
-    skip "2.6b result assertions (setup failed -- the node was not on the wrong build)"
-elif printf '%s' "$out" | grep -q "already fully at the target versions"; then
-    bad "2.6b the gate called a node on $TARGET_CONTAINERD-$WRONG_CONTAINERD_RELEASE.el9 already-at-target"
-    printf '%s\n' "$out" | tail -8 | sed 's/^/       /'
+    skip "2.6b output assertions (the node was never on the wrong build)"
 else
-    ok "2.6b the already-at-target gate does not accept the wrong containerd build"
-fi
-if [ "$SETUP_2_6B" = ok ]; then
+    if printf '%s' "$out" | grep -q "already fully at the target versions"; then
+        bad "2.6b the gate called a node on $TARGET_CONTAINERD-$WRONG_CONTAINERD_RELEASE.el9 already-at-target"
+        printf '%s\n' "$out" | tail -8 | sed 's/^/       /'
+    else
+        ok "2.6b the already-at-target gate does not accept the wrong containerd build"
+    fi
     if printf '%s' "$out" | grep -q "UPGRADE COMPLETE"; then
         ok "2.6b the run completed rather than exiting with nothing to do"
     else
@@ -469,20 +483,23 @@ if [ "$SETUP_2_6B" = ok ]; then
     else
         bad "2.6b phase 9 did not report the installed containerd.io release"
     fi
-
-    # STATE, not the exit code -- a node the gate waved through and a node that
-    # was upgraded can both exit 0. Only these tell them apart.
-    assert_vm_eq "2.6b: containerd.io is now $TARGET_CONTAINERD-$TARGET_CONTAINERD_RELEASE.el9" \
-        "rpm -q containerd.io --queryformat '%{VERSION}-%{RELEASE}'" \
-        "$TARGET_CONTAINERD-$TARGET_CONTAINERD_RELEASE.el9"
-    assert_vm_eq "2.6b: runc is now $TARGET_RUNC, not $WRONG_RUNC" \
-        "runc --version 2>/dev/null | head -1 | awk '{print \$3}'" "$TARGET_RUNC"
-    assert_vm_eq "2.6b: docker active after the corrective run" "systemctl is-active docker" "active"
-    assert_vm_eq "2.6b: containerd active after the corrective run" "systemctl is-active containerd" "active"
-    assert_vm_eq "2.6b: canary data on the relocated root intact" \
-        "docker start survivor >/dev/null 2>&1; docker exec survivor cat /data/canary.txt" \
-        "VOLUME-CANARY-DATA"
 fi
+
+# The STATE assertions are NOT gated. They are the ones that tell a node the
+# gate waved through from a node that was upgraded -- both exit 0 -- and they
+# are also what the rollback section below depends on. Skipping them after a
+# failed setup would hand 2.16 a node in an unknown state and let its failures
+# read as rollback defects.
+assert_vm_eq "2.6b: containerd.io is now $TARGET_CONTAINERD-$TARGET_CONTAINERD_RELEASE.el9" \
+    "rpm -q containerd.io --queryformat '%{VERSION}-%{RELEASE}'" \
+    "$TARGET_CONTAINERD-$TARGET_CONTAINERD_RELEASE.el9"
+assert_vm_eq "2.6b: runc is now $TARGET_RUNC, not $WRONG_RUNC" \
+    "runc --version 2>/dev/null | head -1 | awk '{print \$3}'" "$TARGET_RUNC"
+assert_vm_eq "2.6b: docker active after the corrective run" "systemctl is-active docker" "active"
+assert_vm_eq "2.6b: containerd active after the corrective run" "systemctl is-active containerd" "active"
+assert_vm_eq "2.6b: canary data on the relocated root intact" \
+    "docker start survivor >/dev/null 2>&1; docker exec survivor cat /data/canary.txt" \
+    "VOLUME-CANARY-DATA"
 fi
 
 #############################################

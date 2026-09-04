@@ -195,6 +195,22 @@ vm_wait_systemd_settled() {
 # All digests come back in one guest round trip. Failure is loud and fatal to the
 # caller: staging the wrong scripts means every product assertion afterwards is
 # about code nobody wrote.
+#
+# Paths are SINGLE-QUOTED for the guest through harness_shq. The guest command is
+# assembled as a host string, so an unquoted path containing a dollar sign, a
+# backtick or a quote would be re-expanded -- or executed -- inside the guest. A
+# checkout under a directory literally named something like '$WORK' is a valid
+# filesystem path and must not become a guest expansion.
+harness_shq() {
+    # Each single quote becomes the four characters  ' \ ' '  -- close the
+    # quote, escape a literal quote, reopen. Done with parameter expansion
+    # rather than sed: getting that sequence through a sed replacement intact
+    # needs three levels of quoting, and the version that did not silently
+    # produced ''', which the shell reads as nothing at all.
+    local esc="'\''"
+    printf "'%s'" "${1//\'/$esc}"
+}
+
 vm_cp_verified() {
     local dst_dir="${1:-}"
     shift || true
@@ -224,16 +240,22 @@ vm_cp_verified() {
     # previous run put there and every digest below is taken against a stale file.
     # The DIGEST marker lets the digests be picked out of whatever else the guest
     # says on the way.
-    local quoted="" out
+    local quoted="" qdst out
+    qdst=$(harness_shq "$dst_dir")
     for f in "$@"; do
-        quoted="$quoted \"$f\""
+        quoted="$quoted $(harness_shq "$f")"
     done
+    # The destination goes into a guest VARIABLE, and only the assignment carries
+    # the quoted form. Interpolating it inside a guest double-quoted string would
+    # make its quotes literal path characters instead: "'/root/scripts'/x" is not
+    # /root/scripts/x, and every digest then comes back missing.
     if ! out=$(vm "set -e
-mkdir -p \"$dst_dir\"
-for f in$quoted; do rm -f \"$dst_dir/\$(basename \"\$f\")\"; done
-cp$quoted \"$dst_dir\"/
+d=$qdst
+mkdir -p \"\$d\"
+for f in$quoted; do rm -f \"\$d/\$(basename \"\$f\")\"; done
+cp$quoted \"\$d\"/
 for f in$quoted; do
-    printf 'DIGEST %s\n' \"\$(sha256sum \"$dst_dir/\$(basename \"\$f\")\" | cut -d' ' -f1)\"
+    printf 'DIGEST %s\n' \"\$(sha256sum \"\$d/\$(basename \"\$f\")\" | cut -d' ' -f1)\"
 done" 2>&1); then
         echo "ERROR: vm_cp_verified: copying into $dst_dir inside '$VM_NAME' failed." >&2
         if [ -n "$out" ]; then printf '       %s\n' "$out" >&2; fi

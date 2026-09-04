@@ -62,7 +62,10 @@ need_backend() {
         endpoint="$DOCKER_HOST"
         src_desc="DOCKER_HOST"
     else
-        endpoint=$(docker context inspect --format '{{.Endpoints.docker.Host}}' 2>/dev/null)
+        # `|| endpoint=""` rather than a bare assignment: need_backend is called
+        # from scripts that run under errexit, where a failing docker query would
+        # exit right here and the tailored diagnostic below would never print.
+        endpoint=$(docker context inspect --format '{{.Endpoints.docker.Host}}' 2>/dev/null) || endpoint=""
         src_desc="the active docker context"
         if [ -z "$endpoint" ]; then
             echo "ERROR: could not determine the effective Docker endpoint." >&2
@@ -84,7 +87,7 @@ need_backend() {
     esac
 
     local arch sec
-    arch=$(docker info --format '{{.Architecture}}' 2>/dev/null)
+    arch=$(docker info --format '{{.Architecture}}' 2>/dev/null) || arch=""
     case "$arch" in
         x86_64|amd64) ;;
         *)
@@ -95,7 +98,18 @@ need_backend() {
             ;;
     esac
 
-    sec=$(docker info --format '{{.SecurityOptions}}' 2>/dev/null)
+    # An empty answer is not "not rootless". A failed query has to refuse, or the
+    # one check standing between a rootless daemon and a baseline that cannot
+    # possibly work passes by default. Docker prints at least one option here on
+    # any daemon this harness can use.
+    sec=$(docker info --format '{{.SecurityOptions}}' 2>/dev/null) || sec=""
+    if [ -z "$sec" ]; then
+        echo "ERROR: could not read the daemon's security options, so whether it is" >&2
+        echo "       ROOTLESS cannot be determined. The S1 baseline needs a real loop" >&2
+        echo "       device, an XFS mount and a nested dockerd, none of which rootless" >&2
+        echo "       Docker provides. Refusing rather than assuming." >&2
+        exit 1
+    fi
     case "$sec" in
         *rootless*)
             echo "ERROR: this is a ROOTLESS Docker daemon." >&2
@@ -164,7 +178,9 @@ _vm_verify_repo_mount() {
         echo "       repo bind mount cannot be verified." >&2
         return 1
     fi
-    got=$(docker exec "$VM_NAME" sha256sum "$sentinel" 2>/dev/null | cut -d' ' -f1)
+    # Same reason as above, plus pipefail: under an errexit caller a failed
+    # `docker exec` would end the run before the explanation below is printed.
+    got=$(docker exec "$VM_NAME" sha256sum "$sentinel" 2>/dev/null | cut -d' ' -f1) || got=""
     if [ -z "$got" ]; then
         echo "ERROR: the repo is not visible inside '$VM_NAME' at $HARNESS_REPO_DIR." >&2
         echo "       The bind mount did not resolve, so the daemon is not looking at" >&2

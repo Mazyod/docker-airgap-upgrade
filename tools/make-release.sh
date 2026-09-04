@@ -76,19 +76,31 @@ gh auth status >/dev/null 2>&1 || die "gh is not authenticated (gh auth login)"
 require_vm
 echo "  backend: $HARNESS_BACKEND"
 
-[ -n "$(git status --porcelain)" ] && die "working tree is dirty -- commit or stash first"
+# Every git question below is asked with its STATUS checked. There is no
+# errexit in this script, so `X=$(git ...)` swallows a failure and hands the
+# next line an empty string -- and every one of these preflight questions reads
+# an empty answer as permission to proceed: no output from `git status` looks
+# like a clean tree, and a `git rev-list` that cannot resolve the remote looks
+# like nothing to push.
+DIRTY=$(git status --porcelain) || die "git status failed -- cannot tell whether the tree is clean"
+[ -n "$DIRTY" ] && die "working tree is dirty -- commit or stash first"
 
-BRANCH=$(git rev-parse --abbrev-ref HEAD)
+BRANCH=$(git rev-parse --abbrev-ref HEAD) || die "could not determine the current branch"
+[ -n "$BRANCH" ] || die "git reported an empty branch name"
 [ "$BRANCH" = "main" ] || echo "${YELLOW}WARNING${NC}: releasing from '$BRANCH', not main"
 
-git fetch origin >/dev/null 2>&1
-AHEAD=$(git rev-list --count origin/"$BRANCH".."$BRANCH" 2>/dev/null || echo 0)
+git fetch origin >/dev/null 2>&1 || die "git fetch origin failed -- cannot check for unpushed commits"
+git rev-parse --verify "origin/$BRANCH" >/dev/null 2>&1 \
+    || die "origin/$BRANCH does not exist -- push the branch before releasing"
+AHEAD=$(git rev-list --count "origin/$BRANCH..$BRANCH") \
+    || die "could not count commits ahead of origin/$BRANCH"
 [ "$AHEAD" != "0" ] && die "$AHEAD local commit(s) not pushed -- push before releasing"
 
 git rev-parse "$TAG" >/dev/null 2>&1 && die "tag $TAG already exists locally"
 gh release view "$TAG" >/dev/null 2>&1 && die "release $TAG already exists on GitHub"
 
-COMMIT=$(git rev-parse HEAD)
+COMMIT=$(git rev-parse HEAD) || die "could not resolve HEAD"
+[ -n "$COMMIT" ] || die "git reported an empty commit id"
 echo "  branch:  $BRANCH"
 echo "  commit:  ${COMMIT:0:12}"
 echo "  tag:     $TAG"
@@ -157,6 +169,12 @@ echo "  $(du -h "$OUT_BUNDLE" | cut -f1)  sha256 ${HOST_SHA:0:16}...  (verified 
 #############################################
 step "Composing release notes"
 #############################################
+# Read the provenance BEFORE the notes are composed, so a failed query dies here
+# rather than publishing a release whose "Bundle built on" row is blank.
+BUILD_HOST=$(vm 'cat /etc/os-release | sed -n "s/^PRETTY_NAME=\"\(.*\)\"/\1/p"' | tr -d '\r\n') \
+    || die "could not read the guest's OS name for the provenance table"
+[ -n "$BUILD_HOST" ] || die "the guest returned an empty OS name"
+
 {
     echo "Complete air-gapped upgrade package for Docker Engine on RHEL 8/9."
     echo ""
@@ -185,7 +203,7 @@ step "Composing release notes"
     echo "|---|---|"
     echo "| Commit | \`$COMMIT\` |"
     echo "| Built from | \`$BRANCH\` |"
-    echo "| Bundle built on | $(vm 'cat /etc/os-release | sed -n "s/^PRETTY_NAME=\"\(.*\)\"/\1/p"' | tr -d '\r\n') |"
+    echo "| Bundle built on | $BUILD_HOST |"
     echo ""
     if [ -f docs/TEST-PLAN.md ]; then
         echo "## Testing"

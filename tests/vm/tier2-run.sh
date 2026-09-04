@@ -53,6 +53,10 @@ PRISTINE="/root/pristine-docker-offline"
 ensure_pristine() {
     if ! vm "set -e
 want=\$(sha256sum /opt/docker-upgrade-bundle.tar.gz | cut -d' ' -f1)
+# The guest has errexit but not pipefail, so a failed sha256sum still leaves cut
+# exiting 0 and want empty. An empty key would be WRITTEN as the cache key and
+# then match the next empty one, so a rebuilt bundle would never invalidate it.
+[ -n \"\$want\" ] || { echo 'could not checksum the bundle' >&2; exit 1; }
 have=\$(cat $PRISTINE.sha256 2>/dev/null || echo none)
 if [ \"\$want\" != \"\$have\" ] || [ ! -d $PRISTINE ]; then
     rm -rf $PRISTINE $PRISTINE.tmp $PRISTINE.sha256
@@ -408,6 +412,7 @@ head_ "2.6b  Already-at-target gate: every target version, the WRONG containerd 
 # package. docs/TEST-PLAN.md describes reaching this state by running a -1
 # bundle with the guard disabled; downgrading in place reaches the same state
 # without ever running a mutant.
+SETUP_2_6B=ok
 if ! vm "set -e
 rm -rf /root/wrongct && mkdir -p /root/wrongct
 dnf download -q --destdir=/root/wrongct containerd.io-$TARGET_CONTAINERD-$WRONG_CONTAINERD_RELEASE.el9 >/dev/null 2>&1
@@ -419,51 +424,65 @@ for i in \$(seq 1 30); do ctr version >/dev/null 2>&1 && break; sleep 2; done
 systemctl start docker
 sleep 3" >/dev/null 2>&1; then
     bad "2.6b could not stage the wrong containerd build -- case is vacuous"
+    SETUP_2_6B=failed
 fi
 
-# The precondition, asserted rather than assumed. If the downgrade did not take,
-# everything below passes for the wrong reason.
-assert_vm_eq "2.6b setup: node is on the wrong build $TARGET_CONTAINERD-$WRONG_CONTAINERD_RELEASE.el9" \
-    "rpm -q containerd.io --queryformat '%{VERSION}-%{RELEASE}'" \
-    "$TARGET_CONTAINERD-$WRONG_CONTAINERD_RELEASE.el9"
-assert_vm_eq "2.6b setup: docker-ce is still at the target $TARGET_DOCKER" \
-    "rpm -q docker-ce --queryformat '%{VERSION}'" "$TARGET_DOCKER"
-assert_vm_eq "2.6b setup: runc is the wrong build's $WRONG_RUNC" \
-    "runc --version 2>/dev/null | head -1 | awk '{print \$3}'" "$WRONG_RUNC"
+# The precondition, asserted rather than assumed, and it GATES the case. A setup
+# that half-applied -- the downgrade done, containerd not restarted -- would
+# otherwise let the assertions below run against a node in an unknown state and
+# report on a scenario that never existed. This script has no errexit, so the
+# gate has to be explicit.
+if [ "$SETUP_2_6B" = ok ]; then
+    assert_vm_eq "2.6b setup: node is on the wrong build $TARGET_CONTAINERD-$WRONG_CONTAINERD_RELEASE.el9" \
+        "rpm -q containerd.io --queryformat '%{VERSION}-%{RELEASE}'" \
+        "$TARGET_CONTAINERD-$WRONG_CONTAINERD_RELEASE.el9"
+    assert_vm_eq "2.6b setup: docker-ce is still at the target $TARGET_DOCKER" \
+        "rpm -q docker-ce --queryformat '%{VERSION}'" "$TARGET_DOCKER"
+    assert_vm_eq "2.6b setup: runc is the wrong build's $WRONG_RUNC" \
+        "runc --version 2>/dev/null | head -1 | awk '{print \$3}'" "$WRONG_RUNC"
+else
+    skip "2.6b assertions (setup failed -- see above)"
+fi
 
+# The corrective run happens either way: it is what returns the node to the
+# target build, and the rollback section below starts from there.
 restore_pkgs
 out=$(run_upgrade)
 
-if printf '%s' "$out" | grep -q "already fully at the target versions"; then
+if [ "$SETUP_2_6B" != ok ]; then
+    skip "2.6b result assertions (setup failed -- the node was not on the wrong build)"
+elif printf '%s' "$out" | grep -q "already fully at the target versions"; then
     bad "2.6b the gate called a node on $TARGET_CONTAINERD-$WRONG_CONTAINERD_RELEASE.el9 already-at-target"
     printf '%s\n' "$out" | tail -8 | sed 's/^/       /'
 else
     ok "2.6b the already-at-target gate does not accept the wrong containerd build"
 fi
-if printf '%s' "$out" | grep -q "UPGRADE COMPLETE"; then
-    ok "2.6b the run completed rather than exiting with nothing to do"
-else
-    bad "2.6b the run did not complete"
-    printf '%s\n' "$out" | tail -20 | sed 's/^/       /'
-fi
-if printf '%s' "$out" | grep -q "containerd.io release $TARGET_CONTAINERD_RELEASE.el9"; then
-    ok "2.6b phase 9 reported the installed containerd.io release"
-else
-    bad "2.6b phase 9 did not report the installed containerd.io release"
-fi
+if [ "$SETUP_2_6B" = ok ]; then
+    if printf '%s' "$out" | grep -q "UPGRADE COMPLETE"; then
+        ok "2.6b the run completed rather than exiting with nothing to do"
+    else
+        bad "2.6b the run did not complete"
+        printf '%s\n' "$out" | tail -20 | sed 's/^/       /'
+    fi
+    if printf '%s' "$out" | grep -q "containerd.io release $TARGET_CONTAINERD_RELEASE.el9"; then
+        ok "2.6b phase 9 reported the installed containerd.io release"
+    else
+        bad "2.6b phase 9 did not report the installed containerd.io release"
+    fi
 
-# STATE, not the exit code -- a node the gate waved through and a node that was
-# upgraded can both exit 0. Only these tell them apart.
-assert_vm_eq "2.6b: containerd.io is now $TARGET_CONTAINERD-$TARGET_CONTAINERD_RELEASE.el9" \
-    "rpm -q containerd.io --queryformat '%{VERSION}-%{RELEASE}'" \
-    "$TARGET_CONTAINERD-$TARGET_CONTAINERD_RELEASE.el9"
-assert_vm_eq "2.6b: runc is now $TARGET_RUNC, not $WRONG_RUNC" \
-    "runc --version 2>/dev/null | head -1 | awk '{print \$3}'" "$TARGET_RUNC"
-assert_vm_eq "2.6b: docker active after the corrective run" "systemctl is-active docker" "active"
-assert_vm_eq "2.6b: containerd active after the corrective run" "systemctl is-active containerd" "active"
-assert_vm_eq "2.6b: canary data on the relocated root intact" \
-    "docker start survivor >/dev/null 2>&1; docker exec survivor cat /data/canary.txt" \
-    "VOLUME-CANARY-DATA"
+    # STATE, not the exit code -- a node the gate waved through and a node that
+    # was upgraded can both exit 0. Only these tell them apart.
+    assert_vm_eq "2.6b: containerd.io is now $TARGET_CONTAINERD-$TARGET_CONTAINERD_RELEASE.el9" \
+        "rpm -q containerd.io --queryformat '%{VERSION}-%{RELEASE}'" \
+        "$TARGET_CONTAINERD-$TARGET_CONTAINERD_RELEASE.el9"
+    assert_vm_eq "2.6b: runc is now $TARGET_RUNC, not $WRONG_RUNC" \
+        "runc --version 2>/dev/null | head -1 | awk '{print \$3}'" "$TARGET_RUNC"
+    assert_vm_eq "2.6b: docker active after the corrective run" "systemctl is-active docker" "active"
+    assert_vm_eq "2.6b: containerd active after the corrective run" "systemctl is-active containerd" "active"
+    assert_vm_eq "2.6b: canary data on the relocated root intact" \
+        "docker start survivor >/dev/null 2>&1; docker exec survivor cat /data/canary.txt" \
+        "VOLUME-CANARY-DATA"
+fi
 fi
 
 #############################################

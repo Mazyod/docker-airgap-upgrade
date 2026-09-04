@@ -143,8 +143,14 @@ for spec in "${WANT_PKGS[@]}"; do
         rpm_name=$(pkg_rpm_name "$spec" "$major")
         # Escape the dots: an unescaped version string is a regex matching more
         # than it should, and a check that over-matches fails open.
+        #
+        # Strip comments and require the filename to END where it should. An
+        # unanchored search of the whole file is satisfied by a mention in a
+        # comment, or by a longer token like `...x86_64.rpm.disabled`, while the
+        # live download loop names something else entirely.
         rpm_re=$(printf '%s' "$rpm_name" | sed 's/\./\\./g')
-        if grep -q "$rpm_re" download-docker-packages.sh; then
+        if grep -vE '^[[:space:]]*#' download-docker-packages.sh \
+            | grep -qE "$rpm_re([[:space:]]|\"|'|\\\\|$)"; then
             ok "download loop has $rpm_name"
         else
             bad "download loop MISSING $rpm_name"
@@ -254,8 +260,10 @@ fi
 # shellcheck disable=SC2016  # the literal text "$INSTALLED_CT_REL" IS the pattern
 ct9_line=$(grep -n 'containerd_release_matches "$INSTALLED_CT_REL"' upgrade-docker.sh \
     | head -1 | cut -d: -f1)
+# Anchored to a whole-line ASSIGNMENT, not the bare text: `echo VERIFY_FAILED=1`
+# contains the string and sets nothing.
 if [ -n "$ct9_line" ] && sed -n "${ct9_line},$((ct9_line + 8))p" upgrade-docker.sh \
-    | grep -vE '^\s*#' | grep -q 'VERIFY_FAILED=1'; then
+    | grep -qE '^[[:space:]]*VERIFY_FAILED=1[[:space:]]*$'; then
     ok "upgrade-docker.sh phase 9 fails the run when the installed containerd.io release is wrong"
 else
     bad "upgrade-docker.sh phase 9 checks the installed containerd.io release but does not set VERIFY_FAILED"
@@ -367,8 +375,14 @@ for spec in "TARGET_DOCKER:$WANT_DOCKER" \
             "TARGET_CONTAINERD_RELEASE:$WANT_CONTAINERD_RELEASE"; do
     const="${spec%%:*}"
     want="${spec#*:}"
+    # Count first. grep -m1 reads the FIRST declaration; bash uses the LAST, so a
+    # second assignment further down would hand the harness a value Tier 1 never
+    # looked at -- consistently, across the release title and every case.
+    decls=$(grep -cE "^$const=\"" tests/vm/lib.sh || true)
     got=$(grep -m1 "^$const=\"" tests/vm/lib.sh | sed "s/^$const=\"\(.*\)\".*/\1/")
-    if [ -z "$got" ]; then
+    if [ "$decls" -ne 1 ]; then
+        bad "tests/vm/lib.sh declares $const $decls times (want exactly 1)"
+    elif [ -z "$got" ]; then
         bad "tests/vm/lib.sh has no $const constant"
     elif [ "$got" != "$want" ]; then
         bad "tests/vm/lib.sh $const is '$got', want '$want'"

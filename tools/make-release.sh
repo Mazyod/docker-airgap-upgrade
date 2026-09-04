@@ -29,6 +29,19 @@ RED=$'\033[0;31m'; GREEN=$'\033[0;32m'; YELLOW=$'\033[1;33m'; NC=$'\033[0m'
 die() { echo "${RED}ERROR${NC}: $*" >&2; exit 1; }
 step() { printf '\n%s==>%s %s\n' "$GREEN" "$NC" "$1"; }
 
+# SHA-256 of a file, on either host. Stock macOS has `shasum` but no
+# `sha256sum`; most Linux distributions have `sha256sum` but not `shasum`.
+# Print only the digest, so callers do not have to cut it out.
+sha256_of() {
+    if command -v sha256sum >/dev/null 2>&1; then
+        sha256sum "$1" | cut -d' ' -f1
+    elif command -v shasum >/dev/null 2>&1; then
+        shasum -a 256 "$1" | cut -d' ' -f1
+    else
+        die "neither sha256sum nor shasum is available -- cannot verify the artifact"
+    fi
+}
+
 TAG="${1:-}"
 [ -z "$TAG" ] && die "usage: tools/make-release.sh <tag> [--draft] [--reuse-bundle]"
 shift
@@ -118,7 +131,7 @@ vm "cat $BUNDLE_VM" > "$OUT_BUNDLE" || die "failed to copy the bundle out"
 [ -s "$OUT_BUNDLE" ] || die "copied bundle is empty"
 
 VM_SHA=$(vm "sha256sum $BUNDLE_VM | cut -d' ' -f1" | tr -d '\r\n')
-HOST_SHA=$(sha256sum "$OUT_BUNDLE" | cut -d' ' -f1)
+HOST_SHA=$(sha256_of "$OUT_BUNDLE")
 [ "$VM_SHA" = "$HOST_SHA" ] || die "checksum mismatch after copy (VM=$VM_SHA host=$HOST_SHA)"
 echo "  $(du -h "$OUT_BUNDLE" | cut -f1)  sha256 ${HOST_SHA:0:16}...  (verified end to end)"
 

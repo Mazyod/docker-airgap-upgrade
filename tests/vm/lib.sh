@@ -168,8 +168,25 @@ RequiresMountsFor=$RELOCATED_ROOT
 DROPIN_EOF
 
 systemctl daemon-reload
-systemctl enable data.mount >/dev/null 2>&1 || true
-findmnt -n -o TARGET /data >/dev/null 2>&1 || systemctl start data.mount
+systemctl enable data.mount
+
+# Is /data an actual MOUNT POINT? findmnt with a bare path (no --target)
+# matches an exact mountpoint or source and exits 1 when there is none. The
+# --target form walks up instead and would report the containing filesystem,
+# which is NOT what is wanted here. Compare the output explicitly rather than
+# relying on the exit status, so the intent cannot be misread.
+# (No backticks in this comment: it lives inside a double-quoted host string,
+#  where backticks would be command substitution.)
+if [ \"\$(findmnt -n -o TARGET /data 2>/dev/null)\" != /data ]; then
+    systemctl start data.mount
+fi
+
+# Do not assume the start worked.
+if ! systemctl is-active --quiet data.mount; then
+    echo 'ERROR: data.mount did not become active. systemctl status:' >&2
+    systemctl status data.mount --no-pager -l >&2 || true
+    exit 1
+fi
 mkdir -p $RELOCATED_ROOT"
 }
 
@@ -178,20 +195,48 @@ mkdir -p $RELOCATED_ROOT"
 # If it is not, everything downstream is theatre -- the canary data gets written
 # to a shadow directory on the guest's own root filesystem and the whole S1
 # premise is a lie. Refuse rather than produce a green run built on it.
+# FSTYPE alone is not enough. An XFS filesystem mounted somewhere other than
+# /data, or one backed by something that is not the harness's loopback image, is
+# a different baseline than the one every downstream assertion assumes. Check
+# five facts and name the ones that failed.
+#
+# On is-active vs is-enabled, measured rather than assumed: systemd ADOPTS any
+# mount at /data into data.mount, so `is-active` reports `active` for a
+# hand-made `mount -o loop` -- and keeps reporting it even with the unit file
+# deleted. It therefore proves only "something is mounted there", and is kept
+# for the case where the unit is `failed` with a stale mount underneath.
+# `is-enabled` is the one that carries weight: it is what makes the mount come
+# back after a restart, and a hand mount does not satisfy it. (The other half of
+# restart survival, containerd.service's RequiresMountsFor drop-in, is asserted
+# by preflight-host.sh.)
 require_relocated_xfs() {
-    local fs src
-    fs=$(vm_try "findmnt -n -o FSTYPE --target $RELOCATED_ROOT 2>/dev/null" | tr -d '\r' | tail -1)
-    src=$(vm_try "findmnt -n -o SOURCE --target $RELOCATED_ROOT 2>/dev/null" | tr -d '\r' | tail -1)
-    if [ "$fs" != "xfs" ]; then
+    local tgt fs src active enabled fail=""
+    tgt=$(vm_try     "findmnt -n -o TARGET --target $RELOCATED_ROOT 2>/dev/null" | tr -d '\r' | tail -1)
+    fs=$(vm_try      "findmnt -n -o FSTYPE --target $RELOCATED_ROOT 2>/dev/null" | tr -d '\r' | tail -1)
+    src=$(vm_try     "findmnt -n -o SOURCE --target $RELOCATED_ROOT 2>/dev/null" | tr -d '\r' | tail -1)
+    active=$(vm_try  "systemctl is-active data.mount 2>/dev/null"  | tr -d '\r' | tail -1)
+    enabled=$(vm_try "systemctl is-enabled data.mount 2>/dev/null" | tr -d '\r' | tail -1)
+
+    [ "$tgt" = "/data" ]      || fail="$fail\n       mount point is '${tgt:-<none>}', want /data"
+    [ "$fs" = "xfs" ]         || fail="$fail\n       filesystem is '${fs:-<none>}', want xfs"
+    case "$src" in
+        /dev/loop*) ;;
+        *) fail="$fail\n       source is '${src:-<none>}', want a /dev/loop* device" ;;
+    esac
+    [ "$active" = "active" ]   || fail="$fail\n       data.mount is '${active:-<none>}', want active"
+    [ "$enabled" = "enabled" ] || fail="$fail\n       data.mount is '${enabled:-<none>}', want enabled -- the mount would NOT survive a restart"
+
+    if [ -n "$fail" ]; then
         echo "" >&2
-        echo "${RED}ERROR${NC}: $RELOCATED_ROOT is on '${fs:-<unknown>}' (source '${src:-<unknown>}'), not xfs." >&2
-        echo "       The S1 baseline REQUIRES a separate XFS filesystem there. Without it," >&2
-        echo "       containerd is running on a shadow directory and every relocated-root" >&2
-        echo "       assertion is meaningless." >&2
+        echo "${RED}ERROR${NC}: $RELOCATED_ROOT is not on the harness's separate XFS filesystem." >&2
+        # shellcheck disable=SC2059  # $fail carries the \n separators deliberately
+        printf "$fail\n" >&2
+        echo "       The S1 baseline REQUIRES it. Without it, containerd is running on a" >&2
+        echo "       shadow directory and every relocated-root assertion is meaningless." >&2
         echo "       Fix:  tests/vm/reset-baseline.sh   (or bootstrap-vm.sh --recreate)" >&2
         exit 1
     fi
-    echo "  relocated root: $RELOCATED_ROOT on $src ($fs)"
+    echo "  relocated root: $RELOCATED_ROOT on $src ($fs at $tgt; data.mount $active, $enabled)"
 }
 
 # Stage the in-guest manifest writer, and VERIFY it landed.
@@ -202,12 +247,29 @@ require_relocated_xfs() {
 # an absolute /tmp/... destination is silently discarded while it still exits 0.
 # That is why the landed-file check below exists rather than a status check.
 stage_manifest_writer() {
-    vm "cp \"$HARNESS_LIB_DIR/vm-write-manifest.sh\" /tmp/vm-write-manifest.sh" >/dev/null 2>&1 || true
-    if ! vm "test -f /tmp/vm-write-manifest.sh" >/dev/null 2>&1; then
+    local src="$HARNESS_LIB_DIR/vm-write-manifest.sh"
+    local dst="/tmp/vm-write-manifest.sh"
+    local out
+
+    # Remove the destination FIRST. Otherwise a failed copy leaves whatever a
+    # previous run put there, and every check below passes against a stale file.
+    if ! out=$(vm "rm -f $dst && cp \"$src\" $dst && chmod +x $dst" 2>&1); then
         echo "ERROR: could not stage vm-write-manifest.sh into the VM." >&2
+        echo "       $src -> $dst" >&2
+        [ -n "$out" ] && printf '       %s\n' "$out" >&2
         exit 1
     fi
-    vm "chmod +x /tmp/vm-write-manifest.sh" >/dev/null 2>&1
+
+    # Content, not just existence: both backends reach the file through a mount
+    # of the repo, and a partial or shadowed copy would exit 0.
+    local want got
+    want=$(vm_try "sha256sum \"$src\" | cut -d' ' -f1" | tr -d '\r' | tail -1)
+    got=$(vm_try  "sha256sum $dst | cut -d' ' -f1"      | tr -d '\r' | tail -1)
+    if [ -z "$want" ] || [ "$want" != "$got" ]; then
+        echo "ERROR: staged vm-write-manifest.sh does not match the source." >&2
+        echo "       source ${want:-<unreadable>} != staged ${got:-<unreadable>}" >&2
+        exit 1
+    fi
 }
 
 # Assert a command in the VM prints exactly the expected string.

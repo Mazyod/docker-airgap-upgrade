@@ -2,7 +2,7 @@
 # tests/static-checks.sh
 # Tier 1 of docs/TEST-PLAN.md -- everything checkable without a RHEL box.
 #
-# Runs on the macOS dev machine. Proves syntax, lint, internal consistency, and
+# Runs anywhere bash and shellcheck do. Proves syntax, lint, internal consistency, and
 # (with --online) that every pinned package exists upstream.
 #
 # This does NOT execute any upgrade logic. Passing this does not authorize a

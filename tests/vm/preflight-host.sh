@@ -60,32 +60,46 @@ fi
 
 assert_vm_eq "data.mount is active" "systemctl is-active data.mount" "active"
 
+# From here on, containerd being absent or down is a DEFECT, not a skip.
+# bootstrap-vm.sh installs it, enables it and starts it before this script
+# runs, and this script's whole purpose is to prove the restart did not break
+# that. A skip here would silently pass on the exact regression being hunted.
+
 # The ordering, not just the end state: containerd must depend on the mount.
-# Distinguish "containerd is not installed yet", which is a legitimate skip,
-# from "containerd is installed and has no such dependency", which is the
-# defect -- both look the same if you only grep the property.
-if vm_try "systemctl cat containerd >/dev/null 2>&1; echo \$?" | tr -d '\r' | tail -1 | grep -qx 0; then
-    if vm_try "systemctl show containerd -p RequiresMountsFor" | tr -d '\r' | grep -q "$RELOCATED_ROOT"; then
-        ok "containerd.service requires the $RELOCATED_ROOT mount"
-    else
-        bad "containerd.service has NO RequiresMountsFor=$RELOCATED_ROOT -- nothing orders the mount before it"
-    fi
+if ! vm_try "systemctl cat containerd >/dev/null 2>&1; echo \$?" | tr -d '\r' | tail -1 | grep -qx 0; then
+    bad "containerd.service is not installed -- the baseline is incomplete"
+elif vm_try "systemctl show containerd -p RequiresMountsFor" | tr -d '\r' | grep -q "$RELOCATED_ROOT"; then
+    ok "containerd.service requires the $RELOCATED_ROOT mount"
 else
-    skip "containerd.service is not installed yet (no RequiresMountsFor to check)"
+    bad "containerd.service has NO RequiresMountsFor=$RELOCATED_ROOT -- nothing orders the mount before it"
 fi
 
 # containerd must be usable, and it must be usable ON the relocated root.
 if vm_try "systemctl is-active containerd" | tr -d '\r' | tail -1 | grep -qx active; then
     ok "containerd is active after restart"
-    snaps=$(vm_try "ls -A $RELOCATED_ROOT/io.containerd.snapshotter.v1.overlayfs/snapshots 2>/dev/null | wc -l" | tr -d '\r' | tail -1)
-    shadow=$(vm_try "ls -A /var/lib/containerd/io.containerd.snapshotter.v1.overlayfs/snapshots 2>/dev/null | wc -l" | tr -d '\r' | tail -1)
-    if [ "${snaps:-0}" -gt 0 ]; then
-        ok "snapshots are on the relocated root (${snaps}), not a shadow copy (/var/lib/containerd: ${shadow:-0})"
-    else
-        bad "relocated root has NO snapshots after restart -- containerd is on another root"
-    fi
 else
-    skip "containerd is not running yet (nothing to check on the relocated root)"
+    bad "containerd is not active after restart"
+fi
+
+# containerd's own view of the effective root, as its parser resolves it --
+# including the in-memory v3 -> v4 migration -- rather than a grep of the TOML.
+# This is the same assertion config-version-check.sh's B7 makes. A snapshot
+# count alone would not catch a root that parsed to the wrong path.
+assert_vm_eq "containerd's LIVE root is still $RELOCATED_ROOT" \
+    "containerd config dump 2>/dev/null | awk '/^[[:space:]]*\\[/ { exit } { print }' | sed -n \"s/^[[:space:]]*root[[:space:]]*=[[:space:]]*['\\\"]\\{0,1\\}\\([^'\\\"]*\\)['\\\"]\\{0,1\\}.*/\\1/p\" | head -1" \
+    "$RELOCATED_ROOT"
+
+# systemd reports containerd active before its snapshotter is usable, so
+# exercise the snapshotter rather than trusting the unit state.
+assert_vm_ok "ctr responds and the overlayfs snapshotter is usable after restart" \
+    "ctr version && ctr snapshots --snapshotter overlayfs ls"
+
+snaps=$(vm_try "ls -A $RELOCATED_ROOT/io.containerd.snapshotter.v1.overlayfs/snapshots 2>/dev/null | wc -l" | tr -d '\r' | tail -1)
+shadow=$(vm_try "ls -A /var/lib/containerd/io.containerd.snapshotter.v1.overlayfs/snapshots 2>/dev/null | wc -l" | tr -d '\r' | tail -1)
+if [ "${snaps:-0}" -gt 0 ]; then
+    ok "snapshots are on the relocated root (${snaps}), not a shadow copy (/var/lib/containerd: ${shadow:-0})"
+else
+    bad "relocated root has NO snapshots after restart -- containerd is on another root"
 fi
 
 # Bring the canary container back up: nothing inside the guest restarts it, and

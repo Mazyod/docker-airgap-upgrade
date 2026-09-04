@@ -14,11 +14,23 @@ Either host works:
 | Backend | Host | Guest |
 |---|---|---|
 | `orb` | **macOS + [OrbStack](https://orbstack.dev)** (`brew install orbstack`) | an OrbStack Linux machine, x86_64 via Rosetta on Apple Silicon |
-| `docker` | **Linux + a reachable Docker daemon** (no sudo, no KVM) | a privileged Rocky 9 systemd container, built from `Dockerfile.rocky9-systemd` |
+| `docker` | **Linux + a local, rootful, x86_64 Docker daemon** (no sudo, no KVM) | a privileged Rocky 9 systemd container, built from `Dockerfile.rocky9-systemd` |
 
 `lib.sh` picks one automatically: OrbStack when `orbctl` is installed, otherwise a
 Docker daemon it can reach. Override with `HARNESS_BACKEND=orb` or
 `HARNESS_BACKEND=docker`. If neither is available it says so and names both.
+
+`need_backend` checks three properties of the Docker daemon rather than assuming them,
+because each one silently breaks the baseline rather than failing loudly:
+
+- **Local.** The repo reaches the guest as a bind mount of a host path. A remote
+  daemon (`DOCKER_HOST` pointing anywhere but a unix socket) would resolve that path on
+  the remote machine and mount the wrong tree, or nothing.
+- **Rootful.** The baseline needs a real loop device, a real XFS mount and a nested
+  dockerd. Rootless Docker provides none of them, even under `--privileged`.
+- **x86_64.** The bundle is el9 x86_64 RPMs. On another architecture the rpm
+  transaction — the thing under test — would fail for an unrelated reason. The image
+  build and the container are pinned with `--platform linux/amd64`.
 
 Everything above the backend is shared, because the backend contract is small. The
 **core is six operations** — `need_backend`, `vm_exists`, `vm`, `vm_try`, `vm_create`,
@@ -34,14 +46,24 @@ sitting in `bootstrap-vm.sh` and `teardown-vm.sh`, outside any helper.)
 the host:
 
 - **Loop devices come from the host's global table.** The relocated root's 3 GB image
-  is attached with a host loop device. `mount -o loop` sets autoclear so it is released
-  with the container, and `teardown-vm.sh` sweeps for strays anyway — but two harness
-  runs on one host contend for the same table. Check with `losetup -a` before and after.
+  is attached with a host loop device. `mount -o loop` and systemd's `Options=loop`
+  both set autoclear, so it is released with the container's mount namespace —
+  measured, not assumed. `teardown-vm.sh` **reports** any device still backed by the
+  harness image and never detaches one: a loop attached inside another mount namespace
+  looks idle from the host, so detaching on that evidence could pull a filesystem out
+  from under an unrelated container. Two harness runs on one host contend for the same
+  table. Check with `losetup -a` before and after.
 - **Mounting XFS autoloads the host kernel's `xfs` module**, and it stays loaded.
 
-The guest also runs on the **host's** kernel, not Rocky's. So does the OrbStack guest,
-which runs OrbStack's — this is a change in *which* wrong kernel you get, not a new
-category of gap.
+Neither backend gives you a RHEL kernel, but they miss it differently:
+
+- **`docker`** — the guest shares **this host's** kernel. On Ubuntu 26.04 that is
+  6.x/7.x, and there is no kernel boundary at all between guest and host.
+- **`orb`** — the guest runs OrbStack's **own Linux kernel** inside a lightweight VM.
+  It is a real, separate kernel with a real VM boundary; it is simply not Rocky's or
+  RHEL's, and not the one your nodes run.
+
+Either way, kernel-version-dependent overlayfs, XFS and cgroup behaviour is not RHEL's.
 
 ## The restart hazard, and how it is guarded
 
@@ -158,9 +180,9 @@ phase 0c would be guarding nothing and should be reconsidered, not kept.
 - **Bare metal.** OrbStack machines are lightweight VMs and the container backend is
   not a machine at all — no reboot semantics, no kernel command line, no initramfs,
   no udev, no real block devices. Neither is your hardware.
-- **A guest kernel.** Both backends run the guest on the *host's* kernel, so
-  kernel-version-dependent overlayfs, XFS and cgroup behaviour is the host's, not
-  RHEL's.
+- **A RHEL kernel.** The `docker` backend shares the host's kernel; the `orb` backend
+  runs OrbStack's own. Neither is Rocky's or RHEL's, so kernel-version-dependent
+  overlayfs, XFS and cgroup behaviour is not your nodes'.
 
 Tier 3 in `docs/TEST-PLAN.md` remains mandatory before a production rollout,
 particularly the mixed-version tests that authorize node-by-node rolling.
@@ -172,7 +194,8 @@ particularly the mixed-version tests that authorize node-by-node rolling.
 3. Re-run `bootstrap-vm.sh --recreate`.
 
 On the container backend, `--recreate` also deletes the named data volume holding the
-loopback image and sweeps any host loop device still backed by it.
+loopback image and the built image, verifies all three are gone, and reports any host
+loop device still backed by the image.
 
 If a future upgrade crosses a containerd **major** boundary again, the removed
 machinery (config migration, XFS ftype check, orphaned-network cleanup) is in git

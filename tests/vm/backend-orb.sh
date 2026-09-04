@@ -32,7 +32,17 @@ vm_create() {
     orbctl create -a "$VM_ARCH" "$VM_DISTRO:$VM_RELEASE" "$VM_NAME"
 }
 
-vm_delete() { orbctl delete -f "$VM_NAME"; }
+# Idempotent, and it does not claim success it has not verified. The loopback
+# image lives inside the machine, so deleting the machine takes it along; there
+# is no separate volume or image to clean up on this backend.
+vm_delete() {
+    orbctl delete -f "$VM_NAME" >/dev/null 2>&1 || true
+    if vm_exists; then
+        echo "ERROR: machine '$VM_NAME' still exists after orbctl delete." >&2
+        return 1
+    fi
+    return 0
+}
 
 # --- Beyond the six-function core (see lib.sh) --------------------------------
 
@@ -46,13 +56,20 @@ vm_wake() {
 # relocated-root mount survives a restart rather than assuming it.
 vm_restart() {
     orbctl restart "$VM_NAME" >/dev/null 2>&1 || return 1
-    local waited=0
+    # Only a SETTLED systemd counts. /run/systemd/system exists from very early
+    # in the boot, so testing for it would return while units are still
+    # starting -- including data.mount, which is the whole point of the check
+    # this waiter serves. `is-system-running` exits non-zero for `degraded`,
+    # which is normal for a guest with pruned units, so read the word.
+    local waited=0 state
     while [ "$waited" -lt 120 ]; do
-        vm "systemctl is-system-running" >/dev/null 2>&1 && return 0
-        # `degraded` exits non-zero but the machine is up; accept it.
-        vm "test -d /run/systemd/system" >/dev/null 2>&1 && return 0
+        state=$(vm_try "systemctl is-system-running" | tr -d '\r' | tail -1)
+        case "$state" in
+            running|degraded) return 0 ;;
+        esac
         sleep 2
         waited=$((waited + 2))
     done
+    echo "ERROR: systemd in '$VM_NAME' did not settle (last state: '${state:-none}')." >&2
     return 1
 }

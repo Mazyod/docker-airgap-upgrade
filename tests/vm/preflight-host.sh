@@ -61,8 +61,15 @@ fi
 assert_vm_eq "data.mount is active" "systemctl is-active data.mount" "active"
 
 # The ordering, not just the end state: containerd must depend on the mount.
-if vm_try "systemctl show containerd -p RequiresMountsFor" | tr -d '\r' | grep -q "$RELOCATED_ROOT"; then
-    ok "containerd.service requires the $RELOCATED_ROOT mount"
+# Distinguish "containerd is not installed yet", which is a legitimate skip,
+# from "containerd is installed and has no such dependency", which is the
+# defect -- both look the same if you only grep the property.
+if vm_try "systemctl cat containerd >/dev/null 2>&1; echo \$?" | tr -d '\r' | tail -1 | grep -qx 0; then
+    if vm_try "systemctl show containerd -p RequiresMountsFor" | tr -d '\r' | grep -q "$RELOCATED_ROOT"; then
+        ok "containerd.service requires the $RELOCATED_ROOT mount"
+    else
+        bad "containerd.service has NO RequiresMountsFor=$RELOCATED_ROOT -- nothing orders the mount before it"
+    fi
 else
     skip "containerd.service is not installed yet (no RequiresMountsFor to check)"
 fi

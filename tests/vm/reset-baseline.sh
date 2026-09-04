@@ -44,6 +44,12 @@ dnf downgrade -y -q --allowerasing \
 # guest restart -- see lib.sh's ensure_relocated_mount().
 ensure_relocated_mount
 
+# Refuse before containerd starts and before any canary data is written. A
+# reset onto a shadow directory would recreate the image, the container and the
+# volume in the wrong place and hand back a green run built on a lie -- and by
+# the time services are up, that damage is already done.
+require_relocated_xfs
+
 vm "set -e
 containerd config default > /etc/containerd/config.toml
 sed -i \"s|^root = .*|root = '$RELOCATED_ROOT'|\" /etc/containerd/config.toml
@@ -79,11 +85,6 @@ echo 'reset complete:'
 rpm -q docker-ce containerd.io | sed 's/^/  /'
 grep '^root' /etc/containerd/config.toml | sed 's/^/  /'
 echo \"  docker: \$(systemctl is-active docker)  containerd: \$(systemctl is-active containerd)\""
-
-# Refuse to declare S1 restored on anything but the separate XFS -- a reset
-# onto a shadow directory would rebuild the canary data in the wrong place and
-# hand back a green run built on a lie.
-require_relocated_xfs
 
 echo ""
 echo "=== Refreshing baseline manifest ==="

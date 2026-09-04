@@ -94,7 +94,7 @@ assert_untouched "2.7"
 
 # 2.8 -- corrupt RPM
 restore_pkgs
-vm "truncate -s -1M $PKG_DIR/containerd.io-$TARGET_CONTAINERD-1.el9.x86_64.rpm" >/dev/null 2>&1
+vm "truncate -s -1M $PKG_DIR/containerd.io-$TARGET_CONTAINERD-$TARGET_CONTAINERD_RELEASE.el9.x86_64.rpm" >/dev/null 2>&1
 out=$(run_upgrade)
 if printf '%s' "$out" | grep -qi "digest verification"; then
     ok "2.8 corrupt RPM rejected on digest"
@@ -107,8 +107,8 @@ assert_untouched "2.8"
 # 2.9 -- wrong release: REPLACE the el9 build with its el8 counterpart
 #        (adding it would trip the duplicate check first)
 restore_pkgs
-vm "rm -f $PKG_DIR/containerd.io-$TARGET_CONTAINERD-1.el9.x86_64.rpm
-    cp /opt/docker-offline/rhel8/containerd.io-$TARGET_CONTAINERD-1.el8.x86_64.rpm $PKG_DIR/" >/dev/null 2>&1
+vm "rm -f $PKG_DIR/containerd.io-$TARGET_CONTAINERD-$TARGET_CONTAINERD_RELEASE.el9.x86_64.rpm
+    cp /opt/docker-offline/rhel8/containerd.io-$TARGET_CONTAINERD-$TARGET_CONTAINERD_RELEASE.el8.x86_64.rpm $PKG_DIR/" >/dev/null 2>&1
 out=$(run_upgrade)
 if printf '%s' "$out" | grep -qi "is not el9"; then
     ok "2.9 wrong-release (el8 in rhel9 dir) rejected"

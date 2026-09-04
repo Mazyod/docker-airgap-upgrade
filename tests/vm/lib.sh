@@ -44,10 +44,18 @@ BASELINE_DOCKER="29.1.5"
 BASELINE_CONTAINERD="2.2.1"
 BASELINE_BUILDX="0.30.1"
 BASELINE_COMPOSE="5.0.1"
-TARGET_DOCKER="29.7.2"
-TARGET_CONTAINERD="2.3.3"
-TARGET_BUILDX="0.36.1"
-TARGET_COMPOSE="5.5.0"
+TARGET_DOCKER="29.8.0"
+TARGET_CONTAINERD="2.3.4"
+TARGET_BUILDX="0.37.0"
+TARGET_COMPOSE="5.5.1"
+
+# The containerd.io RPM RELEASE suffix. Everything else in the bundle is -1, so
+# this used to be safe to hard-code at the call sites -- it is not any more.
+# containerd.io 2.3.4 exists as -1 and -2 with the same %{VERSION}, differing
+# only in the runc they carry (1.4.3 vs 1.5.1). Harness cases that build a
+# containerd RPM path by hand must use this, or they name a file the bundle does
+# not contain and fail for a reason unrelated to what they test.
+TARGET_CONTAINERD_RELEASE="2"
 
 # Where the relocated containerd root lives, and the loopback image backing it.
 # A backend may override LOOP_IMG -- the container backend keeps the 3 GB image

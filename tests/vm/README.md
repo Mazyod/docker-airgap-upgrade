@@ -158,9 +158,9 @@ and `daemon.json` survive byte-identically; images, containers and volume data
 survive; rollback returns the node to 29.1.5 with data intact.
 
 `config-version-check.sh` additionally proves, by measurement rather than by reading
-release notes: that containerd 2.3.3 loads a `version = 3` config and leaves the file
+release notes: that containerd 2.3.4 loads a `version = 3` config and leaves the file
 byte-identical; that the relocated root survives the in-memory migration; that
-`containerd config default` under 2.3.3 emits v4 while `containerd config migrate`
+`containerd config default` under 2.3.4 emits v4 while `containerd config migrate`
 writes only to stdout; that containerd 2.2.1 genuinely refuses a v4 config; and that
 `rollback-docker.sh` phase 0c catches that case with the node still running. Its
 section E is a negative control — if containerd 2.2.1 ever started on a v4 config,

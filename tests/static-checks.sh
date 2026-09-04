@@ -41,12 +41,20 @@ SCRIPTS=(
 )
 
 # Target versions, kept here so a retarget that forgets a file gets caught.
-WANT_DOCKER="29.7.2"
-WANT_CONTAINERD="2.3.3"
-WANT_BUILDX="0.36.1"
-WANT_COMPOSE="5.5.0"
+WANT_DOCKER="29.8.0"
+WANT_CONTAINERD="2.3.4"
+WANT_BUILDX="0.37.0"
+WANT_COMPOSE="5.5.1"
 WANT_ROLLBACK_DOCKER="29.1.5"
 WANT_ROLLBACK_CONTAINERD="2.2.1"
+
+# The containerd.io RPM RELEASE suffix, which is load-bearing for the first
+# time. containerd.io 2.3.4 ships as both -1 and -2: identical file lists,
+# identical Requires, identical %{VERSION}, and a DIFFERENT /usr/bin/runc
+# (1.4.3 in -1, 1.5.1 in -2). A version-only assertion cannot tell them apart,
+# so upgrade-docker.sh asserts %{RELEASE} too and this value must agree with
+# the constant there and with the download loops. Every other package is -1.
+WANT_CONTAINERD_RELEASE="2"
 
 #############################################
 head_ "1.1 / 1.2  Syntax and lint"
@@ -98,17 +106,349 @@ check_contains simulate-upgrade.sh "$WANT_CONTAINERD" "simulate-upgrade.sh targe
 check_contains README.md           "$WANT_DOCKER"     "README references $WANT_DOCKER"
 
 # Both el8 and el9 must be covered for every upgrade package.
-for pkg in "docker-ce-$WANT_DOCKER" "docker-ce-cli-$WANT_DOCKER" \
-           "containerd.io-$WANT_CONTAINERD" "docker-buildx-plugin-$WANT_BUILDX" \
-           "docker-compose-plugin-$WANT_COMPOSE"; do
+#
+# The RELEASE suffix is carried per package rather than hard-coded to 1. It used
+# to be 1 for everything, which made "-1" invisible boilerplate; containerd.io
+# 2.3.4 ships as -1 and -2 and only -2 is wanted, so a mechanical version bump
+# that left the suffix alone would name an RPM that is real but WRONG.
+for spec in "docker-ce-$WANT_DOCKER:1" \
+            "docker-ce-cli-$WANT_DOCKER:1" \
+            "containerd.io-$WANT_CONTAINERD:$WANT_CONTAINERD_RELEASE" \
+            "docker-buildx-plugin-$WANT_BUILDX:1" \
+            "docker-compose-plugin-$WANT_COMPOSE:1"; do
+    pkg="${spec%:*}"
+    rel="${spec##*:}"
     for el in el8 el9; do
-        if grep -q "$pkg-1\.$el\.x86_64\.rpm" download-docker-packages.sh; then
-            ok "download loop has $pkg ($el)"
+        if grep -q "$pkg-$rel\.$el\.x86_64\.rpm" download-docker-packages.sh; then
+            ok "download loop has $pkg-$rel ($el)"
         else
-            bad "download loop MISSING $pkg ($el)"
+            bad "download loop MISSING $pkg-$rel ($el)"
         fi
     done
 done
+
+#############################################
+head_ "1.4b  containerd.io RELEASE suffix agrees everywhere"
+#############################################
+# containerd.io 2.3.4-1 and 2.3.4-2 are indistinguishable by %{VERSION}: same
+# file list, same Requires, same version string. The only difference is
+# /usr/bin/runc -- 1.4.3 in -1, 1.5.1 in -2. So the version assertions in
+# upgrade-docker.sh phase 0 cannot tell a bundle built from -1 apart from one
+# built from -2, and an operator with a stale bundle would pass validation and
+# get a runtime nobody chose.
+#
+# upgrade-docker.sh therefore asserts %{RELEASE} as well. That constant, the
+# filenames the download script fetches, and the filenames simulate-upgrade.sh
+# fetches must all name the same build, or the bundle carries packages phase 0
+# will refuse -- discovered on the air-gapped server, which is the worst place.
+#
+# Escape the dots: an unescaped version string is a regex that matches more
+# than it should, and a check that over-matches is a check that fails open.
+CT_RE=$(printf '%s' "$WANT_CONTAINERD" | sed 's/\./\\./g')
+
+UD_CT_REL=$(grep -m1 '^EXPECTED_CONTAINERD_RELEASE="' upgrade-docker.sh \
+    | sed 's/^EXPECTED_CONTAINERD_RELEASE="\(.*\)".*/\1/')
+if [ -z "$UD_CT_REL" ]; then
+    bad "upgrade-docker.sh has no EXPECTED_CONTAINERD_RELEASE constant"
+elif [ "$UD_CT_REL" != "$WANT_CONTAINERD_RELEASE" ]; then
+    bad "upgrade-docker.sh EXPECTED_CONTAINERD_RELEASE is '$UD_CT_REL', want '$WANT_CONTAINERD_RELEASE'"
+else
+    ok "upgrade-docker.sh asserts containerd.io release $UD_CT_REL"
+fi
+
+# The RELEASE assertion has to actually RUN, not merely be declared. Grepping
+# for the name is not enough: the declaration line is itself live code, so a
+# naive grep passes for a constant nothing reads. Exclude the declaration and
+# require a remaining reference -- and require one in each of the two places
+# that matter, the payload check and the post-install check.
+ct_uses=$(grep -vE '^\s*#' upgrade-docker.sh \
+    | grep -c 'EXPECTED_CONTAINERD_RELEASE' || true)
+ct_decl=$(grep -c '^EXPECTED_CONTAINERD_RELEASE=' upgrade-docker.sh || true)
+if [ "$(( ct_uses - ct_decl ))" -gt 0 ]; then
+    ok "upgrade-docker.sh reads EXPECTED_CONTAINERD_RELEASE $(( ct_uses - ct_decl )) time(s) beyond its declaration"
+else
+    bad "upgrade-docker.sh declares EXPECTED_CONTAINERD_RELEASE but never reads it"
+fi
+
+# The payload gate. Phase 0 must call the release check, or a wrong bundle is
+# only caught in phase 9 -- after the node has been drained, stopped and
+# upgraded, which is the whole failure this guard exists to avoid.
+# Pin the arguments, not just the call. A literal "1" here expects the wrong
+# build while leaving the function name -- and every name-based check -- intact,
+# and the behavioural section below cannot see it: that harness supplies its own
+# arguments, so it tests the function, never this call site.
+# shellcheck disable=SC2016  # the literal "$..." text IS the pattern
+if grep -vE '^\s*#' upgrade-docker.sh \
+    | grep -qF 'check_containerd_release "$FOUND_CONTAINERD_REL" "$EXPECTED_CONTAINERD_RELEASE"'; then
+    ok "upgrade-docker.sh phase 0 calls check_containerd_release with the payload and the constant"
+else
+    bad "upgrade-docker.sh phase 0 does not call check_containerd_release with FOUND_CONTAINERD_REL / EXPECTED_CONTAINERD_RELEASE"
+fi
+if grep -qE '^check_containerd_release\(\) \{' upgrade-docker.sh; then
+    ok "upgrade-docker.sh defines check_containerd_release"
+else
+    bad "upgrade-docker.sh calls check_containerd_release but never defines it"
+fi
+
+# The post-install gate: phase 9 must read the INSTALLED release, not just the
+# payload's. rpm can decline or partially apply a transaction.
+#
+# Name the variable, not just the query. Two different sites query
+# %{RELEASE} -- the already-at-target gate and phase 9 -- so a check that
+# matched the query alone stayed green when phase 9's was deleted, satisfied by
+# the other one.
+# Pin the WHOLE assignment, not a prefix of it. A prefix match is satisfied by
+# `VAR=$(rpm -q ... | sed s/1/2/)`, which keeps every required substring while
+# rewriting the value the guard is about to trust.
+CT_QUERY_TAIL="=\$(rpm -q containerd.io --queryformat '%{RELEASE}' 2>/dev/null || echo \"\")"
+if grep -vE '^\s*#' upgrade-docker.sh | grep -qF "INSTALLED_CT_REL$CT_QUERY_TAIL"; then
+    ok "upgrade-docker.sh phase 9 reads the installed containerd.io release, untransformed"
+else
+    bad "upgrade-docker.sh does not query the installed containerd.io %{RELEASE} verbatim"
+fi
+
+# ...and must VALIDATE what it read. Querying the release and then not comparing
+# it is the failure this pair exists to separate.
+# shellcheck disable=SC2016  # the literal text "$INSTALLED_CT_REL" IS the pattern; expanding it would search for this harness's own unset variable
+if grep -vE '^\s*#' upgrade-docker.sh \
+    | grep -qF 'containerd_release_matches "$INSTALLED_CT_REL"'; then
+    ok "upgrade-docker.sh phase 9 validates the installed containerd.io release"
+else
+    bad "upgrade-docker.sh reads the installed containerd.io release but never checks it"
+fi
+
+# Both call sites must pass the CONSTANT as the expected release. A literal
+# argument would satisfy a check that only looked for the function name, while
+# quietly expecting the wrong build.
+for site in INSTALLED_CT_REL CURRENT_CONTAINERD_REL; do
+    # shellcheck disable=SC2016  # the literal "$..." text IS the pattern
+    if grep -vE '^\s*#' upgrade-docker.sh \
+        | grep -qF "containerd_release_matches \"\$$site\" \"\$EXPECTED_CONTAINERD_RELEASE\" \"\$RHEL_VER\""; then
+        ok "containerd_release_matches($site) uses EXPECTED_CONTAINERD_RELEASE and RHEL_VER"
+    else
+        bad "containerd_release_matches($site) does not pass EXPECTED_CONTAINERD_RELEASE / RHEL_VER"
+    fi
+done
+
+# ...and neither may be negated. `if ! containerd_release_matches ...` keeps
+# every substring above intact while inverting the guard.
+if grep -vE '^\s*#' upgrade-docker.sh | grep -qE '!\s*containerd_release_matches'; then
+    bad "upgrade-docker.sh negates containerd_release_matches (guard inverted)"
+else
+    ok "upgrade-docker.sh never negates containerd_release_matches"
+fi
+
+# ...nor may its exit status be discarded. `containerd_release_matches ... || true`
+# keeps every substring the checks above look for while making the guard
+# unconditional. Same for the wrapper.
+if grep -vE '^\s*#' upgrade-docker.sh \
+    | grep -qE '(containerd_release_matches|check_containerd_release)[^#]*\|\|[[:space:]]*(true|:)'; then
+    bad "upgrade-docker.sh discards the containerd release check's status with || true"
+else
+    ok "upgrade-docker.sh does not discard the containerd release check's status"
+fi
+
+# The predicate must be DEFINED before it is CALLED. bash reads top to bottom;
+# a definition moved below its first call is a runtime "command not found" that
+# neither bash -n nor shellcheck reports.
+crm_def=$(grep -n '^containerd_release_matches() {' upgrade-docker.sh | head -1 | cut -d: -f1)
+crm_use_real=$(grep -n 'containerd_release_matches ' upgrade-docker.sh | grep -vE '^[0-9]+:\s*#' | head -1 | cut -d: -f1)
+if [ -n "$crm_def" ] && [ -n "$crm_use_real" ] && [ "$crm_def" -lt "$crm_use_real" ]; then
+    ok "containerd_release_matches is defined (line $crm_def) before first use (line $crm_use_real)"
+else
+    bad "containerd_release_matches defined@${crm_def:-?} is not before first use@${crm_use_real:-?}"
+fi
+
+# The already-at-target gate must test the release too. That branch ends in
+# `exit 0`, so whatever it accepts as "nothing to do" never reaches phase 9 --
+# a node on containerd.io <version>-1 matches every %{VERSION} and would be
+# sent away still running the wrong runc. A guard downstream of an early exit
+# is not a guard for anything that takes the exit.
+# shellcheck disable=SC2016  # the literal text "$CURRENT_CONTAINERD_REL" IS the pattern; expanding it would search for this harness's own unset variable
+if grep -vE '^\s*#' upgrade-docker.sh \
+    | grep -qF 'containerd_release_matches "$CURRENT_CONTAINERD_REL"'; then
+    ok "upgrade-docker.sh already-at-target gate tests the containerd.io release"
+else
+    bad "upgrade-docker.sh already-at-target gate ignores the containerd.io release (exits 0 on a -1 node)"
+fi
+
+# The gate can only test what it read.
+if grep -vE '^\s*#' upgrade-docker.sh | grep -qF "CURRENT_CONTAINERD_REL$CT_QUERY_TAIL"; then
+    ok "upgrade-docker.sh reads the installed containerd.io release before the gate, untransformed"
+else
+    bad "upgrade-docker.sh does not populate CURRENT_CONTAINERD_REL verbatim"
+fi
+
+# Exactly one assignment. Querying it correctly and then overwriting it with
+# "${EXPECTED_CONTAINERD_RELEASE}.el${RHEL_VER}" would satisfy every check above
+# while handing the gate fabricated state.
+ct_assigns=$(grep -vE '^\s*#' upgrade-docker.sh | grep -cE '(^|[^[:alnum:]_])CURRENT_CONTAINERD_REL=' || true)
+if [ "$ct_assigns" -eq 1 ]; then
+    ok "CURRENT_CONTAINERD_REL is assigned exactly once"
+else
+    bad "CURRENT_CONTAINERD_REL is assigned $ct_assigns times in live code (want 1)"
+fi
+
+# Every containerd.io filename in the two download paths must name exactly the
+# wanted release. Collecting the distinct suffixes (rather than grepping for
+# the wanted one) catches a file that fetches BOTH -- which would pass a
+# "contains the right string" test while still shipping the wrong RPM.
+for f in download-docker-packages.sh simulate-upgrade.sh; do
+    rels=$(grep -oE "containerd\.io-$CT_RE-[0-9]+\." "$f" \
+        | sed -E "s/^containerd\.io-$CT_RE-([0-9]+)\.$/\1/" | sort -u | tr '\n' ' ')
+    rels="${rels% }"
+    if [ -z "$rels" ]; then
+        bad "$f fetches no containerd.io-$WANT_CONTAINERD-<release> RPM"
+    elif [ "$rels" != "$WANT_CONTAINERD_RELEASE" ]; then
+        bad "$f fetches containerd.io release(s) '$rels', want exactly '$WANT_CONTAINERD_RELEASE'"
+    else
+        ok "$f fetches containerd.io-$WANT_CONTAINERD-$WANT_CONTAINERD_RELEASE only"
+    fi
+done
+
+# The VM harness builds containerd RPM paths by hand. A hard-coded -1 there
+# would make Tier 2 truncate/copy a file that no longer exists, and the case
+# would fail for a reason unrelated to what it tests.
+if grep -q '^TARGET_CONTAINERD_RELEASE="'"$WANT_CONTAINERD_RELEASE"'"' tests/vm/lib.sh; then
+    ok "tests/vm/lib.sh pins TARGET_CONTAINERD_RELEASE $WANT_CONTAINERD_RELEASE"
+else
+    bad "tests/vm/lib.sh does not pin TARGET_CONTAINERD_RELEASE=\"$WANT_CONTAINERD_RELEASE\""
+fi
+
+# shellcheck disable=SC2016  # the literal string "$TARGET_CONTAINERD" is the pattern; expanding it would search for the version instead
+vm_hardcoded=$(grep -nE 'containerd\.io-\$TARGET_CONTAINERD-[0-9]+\.' tests/vm/*.sh || true)
+if [ -n "$vm_hardcoded" ]; then
+    bad "VM harness hard-codes a containerd.io release suffix instead of \$TARGET_CONTAINERD_RELEASE"
+    printf '       %s\n' "$vm_hardcoded"
+else
+    ok "VM harness builds containerd.io paths from \$TARGET_CONTAINERD_RELEASE"
+fi
+
+#############################################
+head_ "1.4c  containerd_release_matches BEHAVES, not just exists"
+#############################################
+# Every check in 1.4b is a text check, and text checks share one blind spot:
+# they prove a call site is present, never that the thing it calls does
+# anything. Replacing the predicate's body with `return 0` passes all of them
+# and makes the guard accept every bundle.
+#
+# So run it. This is a pure string comparison -- no root, no rpm, no RHEL, no
+# side effects -- which makes it the one piece of upgrade logic Tier 1 can
+# legitimately execute. It is extracted from the real script rather than
+# reimplemented here, because a copy would be the next thing to drift.
+ct_fn=$(awk '/^containerd_release_matches\(\) \{/,/^\}/' upgrade-docker.sh)
+if [ -z "$ct_fn" ]; then
+    bad "containerd_release_matches not found in upgrade-docker.sh"
+else
+    CT_BAD=0
+    CT_CASES=0
+    ct_case() {
+        local want_result="$1" rel="$2" want="$3" major="$4" got
+        CT_CASES=$((CT_CASES + 1))
+        if ( eval "$ct_fn"; containerd_release_matches "$rel" "$want" "$major" ) 2>/dev/null; then
+            got=accept
+        else
+            got=reject
+        fi
+        if [ "$got" != "$want_result" ]; then
+            bad "containerd_release_matches '$rel' (want $want, el$major) -> $got, expected $want_result"
+            CT_BAD=1
+        fi
+    }
+
+    # The only two shapes that may be accepted.
+    ct_case accept "2.el9"          2  9
+    ct_case accept "2.el8"          2  8
+
+    # The build this whole guard exists for: same %{VERSION}, runc 1.4.3.
+    ct_case reject "1.el9"          2  9
+
+    # Absent, unreadable, or rejected by an earlier phase-0 check.
+    ct_case reject ""               2  9
+    ct_case reject "(none)"         2  9
+
+    # Shapes a prefix comparison used to wave through.
+    ct_case reject "2"              2  9
+    ct_case reject "2.1.el9"        2  9
+    ct_case reject "20.el9"         2  9
+    ct_case reject "x2.el9"         2  9
+    ct_case reject "2mycustom.el9"  2  9
+    ct_case reject ".el9"           2  9
+    ct_case reject " 2.el9"         2  9
+    ct_case reject "2.el9 "         2  9
+    ct_case reject "2.el9.el8"      2  9
+    ct_case reject "2.el9.foo"      2  9
+
+    # The same wrong build on RHEL 8. Testing only the el9 form would let a
+    # special case for "1.el8" survive -- and containerd.io-2.3.4-1.el8 is a
+    # real RPM an operator can really be handed.
+    ct_case reject "1.el8"          2  8
+
+    # Wrong RHEL major, in both directions, and a major that only starts right.
+    ct_case reject "2.el8"          2  9
+    ct_case reject "2.el9"          2  8
+    ct_case reject "1.el8"          2  9
+    ct_case reject "1.el9"          2  8
+    ct_case reject "2.el10"         2  9
+    ct_case reject "2.el9x"         2  9
+
+    # A blanked expectation must refuse everything rather than match ".el9".
+    ct_case reject ".el9"           "" 9
+    ct_case reject "2.el9"          "" 9
+    ct_case reject "2.el9"          2  ""
+
+    if [ "$CT_BAD" -eq 0 ]; then
+        ok "containerd_release_matches accepts only <want>.el<major> ($CT_CASES cases)"
+    fi
+
+    # The predicate is only half the phase-0 guard. check_containerd_release is
+    # the wrapper that decides whether a payload problem becomes a PKG_ERRORS
+    # increment -- and phase 0 aborts on PKG_ERRORS, not on the predicate. A
+    # wrapper whose body is `return 0`, or that passes a literal "1" as the
+    # expected release, disables the payload gate while every text check above
+    # stays green. So run the wrapper and watch the counter it is supposed to
+    # move.
+    ct_wrapper=$(awk '/^check_containerd_release\(\) \{/,/^\}/' upgrade-docker.sh)
+    if [ -z "$ct_wrapper" ]; then
+        bad "check_containerd_release not found in upgrade-docker.sh"
+    else
+        WRAP_BAD=0
+        wrap_case() {
+            local want_result="$1" rel="$2" major="$3" errs
+            # Run the wrapper with the REAL constant, in a subshell carrying
+            # just enough of phase 0's environment, and report the counter.
+            # These four look unused to shellcheck; the eval'd function body
+            # reads all of them. Its colour vars come from this script's own,
+            # and its output is discarded, so only these need setting.
+            # shellcheck disable=SC2034
+            errs=$(
+                RHEL_VER="$major"
+                EXPECTED_CONTAINERD_VERSION="$WANT_CONTAINERD"
+                EXPECTED_CONTAINERD_RELEASE=$(grep -m1 '^EXPECTED_CONTAINERD_RELEASE="' upgrade-docker.sh \
+                    | sed 's/^EXPECTED_CONTAINERD_RELEASE="\(.*\)".*/\1/')
+                PKG_ERRORS=0
+                eval "$ct_fn"
+                eval "$ct_wrapper"
+                check_containerd_release "$rel" "$EXPECTED_CONTAINERD_RELEASE" >/dev/null 2>&1
+                echo "$PKG_ERRORS"
+            )
+            local got="accept"
+            [ "${errs:-0}" -gt 0 ] && got="REJECT"
+            if [ "$got" != "$want_result" ]; then
+                bad "check_containerd_release '$rel' on el$major -> $got, expected $want_result"
+                WRAP_BAD=1
+            fi
+        }
+        wrap_case accept "2.el9" 9
+        wrap_case accept "2.el8" 8
+        wrap_case REJECT "1.el9" 9   # the wrong build, el9
+        wrap_case REJECT "1.el8" 8   # the wrong build, el8
+        wrap_case REJECT ""      9   # containerd.io absent from the payload
+        wrap_case REJECT "2.el8" 9   # el8 RPM in the rhel9 directory
+        wrap_case REJECT "2"     9   # malformed
+        [ "$WRAP_BAD" -eq 0 ] && ok "check_containerd_release increments PKG_ERRORS on every wrong payload (7 cases)"
+    fi
+fi
 
 #############################################
 head_ "1.5  No stale version literals"
@@ -120,14 +460,25 @@ head_ "1.5  No stale version literals"
 # versions as its simulated starting state, so 29.1.5 / 2.2.1 / 0.30.1 / 5.0.1
 # are correct there. Only the pre-previous round (28.5.1 / 1.7.29) would be
 # wrong, since this script no longer covers the containerd major migration.
+#
+# MAINTENANCE: the LAST target belongs in this list too. Check 1.4 only proves
+# the new versions are PRESENT; it says nothing about the old ones still being
+# there. Reverting a single constant -- EXPECTED_BUILDX_VERSION back to 0.36.1,
+# say -- left both checks green until 29.7.2 / 2.3.3 / 0.36.1 / 5.5.0 were
+# added here. When the next retarget lands, roll this list forward: the target
+# being replaced becomes stale the moment it is replaced.
+#
+# The fleet baseline (29.1.5 / 2.2.1) is deliberately absent from every pattern
+# -- it is the version being upgraded FROM and is legitimate in all six
+# scripts.
 STALE_FOUND=0
 for s in "${SCRIPTS[@]}"; do
     [ -f "$s" ] || continue
     if [ "$s" = "simulate-upgrade.sh" ]; then
-        pattern='28\.5\.1|1\.7\.29'
+        pattern='28\.5\.1|1\.7\.29|29\.7\.2|2\.3\.3|0\.36\.1|5\.5\.0'
         what="pre-baseline literal"
     else
-        pattern='28\.5\.1|1\.7\.29|0\.30\.1|5\.0\.1'
+        pattern='28\.5\.1|1\.7\.29|0\.30\.1|5\.0\.1|29\.7\.2|2\.3\.3|0\.36\.1|5\.5\.0'
         what="stale literal"
     fi
     # grep -n on a FILTERED stream reports the filtered line numbers, which do
@@ -291,14 +642,22 @@ head_ "1.12  Every helper called is also defined"
 for s in "${SCRIPTS[@]}"; do
     [ -f "$s" ] || continue
     for fn in prompt_yes_no verify_unit_stopped start_services stop_services \
-              read_config_version config_is_loadable; do
+              read_config_version config_is_loadable \
+              containerd_release_matches check_containerd_release; do
         # Does the script reference it anywhere other than its own definition?
         refs=$(grep -vE '^\s*#' "$s" | grep -cE "(^|[^[:alnum:]_])${fn}( |$|\")" || true)
         defs=$(grep -cE "^${fn}\(\) \{" "$s" || true)
         if [ "$refs" -gt 0 ] && [ "$defs" -eq 0 ]; then
             bad "$s calls $fn but never defines it"
+        elif [ "$refs" -gt 0 ] && [ "$defs" -gt 1 ]; then
+            # EXACTLY one, not at least one. Two definitions mean the last one
+            # wins at runtime while the first is dead -- and 1.4c, which
+            # extracts by pattern, would eval BOTH and test the survivor. A
+            # broken definition placed before the call sites with a correct
+            # duplicate after them would run broken and test clean.
+            bad "$s defines $fn $defs times (want exactly 1; the later one silently wins)"
         elif [ "$refs" -gt 0 ]; then
-            ok "$s defines the $fn it calls"
+            ok "$s defines the $fn it calls exactly once"
         fi
     done
 done
@@ -394,7 +753,7 @@ else
         for pkg in \
             "docker-ce-$WANT_DOCKER-1.el$rel.x86_64.rpm" \
             "docker-ce-cli-$WANT_DOCKER-1.el$rel.x86_64.rpm" \
-            "containerd.io-$WANT_CONTAINERD-1.el$rel.x86_64.rpm" \
+            "containerd.io-$WANT_CONTAINERD-$WANT_CONTAINERD_RELEASE.el$rel.x86_64.rpm" \
             "docker-buildx-plugin-$WANT_BUILDX-1.el$rel.x86_64.rpm" \
             "docker-compose-plugin-$WANT_COMPOSE-1.el$rel.x86_64.rpm" \
             "docker-ce-$WANT_ROLLBACK_DOCKER-1.el$rel.x86_64.rpm" \

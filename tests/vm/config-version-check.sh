@@ -1,16 +1,16 @@
 #!/bin/bash
 # shellcheck disable=SC2016,SC1091  # single-quoted VM commands must expand INSIDE the VM
 # tests/vm/config-version-check.sh
-# The containerd config-version boundary introduced by containerd.io 2.2.1 -> 2.3.3.
+# The containerd config-version boundary introduced by containerd.io 2.2.1 -> 2.3.x.
 #
 # WHY THIS EXISTS
 #
 # Every previous round of this upgrade stayed inside one containerd config
 # version, so "phase 6 verifies, it does not rewrite" only had to protect a
-# relocated `root`. Moving to 2.3.3 raises the current config version from 3 to
+# relocated `root`. Moving to 2.3.4 raises the current config version from 3 to
 # 4, which adds a second, sharper hazard in the ROLLBACK direction:
 #
-#   containerd 2.3.3 reads a version = 3 config happily.
+#   containerd 2.3.4 reads a version = 3 config happily.
 #   containerd 2.2.1 refuses a version = 4 config outright, and does not start.
 #
 # So a node that ends up with a v4 config on disk is one emergency rollback away
@@ -43,7 +43,7 @@ require_relocated_xfs
 
 CONF="/etc/containerd/config.toml"
 WORK="/root/configver"
-NEW_CTRD="/opt/docker-offline/rhel9/containerd.io-$TARGET_CONTAINERD-1.el9.x86_64.rpm"
+NEW_CTRD="/opt/docker-offline/rhel9/containerd.io-$TARGET_CONTAINERD-$TARGET_CONTAINERD_RELEASE.el9.x86_64.rpm"
 OLD_CTRD="/opt/docker-offline/rollback-rhel9/containerd.io-$BASELINE_CONTAINERD-1.el9.x86_64.rpm"
 
 # The highest config version the BASELINE containerd can load. This is the

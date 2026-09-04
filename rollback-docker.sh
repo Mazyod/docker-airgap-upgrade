@@ -1,7 +1,7 @@
 #!/bin/bash
 # rollback-docker.sh
-# Emergency rollback: Docker 29.7.2 → 29.1.5
-VERSION="2.1.0"
+# Emergency rollback: Docker 29.8.0 → 29.1.5
+VERSION="2.1.1"
 #
 # Use this script if:
 # - Services fail to start after upgrade
@@ -17,7 +17,7 @@ VERSION="2.1.0"
 # This rolls back to 29.1.5 / containerd.io 2.2.1 -- the state the cluster ran
 # before this upgrade. No network-state reset is involved.
 #
-# It DOES step containerd back across a config-version boundary: 2.3.3 supports
+# It DOES step containerd back across a config-version boundary: 2.3.4 supports
 # config version 4, 2.2.1 supports at most 3. The upgrade never writes a v4
 # file, so in the normal case the config on disk is still the v3 one 2.2.1
 # wrote and nothing needs to change. But if something did write a v4 config --
@@ -47,7 +47,7 @@ NC='\033[0m' # No Color
 exec > >(tee -a /var/log/docker-rollback.log) 2>&1
 
 echo "=========================================="
-echo "Docker Rollback: 29.7.2 → 29.1.5"
+echo "Docker Rollback: 29.8.0 → 29.1.5"
 echo "Script Version: $VERSION"
 echo "Server: $(hostname)"
 echo "Date: $(date)"
@@ -498,7 +498,7 @@ echo "=== Phase 0c: containerd Config Version ==="
 CURRENT_PHASE="phase 0c (containerd config version)"
 
 # containerd $ROLLBACK_CONTAINERD_VERSION loads config version 3 at most.
-# containerd 2.3.3 -- what this node is being rolled back FROM -- generates
+# containerd 2.3.4 -- what this node is being rolled back FROM -- generates
 # version 4, and 2.2.1 refuses such a file outright:
 #
 #   containerd: failed to load TOML from /etc/containerd/config.toml:
@@ -732,7 +732,7 @@ echo ""
 echo "=== Phase 3: containerd Config ==="
 CURRENT_PHASE="phase 3 (containerd config)"
 
-# containerd 2.3.3 reads a version = 3 config and never rewrites it, so the
+# containerd 2.3.4 reads a version = 3 config and never rewrites it, so the
 # file on disk after an upgrade is normally still the v3 file 2.2.1 wrote --
 # valid here, nothing to migrate, nothing to restore.
 #
@@ -846,9 +846,9 @@ echo "  - docker-ce: $ROLLBACK_DOCKER_VERSION"
 echo "  - containerd.io: $ROLLBACK_CONTAINERD_VERSION"
 echo ""
 echo "This node is back on the version the cluster ran before the upgrade."
-echo "It can coexist with nodes already on 29.7.2: both are Docker 29.x engines"
+echo "It can coexist with nodes already on 29.8.0: both are Docker 29.x engines"
 echo "and speak the same Swarm protocol. The containerd difference (2.2.1 here"
-echo "vs 2.3.3 there) is local to each node and does not cross the wire."
+echo "vs 2.3.4 there) is local to each node and does not cross the wire."
 echo ""
 echo "Investigate what went wrong before retrying the upgrade:"
 echo "  /var/log/docker-upgrade.log"

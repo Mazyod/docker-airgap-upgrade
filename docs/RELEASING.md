@@ -29,8 +29,8 @@ git tag alone does not solve:
 v<TARGET_DOCKER_VERSION>-<BUNDLE_REVISION>
 ```
 
-- `v29.7.2-1` — first bundle shipping Docker 29.7.2
-- `v29.7.2-2` — same Docker version, rebuilt (script fix, added package, corrected
+- `v29.8.0-1` — first bundle shipping Docker 29.8.0
+- `v29.8.0-2` — same Docker version, rebuilt (script fix, added package, corrected
   rollback set)
 
 The Docker version is what operators and change tickets talk about, so it leads. The
@@ -41,7 +41,7 @@ revision covers the real case where the same target ships twice because somethin
 
 ```bash
 tests/vm/bootstrap-vm.sh          # once, if the VM does not exist
-tools/make-release.sh v29.7.2-1   # add --draft to review before publishing
+tools/make-release.sh v29.8.0-1   # add --draft to review before publishing
 ```
 
 `make-release.sh` refuses to proceed unless:
@@ -75,8 +75,8 @@ from the packages themselves:
 ## Verifying a release
 
 ```bash
-gh release download v29.7.2-1
-sha256sum -c <<< '<sha from the release notes>  docker-upgrade-bundle-v29.7.2-1.tar.gz'
+gh release download v29.8.0-1
+sha256sum -c <<< '<sha from the release notes>  docker-upgrade-bundle-v29.8.0-1.tar.gz'
 ```
 
 The bundle's own RPM digests are checked again by `upgrade-docker.sh` phase 0 on the

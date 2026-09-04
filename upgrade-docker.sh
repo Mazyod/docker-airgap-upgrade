@@ -1,7 +1,7 @@
 #!/bin/bash
 # upgrade-docker.sh
-# Run on each AIR-GAPPED server to upgrade Docker 29.1.5 → 29.7.2
-VERSION="2.1.0"
+# Run on each AIR-GAPPED server to upgrade Docker 29.1.5 → 29.8.0
+VERSION="2.2.0"
 #
 # Prerequisites:
 # - Extract docker-upgrade-bundle.tar.gz to /opt/
@@ -18,14 +18,14 @@ VERSION="2.1.0"
 # to avoid SSL certificate issues with corporate satellite servers
 # (e.g., "SSL certificate problem: EE certificate key too weak")
 #
-# SCOPE OF THIS VERSION (2.1.0)
+# SCOPE OF THIS VERSION (2.2.0)
 #
-# This upgrade crosses containerd 2.2.1 -> 2.3.3: a MINOR containerd bump, not
+# This upgrade crosses containerd 2.2.1 -> 2.3.4: a MINOR containerd bump, not
 # the 1.7 -> 2.x MAJOR boundary the 28.5.1 -> 29.1.5 migration crossed. 2.3 is
 # containerd's first annual LTS.
 #
 # The minor bump does raise the containerd config version from 3 to 4, but it
-# is read-compatible in the direction that matters: 2.3.3 loads an existing
+# is read-compatible in the direction that matters: 2.3.4 loads an existing
 # version = 3 file, migrates it in memory, and never writes it back. So no
 # config migration is performed here either -- see phase 6, which explains what
 # was measured and why writing a v4 config would be actively harmful.
@@ -47,7 +47,7 @@ VERSION="2.1.0"
 #     prompt. Any node already running containerd 2.x has satisfied the ftype
 #     requirement; the check cannot fire usefully here.
 #
-#   - containerd config regeneration. 2.3.3 reads the existing v3 config and
+#   - containerd config regeneration. 2.3.4 reads the existing v3 config and
 #     migrates it in memory, so there is nothing to migrate on disk -- and
 #     regenerating would DISCARD a relocated root path, registry mirrors, and
 #     runtime config, as well as writing a v4 file that blocks rollback.
@@ -68,7 +68,7 @@ NC='\033[0m' # No Color
 exec > >(tee -a /var/log/docker-upgrade.log) 2>&1
 
 echo "=========================================="
-echo "Docker Upgrade: 29.1.5 → 29.7.2"
+echo "Docker Upgrade: 29.1.5 → 29.8.0"
 echo "Script Version: $VERSION"
 echo "Server: $(hostname)"
 echo "Date: $(date)"
@@ -187,15 +187,30 @@ trap 'exit 143' TERM
 #
 # Keep in sync with download-docker-packages.sh, rollback-docker.sh,
 # simulate-upgrade.sh and README.md -- see CLAUDE.md.
-EXPECTED_DOCKER_VERSION="29.7.2"
-EXPECTED_CONTAINERD_VERSION="2.3.3"
+EXPECTED_DOCKER_VERSION="29.8.0"
+EXPECTED_CONTAINERD_VERSION="2.3.4"
+
+# The containerd.io RPM RELEASE, asserted separately because VERSION alone is
+# no longer enough to identify the build. containerd.io 2.3.4 was published
+# twice: -1 and -2 have the same %{VERSION}, the same file list and the same
+# Requires, and differ only in /usr/bin/runc (1.4.3 in -1, 1.5.1 in -2).
+#
+# A version-only check therefore accepts either. An operator whose bundle was
+# built from the -1 window would pass phase 0 cleanly and get a container
+# runtime nobody chose. Assert the release too, and fail closed.
+#
+# This is the RELEASE's numeric part only. The full %{RELEASE} string is
+# "2.el9" on RHEL 9 and "2.el8" on RHEL 8, so the constant is the same for both
+# majors; containerd_release_matches() builds the full expected string from
+# this value and the host's own RHEL major and compares it exactly.
+EXPECTED_CONTAINERD_RELEASE="2"
 
 # buildx and compose version INDEPENDENTLY of docker-ce -- these are their own
 # versions, not derived from the engine version, and must never be set to it.
 # They are still asserted: the bundle ships specific builds, and a bundle that
 # quietly carries last round's plugins should not report success.
-EXPECTED_BUILDX_VERSION="0.36.1"
-EXPECTED_COMPOSE_VERSION="5.5.0"
+EXPECTED_BUILDX_VERSION="0.37.0"
+EXPECTED_COMPOSE_VERSION="5.5.1"
 
 # The baseline this upgrade was designed and tested against. Starting anywhere
 # else is a warning, except containerd 1.x which is a hard stop -- that crosses
@@ -209,6 +224,35 @@ ALLOWED_PKGS="docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-
 #############################################
 # Helper Functions
 #############################################
+
+# Does an RPM %{RELEASE} name the containerd.io build this upgrade wants?
+#
+# Shared by phase 0 (which checks the PAYLOAD), the already-at-target gate and
+# phase 9 (which checks what rpm actually INSTALLED), so the three cannot drift
+# apart.
+#
+# The comparison is EXACT, not a prefix match. %{RELEASE} for these packages is
+# exactly "<n>.el<major>" -- "2.el9" -- because the architecture lives in
+# %{ARCH} and nothing else is appended. There is therefore nothing legitimate
+# to tolerate on either side, and every tolerance is a hole: splitting on the
+# first ".el" and ignoring the remainder accepted "2.el9.el8" and "2.el9.foo",
+# and comparing only the part before ".el" accepted a bare "2".
+#
+# Both halves of the string carry weight. The <n> is what separates
+# containerd.io 2.3.4-2 (runc 1.5.1) from 2.3.4-1 (runc 1.4.3), which are
+# indistinguishable by %{VERSION}. The el<major> catches an el8 RPM on an el9
+# host, which matters most in phase 9 and in the already-at-target gate, where
+# phase 0's own el check has no say.
+containerd_release_matches() {
+    local rel="$1" want="$2" major="$3"
+
+    # All three must be present. An empty `want` would make the expected string
+    # ".el9", which a release of ".el9" satisfies -- so a guard whose
+    # expectation had been blanked would still report a match. Refuse instead.
+    [ -n "$rel" ] && [ -n "$want" ] && [ -n "$major" ] || return 1
+
+    [ "$rel" = "${want}.el${major}" ]
+}
 
 prompt_yes_no() {
     local prompt="$1"
@@ -406,6 +450,7 @@ echo "  Package inventory:"
 FOUND_DOCKER_CE=""
 FOUND_DOCKER_CLI=""
 FOUND_CONTAINERD=""
+FOUND_CONTAINERD_REL=""
 FOUND_BUILDX=""
 FOUND_COMPOSE=""
 HOST_ARCH=$(uname -m)
@@ -465,7 +510,8 @@ for rpmfile in "${PKG_FILES[@]}"; do
     case "$p_name" in
         docker-ce)             FOUND_DOCKER_CE="$p_ver" ;;
         docker-ce-cli)         FOUND_DOCKER_CLI="$p_ver" ;;
-        containerd.io)         FOUND_CONTAINERD="$p_ver" ;;
+        containerd.io)         FOUND_CONTAINERD="$p_ver"
+                               FOUND_CONTAINERD_REL="$p_rel" ;;
         docker-buildx-plugin)  FOUND_BUILDX="$p_ver" ;;
         docker-compose-plugin) FOUND_COMPOSE="$p_ver" ;;
     esac
@@ -492,11 +538,48 @@ check_version "containerd.io"         "$FOUND_CONTAINERD" "$EXPECTED_CONTAINERD_
 check_version "docker-buildx-plugin"  "$FOUND_BUILDX"     "$EXPECTED_BUILDX_VERSION"
 check_version "docker-compose-plugin" "$FOUND_COMPOSE"    "$EXPECTED_COMPOSE_VERSION"
 
+# containerd.io needs its RELEASE asserted as well, because its VERSION stopped
+# being a unique identifier at 2.3.4: upstream published -1 and -2 with the same
+# version, the same file list and the same Requires, differing only in which
+# runc they carry (1.4.3 vs 1.5.1). check_version above passes for either, so
+# without this a bundle built during the -1 window installs a runtime nobody
+# chose and still reports success.
+#
+# Every branch below either passes or increments PKG_ERRORS. There is no path
+# that reads as a match by default -- an empty, malformed, or unexpected
+# release is an error, not a shrug.
+check_containerd_release() {
+    local found="$1" want="$2"
+
+    if [ -z "$found" ]; then
+        # Either no containerd.io in the payload, or one whose earlier checks
+        # rejected it (arch, el-major, duplicate) and `continue`d before the
+        # release was recorded. check_version has already said which; this
+        # exists so an empty string can never be mistaken for agreement.
+        echo -e "${RED}  ERROR: containerd.io RPM release is empty (expected ${want}.el${RHEL_VER})${NC}"
+        PKG_ERRORS=$((PKG_ERRORS + 1))
+        return
+    fi
+
+    if containerd_release_matches "$found" "$want" "$RHEL_VER"; then
+        echo -e "  ${GREEN}✓ containerd.io release $found${NC}"
+        return
+    fi
+
+    echo -e "${RED}  ERROR: containerd.io release is $found, expected ${want}.el${RHEL_VER}${NC}"
+    echo "         containerd.io $EXPECTED_CONTAINERD_VERSION was published more than once."
+    echo "         Release -1 carries runc 1.4.3; -2 carries runc 1.5.1."
+    echo "         This bundle has the wrong build. Re-download it."
+    PKG_ERRORS=$((PKG_ERRORS + 1))
+}
+
+check_containerd_release "$FOUND_CONTAINERD_REL" "$EXPECTED_CONTAINERD_RELEASE"
+
 if [ "$PKG_ERRORS" -gt 0 ]; then
     echo ""
     echo -e "${RED}ERROR: $PKG_ERRORS problem(s) with the package payload.${NC}"
     echo "Nothing on this node has been changed. Re-transfer the correct bundle:"
-    echo "  expected docker-ce $EXPECTED_DOCKER_VERSION, containerd.io $EXPECTED_CONTAINERD_VERSION"
+    echo "  expected docker-ce $EXPECTED_DOCKER_VERSION, containerd.io $EXPECTED_CONTAINERD_VERSION-$EXPECTED_CONTAINERD_RELEASE"
     exit 1
 fi
 
@@ -522,13 +605,17 @@ echo -e "${GREEN}Package payload validated.${NC}"
 CURRENT_DOCKER=$(rpm -q docker-ce --queryformat '%{VERSION}' 2>/dev/null || echo "")
 CURRENT_DOCKER_CLI=$(rpm -q docker-ce-cli --queryformat '%{VERSION}' 2>/dev/null || echo "")
 CURRENT_CONTAINERD=$(rpm -q containerd.io --queryformat '%{VERSION}' 2>/dev/null || echo "")
+# The installed RELEASE too. Without it, "already fully at the target" is a
+# claim about %{VERSION} alone, and %{VERSION} stopped identifying the build at
+# containerd.io 2.3.4 -- see EXPECTED_CONTAINERD_RELEASE.
+CURRENT_CONTAINERD_REL=$(rpm -q containerd.io --queryformat '%{RELEASE}' 2>/dev/null || echo "")
 CURRENT_BUILDX=$(rpm -q docker-buildx-plugin --queryformat '%{VERSION}' 2>/dev/null || echo "")
 CURRENT_COMPOSE=$(rpm -q docker-compose-plugin --queryformat '%{VERSION}' 2>/dev/null || echo "")
 
 # UNCONDITIONAL hard stop, evaluated before any of the branches below.
 #
 # This was previously nested inside the "unexpected starting version" branch,
-# which made it bypassable: a node with docker-ce already at 29.7.2 but
+# which made it bypassable: a node with docker-ce already at 29.8.0 but
 # containerd still on 1.x took the partial-upgrade branch instead and never
 # reached this check -- letting the script attempt exactly the major migration
 # it no longer supports.
@@ -556,15 +643,24 @@ esac
 # If the node is ALREADY fully at the target, offer to skip. ALL FIVE packages
 # must match, not just the core three: a partially applied transaction can leave
 # correct core packages beside stale plugins, and that node still needs this run.
+#
+# The containerd.io RPM RELEASE is part of "at the target", not a detail. This
+# branch ends in `exit 0` on the default answer, so anything it treats as
+# already-done never reaches phase 9's assertions. A node holding
+# containerd.io 2.3.4-1 matches every %{VERSION} here while running runc 1.4.3;
+# without the release test it would be told there was nothing to do and keep a
+# runtime nobody chose. A release mismatch falls through to the partial-upgrade
+# branch below, which is correct -- that node does need this run.
 if [ "$CURRENT_DOCKER" = "$EXPECTED_DOCKER_VERSION" ] &&
    [ "$CURRENT_DOCKER_CLI" = "$EXPECTED_DOCKER_VERSION" ] &&
    [ "$CURRENT_CONTAINERD" = "$EXPECTED_CONTAINERD_VERSION" ] &&
+   containerd_release_matches "$CURRENT_CONTAINERD_REL" "$EXPECTED_CONTAINERD_RELEASE" "$RHEL_VER" &&
    [ "$CURRENT_BUILDX" = "$EXPECTED_BUILDX_VERSION" ] &&
    [ "$CURRENT_COMPOSE" = "$EXPECTED_COMPOSE_VERSION" ]; then
     echo ""
     echo -e "${YELLOW}NOTE: this node is already fully at the target versions:${NC}"
     echo "  docker-ce $CURRENT_DOCKER, docker-ce-cli $CURRENT_DOCKER_CLI,"
-    echo "  containerd.io $CURRENT_CONTAINERD, buildx $CURRENT_BUILDX,"
+    echo "  containerd.io $CURRENT_CONTAINERD-$CURRENT_CONTAINERD_REL, buildx $CURRENT_BUILDX,"
     echo "  compose $CURRENT_COMPOSE"
     if ! prompt_yes_no "Re-run the upgrade anyway? [y/N]" "n"; then
         echo "Nothing to do. Exiting without changes."
@@ -577,7 +673,7 @@ elif [ "$CURRENT_DOCKER" = "$EXPECTED_DOCKER_VERSION" ] ||
     echo -e "${YELLOW}not - this looks like a partial upgrade.${NC}"
     echo "  docker-ce:             ${CURRENT_DOCKER:-absent} (want $EXPECTED_DOCKER_VERSION)"
     echo "  docker-ce-cli:         ${CURRENT_DOCKER_CLI:-absent} (want $EXPECTED_DOCKER_VERSION)"
-    echo "  containerd.io:         ${CURRENT_CONTAINERD:-absent} (want $EXPECTED_CONTAINERD_VERSION)"
+    echo "  containerd.io:         ${CURRENT_CONTAINERD:-absent}-${CURRENT_CONTAINERD_REL:-?} (want $EXPECTED_CONTAINERD_VERSION-$EXPECTED_CONTAINERD_RELEASE.el$RHEL_VER)"
     echo "  docker-buildx-plugin:  ${CURRENT_BUILDX:-absent} (want $EXPECTED_BUILDX_VERSION)"
     echo "  docker-compose-plugin: ${CURRENT_COMPOSE:-absent} (want $EXPECTED_COMPOSE_VERSION)"
     echo "Proceeding to complete it."
@@ -856,13 +952,13 @@ echo ""
 echo "=== Phase 6: Verify containerd Config ==="
 CURRENT_PHASE="phase 6 (containerd config)"
 
-# containerd 2.2.1 speaks config v3; 2.3.3 raises the current version to v4.
+# containerd 2.2.1 speaks config v3; 2.3.4 raises the current version to v4.
 # Unlike the 2.2.1 -> 2.2.6 move this replaces, that IS a config-format
 # boundary -- but it is a read-compatible one, and the correct response is
-# still to leave the file alone. Verified against containerd.io 2.3.3 on a node
+# still to leave the file alone. Verified against containerd.io 2.3.x on a node
 # with a relocated root (tests/vm/config-version-check.sh):
 #
-#   - 2.3.3 loads a version = 3 config unchanged. It migrates it IN MEMORY at
+#   - 2.3.4 loads a version = 3 config unchanged. It migrates it IN MEMORY at
 #     load time and logs "Configuration migrated from version 3, use
 #     `containerd config migrate` to avoid migration". Nothing is written back.
 #   - The RPM ships /etc/containerd/config.toml as %config(noreplace), so an
@@ -871,7 +967,7 @@ CURRENT_PHASE="phase 6 (containerd config)"
 #     `containerd config dump` still reports the relocated path.
 #
 # So this phase still VERIFIES rather than rewrites -- and that now matters
-# MORE, not less. `containerd config default` under 2.3.3 emits version = 4,
+# MORE, not less. `containerd config default` under 2.3.4 emits version = 4,
 # and containerd 2.2.1 refuses to load a v4 file at all:
 #
 #   containerd: failed to load TOML from /etc/containerd/config.toml:
@@ -904,7 +1000,7 @@ read_config_version() {
 
 if [ ! -f "$CONTAINERD_CONF" ]; then
     # containerd.io ships this file, so reaching here means it was deliberately
-    # removed. Generating a default is the only option, but under 2.3.3 that
+    # removed. Generating a default is the only option, but under 2.3.4 that
     # default is v4 -- which the rollback containerd cannot read. Say so plainly
     # rather than letting the operator discover it mid-emergency.
     echo -e "${YELLOW}No $CONTAINERD_CONF found - generating a default.${NC}"
@@ -940,7 +1036,7 @@ elif [ "${#CONFIG_VERSION}" -gt 4 ]; then
     echo "Services start next; if containerd fails to come up, this is why."
 elif [ "$CONFIG_VERSION" -le "$ROLLBACK_SAFE_CONFIG_VERSION" ]; then
     # Deliberately bounded from ABOVE only. A lower bound ("is this too old for
-    # 2.3.3?") is not asserted: every node in this fleet came from containerd
+    # 2.3.4?") is not asserted: every node in this fleet came from containerd
     # 2.2.1, which writes v3, so a v2 config would have to be hand-made. Adding
     # an untested lower bound risks refusing a node that is actually fine, and
     # phase 8's readiness gate already catches a config containerd cannot load.
@@ -1091,7 +1187,7 @@ CURRENT_PHASE="phase 7 (nvidia toolkit)"
 
         # Reconfigure NVIDIA runtime for Docker
         # Note: nvidia-ctk doesn't understand containerd config v3, let alone the
-        # v4 that containerd 2.3.3 introduces, so the containerd runtime is skipped.
+        # v4 that containerd 2.3.4 introduces, so the containerd runtime is skipped.
         echo "Configuring NVIDIA runtime for Docker..."
         if nvidia-ctk runtime configure --runtime=docker 2>/dev/null; then
             echo -e "${GREEN}NVIDIA Docker runtime configured.${NC}"
@@ -1240,6 +1336,19 @@ assert_installed docker-ce-cli         "$EXPECTED_DOCKER_VERSION"
 assert_installed containerd.io         "$EXPECTED_CONTAINERD_VERSION"
 assert_installed docker-buildx-plugin  "$EXPECTED_BUILDX_VERSION"
 assert_installed docker-compose-plugin "$EXPECTED_COMPOSE_VERSION"
+
+# The installed containerd.io RELEASE, for the same reason phase 0 checks the
+# payload's: 2.3.4-1 and 2.3.4-2 report an identical %{VERSION}. Phase 0 proves
+# the BUNDLE was right; this proves what rpm actually left on the node, which
+# is not the same claim -- a node that already had -1 installed and whose
+# transaction partially failed would satisfy the version check above.
+INSTALLED_CT_REL=$(rpm -q containerd.io --queryformat '%{RELEASE}' 2>/dev/null || echo "")
+if containerd_release_matches "$INSTALLED_CT_REL" "$EXPECTED_CONTAINERD_RELEASE" "$RHEL_VER"; then
+    echo -e "  ${GREEN}✓ containerd.io release $INSTALLED_CT_REL${NC}"
+else
+    echo -e "${RED}  ✗ containerd.io release is ${INSTALLED_CT_REL:-unreadable}, expected ${EXPECTED_CONTAINERD_RELEASE}.el${RHEL_VER}${NC}"
+    VERIFY_FAILED=1
+fi
 
 if [ "$VERIFY_FAILED" -ne 0 ]; then
     echo ""

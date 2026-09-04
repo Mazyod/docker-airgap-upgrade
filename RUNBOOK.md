@@ -1,6 +1,6 @@
-# Runbook — Docker 29.1.5 → 29.7.2 on Air-Gapped RHEL 8/9 Swarm
+# Runbook — Docker 29.1.5 → 29.8.0 on Air-Gapped RHEL 8/9 Swarm
 
-**Target:** docker-ce 29.7.2, containerd.io 2.3.3, buildx 0.36.1, compose 5.5.0
+**Target:** docker-ce 29.8.0, containerd.io 2.3.4-**2**, buildx 0.37.0, compose 5.5.1
 **From:** docker-ce 29.1.5, containerd.io 2.2.1
 **Rollback:** 29.1.5 / 2.2.1 (bundled)
 
@@ -8,7 +8,15 @@ This crosses containerd 2.2 → 2.3, a minor bump onto containerd's first annual
 It is substantially lower risk than the 28.5.1 → 29.1.5 round, and **nodes can be
 rolled one at a time**.
 
-⚠️ **One new thing to know before you roll back.** containerd 2.3.3 supports config
+⚠️ **This bundle changes runc.** `containerd.io` 2.3.4 was published twice. Both
+builds report version `2.3.4`; `-1` carries runc 1.4.3 and `-2` carries runc 1.5.1.
+This bundle takes `-2`, so every container on the node ends up on a new runtime
+binary. `upgrade-docker.sh` phase 0 asserts the RPM release and refuses a bundle
+built from `-1`, because the version string alone cannot tell them apart. If phase 0
+rejects your bundle for the containerd release, re-download it — do not work around
+the check.
+
+⚠️ **One thing to know before you roll back.** containerd 2.3.4 supports config
 version 4; 2.2.1 supports at most 3. The upgrade never writes a v4 config, so a
 normal rollback is unaffected. But if anyone runs
 `containerd config default > /etc/containerd/config.toml` on an upgraded node, that
@@ -42,8 +50,11 @@ chmod +x *.sh
 
 Produces `/opt/docker-upgrade-bundle.tar.gz`.
 
-The script aborts if any download 404s, any RPM fails digest verification, or any
-operator script is missing — so success means the bundle is complete. Verify:
+The script aborts if any download 404s, any RPM in the four Docker directories fails
+digest verification, or any operator script is missing — so success means the Docker
+half of the bundle is complete. The NVIDIA packages are neither pinned nor digest
+checked, because phase 7 is best-effort and a GPU-less fleet does not need them.
+Verify:
 
 ```bash
 tar tzf /opt/docker-upgrade-bundle.tar.gz | head -30
@@ -70,7 +81,7 @@ cd /opt/docker-offline
 ```
 
 `rm -rf` first is not optional. Extracting over a previous bundle leaves 29.1.5 and
-29.7.2 RPMs side by side; the script now rejects that, but avoiding it is cleaner.
+29.8.0 RPMs side by side; the script now rejects that, but avoiding it is cleaner.
 
 ### 3.2 Record the starting state
 
@@ -121,7 +132,8 @@ still serving and still active in the Swarm.
 | containerd 1.x installed | This script no longer handles the 1.7 → 2.x major migration. Use v1.2.3 (`974683a`). |
 | Starting version isn't 29.1.5 / 2.2.1 | Warns and asks. Untested path. |
 | Wrong, duplicate, corrupt, wrong-arch or wrong-release RPMs | Checked against RPM **metadata**, not filenames |
-| buildx / compose not at 0.36.1 / 5.5.0 | A bundle carrying last round's plugins shouldn't report success |
+| buildx / compose not at 0.37.0 / 5.5.1 | A bundle carrying last round's plugins shouldn't report success |
+| `containerd.io` RPM release is not `2` | 2.3.4-1 and 2.3.4-2 share a version and differ only in runc (1.4.3 vs 1.5.1) |
 | `rpm --test` refuses the transaction | Dependency or space problem, caught while the node is still up |
 
 **Phase 6 will stop you if** the config points at a relocated containerd root
@@ -132,9 +144,11 @@ empty root and make every image and snapshot look lost.
 ### 3.5 Verify
 
 ```bash
-docker version | grep -A2 Server        # 29.7.2
-containerd --version                    # 2.3.3
+docker version | grep -A2 Server        # 29.8.0
+containerd --version                    # 2.3.4
+runc --version                          # 1.5.1
 rpm -q docker-ce docker-ce-cli containerd.io
+rpm -q containerd.io --queryformat '%{VERSION}-%{RELEASE}\n'   # 2.3.4-2.el9
 
 # containerd config was preserved, not regenerated
 grep '^root' /etc/containerd/config.toml   # must match what you recorded in 3.2
@@ -204,7 +218,7 @@ on failure and exits 2 if the cleanup was incomplete.
 Returns the node to 29.1.5 / 2.2.1. It validates and dry-runs before stopping
 anything, so a rollback that cannot succeed fails while the node is still up.
 
-A rolled-back node **can rejoin a cluster containing 29.7.2 nodes** — both are
+A rolled-back node **can rejoin a cluster containing 29.8.0 nodes** — both are
 Docker 29.x engines speaking the same Swarm protocol. containerd's version is local
 to each node.
 
@@ -237,7 +251,7 @@ exist on production air-gapped hosts. Create it first or those commands will fai
 
 ## Things worth knowing
 
-**Mixed versions are fine here.** 29.1.5 and 29.7.2 are both Docker 29.x engines
+**Mixed versions are fine here.** 29.1.5 and 29.8.0 are both Docker 29.x engines
 speaking the same Swarm protocol; containerd runs locally on each node and its
 version does not cross the wire. A partially upgraded cluster is a supported state,
 so you can stop between any two nodes. This is *not* true across the containerd

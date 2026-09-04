@@ -1,10 +1,10 @@
 #!/bin/bash
 # download-docker-packages.sh
 # Run on the ONLINE RHEL 8 server to collect all packages needed for air-gapped upgrade
-VERSION="2.2.0"
+VERSION="2.3.0"
 #
 # This script downloads:
-# - Docker 29.7.2 packages for RHEL 8 and RHEL 9
+# - Docker 29.8.0 packages for RHEL 8 and RHEL 9
 # - Rollback packages (29.1.5) for emergency recovery
 # - NVIDIA Container Toolkit packages (for GPU servers)
 # - All upgrade/rollback/recovery scripts
@@ -24,6 +24,14 @@ echo "Script Version: $VERSION"
 echo "Date: $(date)"
 echo "=========================================="
 
+# NOTE ON THE RELEASE SUFFIX in the filenames below. Every package here is "-1"
+# except containerd.io, which is "-2". That is not a typo and it is not cosmetic:
+# containerd.io 2.3.4 was published twice. -1 and -2 carry the same version, the
+# same file list and the same Requires, and a different /usr/bin/runc -- 1.4.3 in
+# -1, 1.5.1 in -2. Both exist upstream, so a mechanical version bump that leaves
+# the suffix at "-1" downloads successfully and builds a bundle that
+# upgrade-docker.sh phase 0 will refuse on the air-gapped server.
+#
 # Download one RPM into the current directory.
 #
 # -f is load-bearing: without it curl writes the server's 404 HTML body into a
@@ -44,18 +52,18 @@ fetch_pkg() {
 }
 
 echo ""
-echo "=== Downloading Docker 29.7.2 packages ==="
+echo "=== Downloading Docker 29.8.0 packages ==="
 
 # RHEL 8
 echo ""
 echo "Downloading RHEL 8 packages..."
 cd "$DEST_BASE/rhel8"
 for pkg in \
-    docker-ce-29.7.2-1.el8.x86_64.rpm \
-    docker-ce-cli-29.7.2-1.el8.x86_64.rpm \
-    containerd.io-2.3.3-1.el8.x86_64.rpm \
-    docker-buildx-plugin-0.36.1-1.el8.x86_64.rpm \
-    docker-compose-plugin-5.5.0-1.el8.x86_64.rpm
+    docker-ce-29.8.0-1.el8.x86_64.rpm \
+    docker-ce-cli-29.8.0-1.el8.x86_64.rpm \
+    containerd.io-2.3.4-2.el8.x86_64.rpm \
+    docker-buildx-plugin-0.37.0-1.el8.x86_64.rpm \
+    docker-compose-plugin-5.5.1-1.el8.x86_64.rpm
 do
     fetch_pkg 8 "$pkg"
 done
@@ -65,11 +73,11 @@ echo ""
 echo "Downloading RHEL 9 packages..."
 cd "$DEST_BASE/rhel9"
 for pkg in \
-    docker-ce-29.7.2-1.el9.x86_64.rpm \
-    docker-ce-cli-29.7.2-1.el9.x86_64.rpm \
-    containerd.io-2.3.3-1.el9.x86_64.rpm \
-    docker-buildx-plugin-0.36.1-1.el9.x86_64.rpm \
-    docker-compose-plugin-5.5.0-1.el9.x86_64.rpm
+    docker-ce-29.8.0-1.el9.x86_64.rpm \
+    docker-ce-cli-29.8.0-1.el9.x86_64.rpm \
+    containerd.io-2.3.4-2.el9.x86_64.rpm \
+    docker-buildx-plugin-0.37.0-1.el9.x86_64.rpm \
+    docker-compose-plugin-5.5.1-1.el9.x86_64.rpm
 do
     fetch_pkg 9 "$pkg"
 done
@@ -167,6 +175,47 @@ if [ "$CORRUPT" -gt 0 ]; then
 fi
 echo "All packages passed digest verification."
 
+# Record what is actually in the bundle, from RPM METADATA rather than from
+# filenames -- the same rule upgrade-docker.sh phase 0 and
+# tools/vm-bundle-manifest.sh follow. A filename is a claim; the header is the
+# fact, and the two can disagree after a rename or a partial re-download.
+#
+# VERSION-RELEASE, not VERSION. containerd.io 2.3.4 exists as both -1 and -2
+# with identical versions and different runc binaries, so a manifest that
+# recorded only the version would not answer the one question an operator needs
+# it to answer: which build is on this node?
+#
+# This file travels inside the tarball, so an air-gapped operator can read it
+# with no network and no release notes.
+echo ""
+echo "=== Writing bundle manifest ==="
+MANIFEST="$DEST_BASE/MANIFEST.txt"
+{
+    echo "Bundle manifest"
+    echo "Built:  $(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+    echo "By:     download-docker-packages.sh $VERSION"
+    echo ""
+    printf '%-14s  %-24s  %-18s  %s\n' "DIRECTORY" "PACKAGE" "VERSION-RELEASE" "ARCH"
+    for dir in rhel8 rhel9 rollback-rhel8 rollback-rhel9 nvidia; do
+        [ -d "$DEST_BASE/$dir" ] || continue
+        shopt -s nullglob
+        for rpmfile in "$DEST_BASE/$dir"/*.rpm; do
+            meta=$(rpm -qp --queryformat '%{NAME} %{VERSION}-%{RELEASE} %{ARCH}' \
+                "$rpmfile" 2>/dev/null || echo "")
+            if [ -z "$meta" ]; then
+                # Unreadable header. Say so rather than omitting the row: a
+                # short manifest reads as a short bundle.
+                printf '%-14s  %-24s  %-18s  %s\n' "$dir" "${rpmfile##*/}" "UNREADABLE" "?"
+                continue
+            fi
+            read -r m_name m_evr m_arch <<< "$meta"
+            printf '%-14s  %-24s  %-18s  %s\n' "$dir" "$m_name" "$m_evr" "$m_arch"
+        done
+        shopt -u nullglob
+    done
+} > "$MANIFEST"
+cat "$MANIFEST"
+
 # Copy scripts into bundle
 echo ""
 echo "=== Including scripts ==="
@@ -223,13 +272,14 @@ echo "Bundle ready: /opt/docker-upgrade-bundle.tar.gz"
 echo "Size: $(du -h /opt/docker-upgrade-bundle.tar.gz | cut -f1)"
 echo ""
 echo "Contents:"
-echo "  - Docker 29.7.2 / containerd.io 2.3.3 packages (RHEL 8 & 9)"
+echo "  - Docker 29.8.0 / containerd.io 2.3.4-2 packages (RHEL 8 & 9), runc 1.5.1"
 echo "  - Rollback packages (29.1.5 / containerd.io 2.2.1)"
 echo "  - NVIDIA Container Toolkit"
 echo "  - upgrade-docker.sh"
 echo "  - rollback-docker.sh"
 echo "  - recover-dnf.sh"
 echo "  - clean-swarm-networks.sh"
+echo "  - MANIFEST.txt (every package by NAME and VERSION-RELEASE)"
 echo ""
 echo "On air-gapped server:"
 echo "  tar xzf docker-upgrade-bundle.tar.gz -C /opt"

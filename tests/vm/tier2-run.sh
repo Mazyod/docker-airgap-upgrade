@@ -1447,6 +1447,309 @@ else
     bad "2.38 teardown: guest is still '$sw' -- leaving the EXIT trap armed to retry"
 fi
 
+#############################################
+head_ "2.39-2.42  Agent mode: the cleanup dry run and the inventory hash"
+#############################################
+# Slice 5. The cleanup is the one script an agent cannot drive in a single
+# invocation: the inventory is enumerated only AFTER the services stop, so
+# nobody can be told it in advance. The dry run publishes a hash of what it
+# enumerated; the real run hashes ITS OWN enumeration and compares.
+#
+# THE FIXTURE IS NOT OPTIONAL. Without a Swarm the script refuses at the
+# allow-non-swarm gate before stopping anything, and with an empty inventory it
+# takes the nothing-to-clean exit. Either way every case below would pass
+# without executing the code under test, so the fixture is asserted first.
+./reset-baseline.sh >/dev/null 2>&1
+restore_pkgs
+vm "rm -f $SF" >/dev/null 2>&1
+CLEANLOG=/var/log/docker-network-cleanup.log
+
+# Armed before the fixture exists. An interrupted suite must not leave the
+# guest in a Swarm carrying a test overlay network.
+trap 'swarm_net_teardown; swarm_leave' EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
+if swarm_net_fixture; then
+    ok "2.39 fixture: single-node Swarm with an attached overlay network"
+else
+    bad "2.39 fixture: could not build it -- every case below is vacuous"
+fi
+docker_settle
+capture_inventory inv0
+inv_ns=$(vm_try "find /var/run/docker/netns -mindepth 1 -maxdepth 1 2>/dev/null | wc -l" | tail -1)
+if [ "${inv_ns:-0}" -gt 0 ] 2>/dev/null; then
+    ok "2.39 fixture: $inv_ns network namespace(s) to enumerate"
+else
+    bad "2.39 fixture: no network namespaces -- an empty inventory proves nothing"
+fi
+if [ "${INV_KVINO[inv0]}" != "absent" ]; then
+    ok "2.39 fixture: libnetwork key-value store present (inode ${INV_KVINO[inv0]})"
+else
+    bad "2.39 fixture: no key-value store -- an empty inventory proves nothing"
+fi
+if [ "${INV_GW[inv0]}" = "present" ]; then
+    ok "2.39 fixture: docker_gwbridge present"
+else
+    bad "2.39 fixture: no docker_gwbridge -- an empty inventory proves nothing"
+fi
+if [ -n "${INV_VXLAN[inv0]}" ]; then
+    ok "2.39 fixture: VXLAN interface(s) in the host namespace (${INV_VXLAN[inv0]})"
+else
+    # Not a failure: an attachable overlay puts its VXLAN inside the network
+    # namespace, so a host-namespace list is often empty. Said out loud rather
+    # than left invisible, because it means phase 4's VXLAN deletion loop is
+    # not exercised by these cases.
+    skip "2.39 fixture: no VXLAN interface in the host namespace -- phase 4's VXLAN loop is not exercised here"
+fi
+
+# --- 2.39: --dry-run deletes nothing ---
+# It really does stop and restart: that is the point. What it must not do is
+# reach phase 4, so the proof is the phase-4 marker count plus the key-value
+# store's inode, not "the services are up afterwards".
+p4_before=$(log_phase_count "$CLEANLOG" '=== Phase 4: Delete Network State ===')
+p2_dry_before=$(log_phase_count "$CLEANLOG" '=== Phase 2: Stop Services ===')
+rc=$(vm_try "cd /opt/docker-offline && ./clean-swarm-networks.sh --non-interactive --dry-run --status-file=$SF --assume-drained --confirm-stop </dev/null >/dev/null 2>&1; echo \$?" | tail -1)
+if [ "$rc" = "0" ]; then
+    ok "2.39 --dry-run exits 0"
+else
+    bad "2.39 --dry-run exited '$rc', want 0"
+    vm_try "cd /opt/docker-offline && ./clean-swarm-networks.sh --non-interactive --dry-run --status-file=/tmp/x.kv --assume-drained --confirm-stop </dev/null 2>&1" | tail -15 | sed 's/^/       /'
+fi
+docker_settle
+assert_status_complete "2.39" "$SF"
+assert_status_key "2.39" "$SF" mode dry-run
+assert_status_key "2.39" "$SF" result completed
+assert_status_key "2.39" "$SF" deleted false
+assert_status_key "2.39" "$SF" next_action proceed
+assert_status_key "2.39" "$SF" services_stopped false
+assert_status_key "2.39" "$SF" inventory_sha_expected ""
+DRY_SHA=$(status_key "$SF" inventory_sha)
+if printf '%s' "$DRY_SHA" | grep -qE '^[0-9a-f]{64}$'; then
+    ok "2.39 inventory_sha is 64 hex characters (${DRY_SHA:0:12}...)"
+else
+    bad "2.39 inventory_sha is '$DRY_SHA', not a sha256 digest"
+fi
+DRY_TOTAL=$(status_key "$SF" inventory_total)
+if [ "${DRY_TOTAL:-0}" -gt 0 ] 2>/dev/null; then
+    ok "2.39 the dry run enumerated a non-empty inventory ($DRY_TOTAL items)"
+else
+    bad "2.39 inventory_total is '$DRY_TOTAL' -- the nothing-to-clean exit proves nothing"
+fi
+# It stopped, and it did not delete.
+p2_dry_after=$(log_phase_count "$CLEANLOG" '=== Phase 2: Stop Services ===')
+if [ "$p2_dry_after" -gt "$p2_dry_before" ]; then
+    ok "2.39 the dry run really did stop and restart services ($p2_dry_before -> $p2_dry_after)"
+else
+    bad "2.39 phase 2 never ran, so the enumeration was not the post-stop one"
+fi
+assert_phase_count_unchanged "2.39" "$CLEANLOG" '=== Phase 4: Delete Network State ===' "$p4_before"
+assert_inventory_intact "2.39" inv0
+
+# --- 2.40: a wrong hash refuses, node intact ---
+vm "rm -f $SF" >/dev/null 2>&1
+capture_inventory inv1
+ZEROSHA=$(printf '0%.0s' $(seq 1 64))
+rc=$(vm_try "cd /opt/docker-offline && ./clean-swarm-networks.sh --non-interactive --status-file=$SF --assume-drained --confirm-stop --confirm-delete --expect-inventory-sha=$ZEROSHA </dev/null >/dev/null 2>&1; echo \$?" | tail -1)
+if [ "$rc" = "1" ]; then
+    ok "2.40 a mismatched inventory hash exits 1"
+else
+    bad "2.40 mismatched hash exited '$rc', want 1"
+fi
+docker_settle
+assert_status_key "2.40" "$SF" result refused
+assert_status_key "2.40" "$SF" refusal_reason inventory-changed
+assert_status_key "2.40" "$SF" next_action rerun-dry-run
+assert_status_key "2.40" "$SF" deleted false
+assert_status_key "2.40" "$SF" inventory_sha_expected "$ZEROSHA"
+assert_status_complete "2.40" "$SF"
+# Both hashes in the detail, or an operator cannot tell what moved.
+rd=$(status_key "$SF" refusal_detail)
+if printf '%s' "$rd" | grep -q "$ZEROSHA" && printf '%s' "$rd" | grep -q "$DRY_SHA"; then
+    ok "2.40 refusal_detail carries both hashes"
+else
+    bad "2.40 refusal_detail is '$rd' and does not carry both hashes"
+fi
+# It DID stop -- the comparison happens after the post-stop enumeration -- and
+# it must have restarted before refusing.
+assert_phase_count_unchanged "2.40" "$CLEANLOG" '=== Phase 4: Delete Network State ===' "$p4_before"
+assert_inventory_intact "2.40" inv1
+
+# --- 2.41: --confirm-delete with no hash refuses, in BOTH modes ---
+# Services are never stopped here, so this is asserted temporally: finding them
+# active afterwards would also hold after a stop, a delete and a restart.
+vm "rm -f $SF" >/dev/null 2>&1
+capture_inventory inv2
+p2_before=$(log_phase_count "$CLEANLOG" '=== Phase 2: Stop Services ===')
+rc=$(vm_try "cd /opt/docker-offline && ./clean-swarm-networks.sh --non-interactive --status-file=$SF --assume-drained --confirm-stop --confirm-delete </dev/null >/dev/null 2>&1; echo \$?" | tail -1)
+if [ "$rc" = "1" ]; then
+    ok "2.41 --confirm-delete with no hash exits 1 under --non-interactive"
+else
+    bad "2.41 exited '$rc' with no hash, want 1"
+fi
+assert_status_key "2.41" "$SF" result refused
+assert_status_key "2.41" "$SF" refusal_reason inventory-sha-required
+assert_status_key "2.41" "$SF" next_action rerun-dry-run
+assert_status_key "2.41" "$SF" deleted false
+# The interactive form, on a terminal-shaped stdin. A pre-declared answer wins
+# in both modes, so this is the case that proves the hash is required in BOTH.
+rc=$(vm_try "cd /opt/docker-offline && yes y | ./clean-swarm-networks.sh --confirm-delete >/dev/null 2>&1; echo \$?" | tail -1)
+if [ "$rc" = "1" ]; then
+    ok "2.41 --confirm-delete with no hash exits 1 interactively too, with a yes stream"
+else
+    bad "2.41 interactive form exited '$rc' with a yes stream, want 1"
+fi
+assert_phase_count_unchanged "2.41" "$CLEANLOG" '=== Phase 2: Stop Services ===' "$p2_before"
+# `exact` because no service was stopped in this case: nothing could have
+# recreated a namespace in between, so the set itself must be identical.
+assert_inventory_intact "2.41" inv2 exact
+
+# --- 2.41a: a malformed hash is a usage error ---
+vm "rm -f $SF" >/dev/null 2>&1
+capture_inventory inv3
+p2_before=$(log_phase_count "$CLEANLOG" '=== Phase 2: Stop Services ===')
+rc=$(vm_try "cd /opt/docker-offline && ./clean-swarm-networks.sh --non-interactive --status-file=$SF --assume-drained --confirm-stop --confirm-delete --expect-inventory-sha=nothex </dev/null >/dev/null 2>&1; echo \$?" | tail -1)
+if [ "$rc" = "1" ]; then
+    ok "2.41a a malformed --expect-inventory-sha exits 1"
+else
+    bad "2.41a malformed hash exited '$rc', want 1"
+fi
+out=$(vm_try "cd /opt/docker-offline && ./clean-swarm-networks.sh --non-interactive --status-file=$SF --assume-drained --confirm-stop --confirm-delete --expect-inventory-sha=nothex </dev/null 2>&1")
+if printf '%s' "$out" | grep -q "64 lowercase hex characters"; then
+    ok "2.41a the refusal says the value is malformed, not that the inventory changed"
+else
+    bad "2.41a the refusal does not identify the value as malformed"
+    printf '%s\n' "$out" | tail -6 | sed 's/^/       /'
+fi
+# A usage error is rejected at parse time, before the traps are armed, so NO
+# record is written -- the same contract every other usage error follows and
+# the reason the runbook tells a caller to compare run_id.
+if vm_try "test -e $SF; echo \$?" | tail -1 | grep -qx 1; then
+    ok "2.41a a parse-time usage error wrote no status file"
+else
+    bad "2.41a a status file appeared for a usage error"
+fi
+assert_phase_count_unchanged "2.41a" "$CLEANLOG" '=== Phase 2: Stop Services ===' "$p2_before"
+assert_inventory_intact "2.41a" inv3 exact
+
+# --- 2.41b: --dry-run beside a delete answer is a usage error ---
+vm "rm -f $SF" >/dev/null 2>&1
+capture_inventory inv4
+p2_before=$(log_phase_count "$CLEANLOG" '=== Phase 2: Stop Services ===')
+rc=$(vm_try "cd /opt/docker-offline && ./clean-swarm-networks.sh --non-interactive --status-file=$SF --assume-drained --confirm-stop --dry-run --confirm-delete </dev/null >/dev/null 2>&1; echo \$?" | tail -1)
+if [ "$rc" = "1" ]; then
+    ok "2.41b --dry-run --confirm-delete exits 1"
+else
+    bad "2.41b --dry-run --confirm-delete exited '$rc', want 1"
+fi
+out=$(vm_try "cd /opt/docker-offline && ./clean-swarm-networks.sh --non-interactive --status-file=$SF --assume-drained --confirm-stop --dry-run --confirm-delete </dev/null 2>&1")
+if printf '%s' "$out" | grep -q "cannot be combined with"; then
+    ok "2.41b the refusal names the contradiction"
+else
+    bad "2.41b the refusal does not name the contradiction"
+    printf '%s\n' "$out" | tail -6 | sed 's/^/       /'
+fi
+# The same combination with --expect-inventory-sha instead of the gate answer.
+rc=$(vm_try "cd /opt/docker-offline && ./clean-swarm-networks.sh --non-interactive --status-file=$SF --assume-drained --confirm-stop --dry-run --expect-inventory-sha=$DRY_SHA </dev/null >/dev/null 2>&1; echo \$?" | tail -1)
+if [ "$rc" = "1" ]; then
+    ok "2.41b --dry-run --expect-inventory-sha exits 1 as well"
+else
+    bad "2.41b --dry-run --expect-inventory-sha exited '$rc', want 1"
+fi
+if vm_try "test -e $SF; echo \$?" | tail -1 | grep -qx 1; then
+    ok "2.41b a parse-time usage error wrote no status file"
+else
+    bad "2.41b a status file appeared for a usage error"
+fi
+assert_phase_count_unchanged "2.41b" "$CLEANLOG" '=== Phase 2: Stop Services ===' "$p2_before"
+assert_inventory_intact "2.41b" inv4 exact
+
+# --- 2.42: a matching hash proceeds, and deletes exactly what was listed ---
+# Two passes, back to back, exactly as docs/AGENT-RUNBOOK.md tells an agent to
+# run them.
+vm "rm -f $SF" >/dev/null 2>&1
+vm_try "cd /opt/docker-offline && ./clean-swarm-networks.sh --non-interactive --dry-run --status-file=$SF --assume-drained --confirm-stop </dev/null >/dev/null 2>&1" >/dev/null
+docker_settle
+PASS1_SHA=$(status_key "$SF" inventory_sha)
+PASS1_TOTAL=$(status_key "$SF" inventory_total)
+if printf '%s' "$PASS1_SHA" | grep -qE '^[0-9a-f]{64}$'; then
+    ok "2.42 pass one published a hash for $PASS1_TOTAL item(s)"
+else
+    bad "2.42 pass one published no usable hash ('$PASS1_SHA')"
+fi
+kv_before=$(vm_try "stat -c %i $KV_DB_PATH 2>/dev/null || echo absent" | tail -1)
+vm "rm -f $SF" >/dev/null 2>&1
+# The cleanup log is append-only and every earlier case in this suite has
+# written to it. Record its length so the phase-4 assertions below read THIS
+# run's block rather than the first one in the file.
+loglines_before=$(vm_try "wc -l < $CLEANLOG 2>/dev/null || echo 0" | tr -d ' \r' | tail -1)
+rc=$(vm_try "cd /opt/docker-offline && ./clean-swarm-networks.sh --non-interactive --status-file=$SF --assume-drained --confirm-stop --confirm-delete --expect-inventory-sha=$PASS1_SHA </dev/null >/dev/null 2>&1; echo \$?" | tail -1)
+if [ "$rc" = "0" ] || [ "$rc" = "2" ]; then
+    ok "2.42 pass two ran with the matching hash (exit $rc)"
+else
+    bad "2.42 pass two exited '$rc', want 0 or 2"
+    vm_try "tail -40 $CLEANLOG" | sed 's/^/       /'
+fi
+docker_settle
+assert_status_complete "2.42" "$SF"
+assert_status_key "2.42" "$SF" deleted true
+assert_status_key "2.42" "$SF" failed_items 0
+assert_status_key "2.42" "$SF" inventory_sha "$PASS1_SHA"
+assert_status_key "2.42" "$SF" inventory_sha_expected "$PASS1_SHA"
+assert_status_key "2.42" "$SF" services_stopped false
+# It deleted, and it deleted exactly the listed items. The key-value store is
+# the direct observation: dockerd opens an existing one rather than replacing
+# it, so a changed inode means the file was genuinely removed. Counting
+# namespaces afterwards would measure what dockerd rebuilt on restart, not what
+# was deleted, so the removal itself is read from the run's own log.
+kv_after=$(vm_try "stat -c %i $KV_DB_PATH 2>/dev/null || echo absent" | tail -1)
+if [ "$kv_after" != "$kv_before" ]; then
+    ok "2.42 the key-value store was really deleted (inode $kv_before -> $kv_after)"
+else
+    bad "2.42 the key-value store inode is unchanged ($kv_after) -- nothing was deleted"
+fi
+p4_after=$(log_phase_count "$CLEANLOG" '=== Phase 4: Delete Network State ===')
+if [ "$p4_after" -gt "$p4_before" ]; then
+    ok "2.42 phase 4 ran ($p4_before -> $p4_after)"
+else
+    bad "2.42 phase 4 never ran, so nothing was deleted"
+fi
+# The tick is multibyte, and `.` in a C locale matches one BYTE, so an awk
+# pattern of `^  . ` can count zero removals on a guest with no UTF-8 locale.
+# Slice the block and count the literal character instead.
+removed=$(vm_try "tail -n +$((loglines_before + 1)) $CLEANLOG | sed -n '/=== Phase 4: Delete Network State ===/,/=== Phase 5: Start Services ===/p' | grep -cF '✓' || echo 0" | tr -d ' \r' | tail -1)
+if [ "${removed:-0}" = "$PASS1_TOTAL" ]; then
+    ok "2.42 phase 4 removed exactly the $PASS1_TOTAL enumerated item(s)"
+else
+    bad "2.42 phase 4 reported $removed removals for an inventory of $PASS1_TOTAL"
+fi
+# "already gone" is also printed with a tick. Within one run that enumerated
+# after the stop and deleted straight away, nothing should have vanished on its
+# own -- and counting those as removals would let a phase 4 that deleted
+# NOTHING report a full tally.
+noops=$(vm_try "tail -n +$((loglines_before + 1)) $CLEANLOG | sed -n '/=== Phase 4: Delete Network State ===/,/=== Phase 5: Start Services ===/p' | grep -cF 'already gone' || echo 0" | tr -d ' \r' | tail -1)
+if [ "${noops:-0}" = "0" ]; then
+    ok "2.42 every removal was a real deletion, not an 'already gone'"
+else
+    bad "2.42 $noops item(s) were already gone before phase 4 reached them"
+fi
+assert_vm_eq "2.42 docker active again" "systemctl is-active docker" "active"
+assert_vm_eq "2.42 containerd active again" "systemctl is-active containerd" "active"
+# Containers, images and volumes are NOT touched by this script.
+assert_vm_eq "2.42 canary data intact" \
+    "docker start survivor >/dev/null 2>&1; docker exec survivor cat /data/canary.txt" \
+    "VOLUME-CANARY-DATA"
+
+swarm_net_teardown
+swarm_leave
+sw=$(vm_try "docker info --format '{{.Swarm.LocalNodeState}}'" | tr -d '\r' | tail -1)
+if [ "$sw" = "inactive" ]; then
+    ok "2.42 teardown: the guest left the Swarm"
+    trap - EXIT INT TERM
+else
+    bad "2.42 teardown: guest is still '$sw' -- leaving the EXIT trap armed to retry"
+fi
+
 vm "rm -f $SF" >/dev/null 2>&1
 ./reset-baseline.sh >/dev/null 2>&1
 fi

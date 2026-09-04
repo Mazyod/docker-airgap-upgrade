@@ -216,6 +216,10 @@ docker node update --availability drain <node-hostname>
 It shows exactly what it will delete and asks before deleting. It restores services
 on failure and exits 2 if the cleanup was incomplete.
 
+To see the list without deleting anything, add `--dry-run`: it stops, enumerates,
+prints the inventory and its hash, restarts and exits 0. Without a terminal the script
+takes two passes, and `docs/AGENT-RUNBOOK.md` has the procedure.
+
 ### Roll back
 
 ```bash

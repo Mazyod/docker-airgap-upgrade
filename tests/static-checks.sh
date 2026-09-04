@@ -1354,6 +1354,100 @@ else
     bad "upgrade-docker.sh preflight exit misplaced (p0@${p0:-?} p1@${p1:-?} exit@${pf_exit:-?} p2@${p2:-?})"
 fi
 
+# The inventory hash covers NAMES, not contents.
+#
+# The libnetwork KV database's bytes change on every dockerd run, so a hash
+# that read them would never match between a dry run and the real one. Worse
+# than useless: --expect-inventory-sha would then refuse every honest second
+# pass, and the pressure would be to drop the check rather than fix it.
+#
+# Scoped to compute_inventory_sha's own body, comments stripped -- the block
+# explains what it must not do, and a grep that reads its own prose as code
+# reports the explanation as the crime.
+if ! grep -q '^compute_inventory_sha() {' clean-swarm-networks.sh; then
+    bad "clean-swarm-networks.sh has no compute_inventory_sha to check"
+else
+    csi=$(awk '/^compute_inventory_sha\(\) \{/,/^\}/' clean-swarm-networks.sh \
+        | grep -vE '^[[:space:]]*#')
+    # A hashing command with a FILE OPERAND reads that file's bytes. The only
+    # permitted form is a bare `sha256sum` in the pipeline, fed from stdin.
+    bytes=$(printf '%s\n' "$csi" \
+        | grep -nE '(sha[0-9]+sum|md5sum|cksum|b2sum|openssl)[[:space:]]+[^|&;)[:space:]]' || true)
+    # Any other way of getting a file's contents into the pipeline.
+    reads=$(printf '%s\n' "$csi" \
+        | grep -nE '(^|[^a-z_-])(cat|head|tail|od|xxd|base64)[[:space:]]|\$\(<|<[[:space:]]*"?\$' || true)
+    # And it must actually hash something.
+    hashes=$(printf '%s\n' "$csi" | grep -cE 'sha256sum' || true)
+    if [ -z "$bytes" ] && [ -z "$reads" ] && [ "${hashes:-0}" -ge 1 ]; then
+        ok "clean-swarm-networks.sh hashes inventory names, never file contents"
+    else
+        bad "clean-swarm-networks.sh inventory hash reads a file's bytes"
+        printf '%s\n%s\n' "$bytes" "$reads" | grep . | sed 's/^/       /'
+        [ "${hashes:-0}" -ge 1 ] || printf '       no sha256sum in the block at all\n'
+    fi
+    # And the pipeline must fail CLOSED. The script runs `set -e` without
+    # `pipefail`, so a failing `sort` upstream of a succeeding `sha256sum`
+    # yields a confident hash of nothing -- which a later run would happily
+    # "match". A hash of nothing authorising a deletion is the whole hazard.
+    if printf '%s\n' "$csi" | grep -q 'set -o pipefail'; then
+        ok "clean-swarm-networks.sh hashes the inventory under pipefail"
+    else
+        bad "clean-swarm-networks.sh inventory hash pipeline is not fail-closed"
+    fi
+fi
+
+# --dry-run must never reach the deletion loop. The delete gate is what stands
+# between the two, and the dry-run exit has to sit BEFORE it: after it, a
+# pre-declared answer or a prompt could carry a "dry" run into phase 4.
+# shellcheck disable=SC2016  # a literal grep pattern, not an expansion
+dr=$(grep -n 'if \[ "\$DRY_RUN" = true \]; then' clean-swarm-networks.sh | tail -1 | cut -d: -f1)
+dg=$(grep -n 'if ! gate confirm-delete' clean-swarm-networks.sh | head -1 | cut -d: -f1)
+p4=$(grep -n '^CURRENT_PHASE="phase 4 (delete network state)"' clean-swarm-networks.sh | head -1 | cut -d: -f1)
+# Position is necessary and not sufficient: a branch that sits before the gate
+# and then falls through into it is worse than one that sits after, because it
+# reads as a dry run and deletes. Require the branch body to restart the
+# services it stopped and to LEAVE.
+dr_body=""
+if [ -n "$dr" ]; then
+    dr_body=$(awk -v st="$dr" 'NR >= st { print; if (NR > st && /^fi$/) exit }' clean-swarm-networks.sh)
+fi
+dr_exits=$(printf '%s\n' "$dr_body" | grep -cE '^[[:space:]]*exit 0$' || true)
+dr_starts=$(printf '%s\n' "$dr_body" | grep -cE '^[[:space:]]*start_services$' || true)
+if [ -n "$dr" ] && [ -n "$dg" ] && [ -n "$p4" ] && [ "$dr" -lt "$dg" ] && [ "$dg" -lt "$p4" ] &&
+   [ "${dr_exits:-0}" -ge 1 ] && [ "${dr_starts:-0}" -ge 1 ]; then
+    ok "clean-swarm-networks.sh restarts services and exits a dry run before the delete gate"
+else
+    bad "clean-swarm-networks.sh dry-run branch is wrong (dry@${dr:-?} gate@${dg:-?} phase4@${p4:-?} exits=$dr_exits starts=$dr_starts)"
+fi
+
+# The sha comparison must also sit before the delete gate, for the same reason:
+# a mismatch that could be answered past by --confirm-delete is not a guard.
+# shellcheck disable=SC2016  # a literal grep pattern, not an expansion
+sc=$(grep -n 'EXPECT_INVENTORY_SHA" != "\$INVENTORY_SHA' clean-swarm-networks.sh | head -1 | cut -d: -f1)
+if [ -n "$sc" ] && [ -n "$dg" ] && [ "$sc" -lt "$dg" ]; then
+    ok "clean-swarm-networks.sh compares the inventory hash before the delete gate"
+else
+    bad "clean-swarm-networks.sh hash comparison is at ${sc:-?}, not before the gate at ${dg:-?}"
+fi
+
+# Deletion iterates the CAPTURED arrays and never re-globs. This is the
+# load-bearing invariant the two-pass protocol must not disturb: a stale hash
+# still cannot authorise deleting a name this run did not enumerate.
+p4_to=$(grep -n '^CURRENT_PHASE="phase 5 (start services)"' clean-swarm-networks.sh | head -1 | cut -d: -f1)
+if [ -n "$p4" ] && [ -n "$p4_to" ]; then
+    p4body=$(sed -n "${p4},${p4_to}p" clean-swarm-networks.sh | grep -vE '^[[:space:]]*#')
+    reglob=$(printf '%s\n' "$p4body" \
+        | grep -nE 'ip -o link show|find[[:space:]]+/|netns/\*|for [a-z]+ in [^"$]*\*' || true)
+    if [ -z "$reglob" ]; then
+        ok "clean-swarm-networks.sh phase 4 deletes from the captured lists, never a re-glob"
+    else
+        bad "clean-swarm-networks.sh phase 4 re-enumerates instead of using the captured lists"
+        printf '%s\n' "$reglob" | sed 's/^/       /'
+    fi
+else
+    bad "could not locate phase 4 in clean-swarm-networks.sh"
+fi
+
 # Phase 6 must still ENFORCE what preflight predicts, through the same helpers,
 # so the two cannot answer differently. Preflight predicts; phase 6 enforces.
 p6=$(grep -n '^CURRENT_PHASE="phase 6 (containerd config)"' upgrade-docker.sh | head -1 | cut -d: -f1)

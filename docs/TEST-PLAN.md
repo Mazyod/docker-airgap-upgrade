@@ -363,6 +363,42 @@ D7 passing there is the whole point: the mutant's non-zero exit comes from the
 rollback completing and *then* failing to start containerd. Any guard test that
 checks only an exit code is measuring the outage it was meant to prevent.
 
+### 2.39–2.42 — the cleanup dry run and the inventory hash ⚑
+
+New with `clean-swarm-networks.sh --dry-run` and `--expect-inventory-sha`. Automated in
+`tests/vm/tier2-run.sh agent`, which is **destructive** — it resets the baseline
+afterwards.
+
+**The fixture is not optional and is asserted before any case runs.** On a host that
+is not in a Swarm the script refuses at the `allow-non-swarm` gate before stopping
+anything, and an empty inventory takes the nothing-to-clean exit; either way every
+case below would pass without executing the code under test. So the guest is made a
+single-node Swarm with an attachable overlay network and a container attached to it,
+and the harness asserts there are namespaces, a key-value store and a
+`docker_gwbridge` to enumerate.
+
+| # | Test | From | Pass criteria |
+|---|---|---|---|
+| 2.39 | `--dry-run` deletes nothing | S1 + Swarm fixture | Exit 0, `mode=dry-run`, `deleted=false`, `next_action=proceed`, `inventory_sha` is 64 hex characters, `inventory_total > 0`. Phase 2 **did** run and phase 4 did **not**; the key-value store's inode is unchanged; `docker_gwbridge` present; both services `active` |
+| 2.40 | A wrong hash refuses, node intact | S1 + fixture | Exit 1, `refusal_reason=inventory-changed`, `next_action=rerun-dry-run`, `deleted=false`, `refusal_detail` carries both hashes. Phase 4 marker count unchanged; key-value store inode unchanged; services back `active` |
+| 2.41 | `--confirm-delete` with no hash refuses, in **both** modes | S1 + fixture | Exit 1, `refusal_reason=inventory-sha-required`. Asserted **temporally** — the phase-2 marker count is unchanged, so the services were never stopped — plus the exact set of namespaces unchanged. The interactive form is run with a live `yes y` stream and refuses too |
+| 2.41a | A malformed hash is a usage error | S1 + fixture | Exit 1, the message says the value is malformed rather than that the inventory changed, **no status file is written**, phase 2 never ran, inventory intact |
+| 2.41b | `--dry-run` beside a delete answer is a usage error | S1 + fixture | Exit 1 for `--dry-run --confirm-delete` and for `--dry-run --expect-inventory-sha`, message names the contradiction, no status file, phase 2 never ran, inventory intact |
+| 2.42 | A matching hash proceeds | S1 + fixture | Two passes back to back. Exit 0 or 2, `deleted=true`, `failed_items=0`, `inventory_sha` equals the first pass's. The key-value store's **inode changed**, phase 4 ran, and it reported exactly `inventory_total` removals. Services back `active`, canary volume data intact |
+
+**Mutation-tested**, in `tests/vm/agent-mode-negative-control.sh`:
+
+- **M4a** neuters the hash comparison so it always matches, and runs 2.40's exact
+  invocation — a hash of 64 zeros no enumeration can produce. The mutant exits **0**
+  and deletes the node's network state, which is why 2.40 asserts the key-value
+  store's inode and the phase-4 marker count rather than the exit code.
+- **M4b** makes `--confirm-delete` accepted with no hash, and runs 2.41's exact
+  invocation on the same fixture. The mutant stops the services and deletes an
+  inventory nothing had seen.
+
+Neither mutant reproduces anything without the Swarm fixture: it would refuse at the
+`allow-non-swarm` gate long before reaching a stop or a delete.
+
 ### 2.4 — Relocated-root regression, in full
 
 The earlier version of this test only checked that a string survived in a file. That

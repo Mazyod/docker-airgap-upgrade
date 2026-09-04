@@ -236,6 +236,8 @@ and `drain_performed` for whether **this run** did the draining.
 | `--preflight` | upgrade | Run every check that can be made with the node untouched, report, exit |
 | `--non-interactive` | upgrade, cleanup | Refuse, rather than prompt, on a gate with no answer. **Requires `--status-file`** |
 | `--status-file=PATH` | all three | Write a `key=value` record of the run to PATH. Absolute paths only |
+| `--dry-run` | cleanup | Stop, enumerate, print the inventory and its hash, restart, exit 0. Deletes nothing |
+| `--expect-inventory-sha=SHA` | cleanup | Refuse unless this run's own enumeration hashes to SHA |
 | `--help` | all three | Usage, exit 0. Works as any user and touches nothing |
 | `--version` | all three | The script's version, exit 0 |
 
@@ -301,9 +303,64 @@ survives in the record as `tasks_remaining=3` versus `tasks_remaining=unknown`.
 **`--confirm-delete` is refused on its own, in every mode**, with
 `refusal_reason=inventory-sha-required` and the node untouched. The inventory is enumerated
 only *after* the services stop, so a pre-declared yes would authorise deleting a list nothing
-had seen — which is the exact bypass this interface exists to prevent. The flag that supplies
-the hash to check the inventory against arrives with the dry run in a later change. Until then
-the only path to deletion is answering the live question after enumeration, on a terminal.
+had seen — which is the exact bypass this interface exists to prevent. Pair it with
+`--expect-inventory-sha` from an immediately preceding `--dry-run`, or answer the live
+question after enumeration on a terminal. There is no third way.
+
+### The two-pass cleanup
+
+The cleanup is the one script an agent cannot drive in a single invocation, and the reason is
+structural rather than an omission. The inventory is enumerated **after** docker and containerd
+stop, deliberately, so the confirmation describes exactly what gets deleted. Nobody — human or
+agent — can know that list before the node is already down.
+
+So it takes two passes.
+
+**Pass one, the dry run.** It stops services, enumerates, prints the inventory and its hash,
+restarts services, and exits 0 having deleted nothing.
+
+```
+./clean-swarm-networks.sh --non-interactive --status-file=/run/clean-1.kv \
+    --assume-drained --confirm-stop --dry-run
+```
+
+Read `inventory_sha` from that record. `inventory_total` tells you whether there was anything
+to clean at all: `0` means the run took the nothing-to-clean exit, `result=nothing-to-do`, and
+there is no second pass to make.
+
+**Pass two, the real run.** Immediately. Same gate flags, plus the delete answer and the hash
+the first pass printed.
+
+```
+./clean-swarm-networks.sh --non-interactive --status-file=/run/clean-2.kv \
+    --assume-drained --confirm-stop --confirm-delete \
+    --expect-inventory-sha=<inventory_sha from pass one>
+```
+
+The second run enumerates again, hashes **its own** list, and compares. On a mismatch it
+restarts services and refuses with `refusal_reason=inventory-changed` and
+`next_action=rerun-dry-run`, having deleted nothing.
+
+**What the hash proves, and what it does not.** Services restart between the two passes, so
+dockerd recreates network namespaces and VXLAN interfaces. The hash covers the **set of names
+and paths**, never file contents, so it proves the list is the same list. It does not prove the
+objects behind those names are the same objects: a namespace file with the same name after a
+daemon restart is a different namespace. It is a name-list equality check and nothing more —
+not a check that the node is unchanged, and not consent from anything that inspected what is
+about to be destroyed.
+
+**Nothing enforces freshness.** A hash from an hour-old dry run is accepted if the names still
+match. Take it from the immediately preceding run and no other. What is enforced regardless is
+that the second run deletes **only what it enumerated itself** — a stale hash can never
+authorise deleting a name this run did not see.
+
+`--dry-run` on the same command line as `--confirm-delete`, `--no-confirm-delete` or
+`--expect-inventory-sha` is a usage error, rejected before anything runs. A dry run's
+definition is that it deletes nothing; a pre-declared delete answer beside it is two
+contradictory instructions.
+
+A `--expect-inventory-sha` value that is not 64 lowercase hex characters is also a usage error,
+not a mismatch — so a typo does not send you inspecting the node.
 
 ### `--preflight`
 
@@ -443,6 +500,7 @@ services, which is what its recovery logic needs. A stop that failed partway lea
 | `stop-failed` | a unit was not conclusively stopped | all three |
 | `gate-unanswered:<name>` | `--non-interactive` was given and that question had no flag | upgrade, cleanup |
 | `inventory-sha-required` | `--confirm-delete` was given with no inventory hash to check it against | cleanup |
+| `inventory-changed` | this run's inventory does not hash to `--expect-inventory-sha`; nothing was deleted | cleanup |
 | `relocated-root-missing` | the configured containerd root does not exist | upgrade |
 | `verification-failed` | installed versions do not match the target | upgrade, rollback |
 | `config-version-blocks-rollback` | the config the rollback would load is one it cannot read | rollback |
@@ -575,6 +633,8 @@ guard decided.
 | `services_stopped` | `true` \| `false` |
 | `docker_data_root` | path, or `unknown` |
 | `inventory_total` | integer, or `unknown` |
+| `inventory_sha` | sha256 of the inventory this run enumerated, or empty |
+| `inventory_sha_expected` | the value passed to `--expect-inventory-sha`, or empty |
 | `vxlan_count` | integer, or `unknown` |
 | `netns_count` | integer, or `unknown` |
 | `kv_db_present` | `true` \| `false` \| `unknown` |
@@ -639,7 +699,8 @@ Four gates, two of them unconditional — the drain attestation and the stop con
 | `confirm-stop` | Always, after the above | Stop docker and containerd now? | no | exits 0, nothing changed |
 | `confirm-delete` | Only when the enumerated inventory is non-empty | Delete the state listed above? | no | restarts services, exits 0, nothing deleted |
 
-`--confirm-delete` on its own is refused in every mode; see the flag section above.
+`--confirm-delete` on its own is refused in every mode; pair it with `--expect-inventory-sha`
+from a preceding `--dry-run`. See the two-pass procedure above.
 
 The drain attestation here attests only to the drain. The script never checks task emptiness,
 so confirm it yourself from a manager before running this.
@@ -669,7 +730,9 @@ Read this first, from the status file. The prose below is for a run that had no
 | `refused` | `tasks-present` | `investigate` | the drain already ran; wait and look from a manager |
 | `refused` | `drain-unconfirmed` | `drain-from-manager` | drain it from a manager, confirm it is empty, then retry |
 | `refused` | `config-version-blocks-rollback` | `restore-config` | restore the named backup, then try again |
-| `refused` | `inventory-sha-required` | `rerun-dry-run` | you cannot pre-answer the deletion; run the cleanup on a terminal |
+| `refused` | `inventory-sha-required` | `rerun-dry-run` | you cannot pre-answer the deletion; dry run first, then pass its hash |
+| `refused` | `inventory-changed` | `rerun-dry-run` | the node changed between the two passes; dry run again and use the new hash |
+| `refused` | `enumeration-failed` | `investigate` | the inventory could not be read or hashed. Services were restored; nothing was deleted |
 | `failed` / `interrupted` | — | `start-services` | packages untouched, services down: start containerd, wait, then docker |
 | `failed` / `interrupted` | — | `investigate` | report `pkg_state`, `phase` and the log; do not guess between retry and rollback |
 
@@ -811,7 +874,8 @@ as they are. **Escalate rather than hand-editing a containerd config on a produc
 an upgrade unable to attach to overlay networks, or when dockerd logs `failed adding service
 binding`. Drain the node and confirm it is empty first. It stops services, lists exactly what
 it will delete, asks, and restores services if you decline. It exits **2** when the cleanup
-completed but some items could not be removed — treat 2 as "not done", not as success.
+completed but some items could not be removed — treat 2 as "not done", not as success. Without
+a terminal it takes two passes; see the two-pass procedure in the flag section.
 
 **`recover-dnf.sh`** is a diagnostic. It does **not** refuse end-of-file: with stdin closed it
 skips its Option A and exits 0. That is safe but it is not read-only — by the time it asks, it

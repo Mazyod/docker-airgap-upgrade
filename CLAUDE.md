@@ -336,8 +336,45 @@ one list that silently omitted them would be worse than advertising none.
 **`--confirm-delete` is refused without an inventory hash in every mode**, not only under
 `--non-interactive`. A pre-declared answer wins in both modes, so the flag alone would skip the
 post-enumeration confirmation with nothing having seen the inventory — the exact bypass the
-enumerate-after-the-stop ordering exists to prevent. The hash flag arrives with the cleanup dry
-run; until then the refusal is unconditional.
+enumerate-after-the-stop ordering exists to prevent.
+
+### The cleanup dry run and `--expect-inventory-sha`
+
+`clean-swarm-networks.sh --dry-run` stops, enumerates, prints the inventory and its hash,
+restarts, and exits 0 having deleted nothing. It reaches the delete gate's **existing "no"
+branch** by flag instead of by prompt — it is not a second route through the script. The real
+run then hashes **its own** enumeration and refuses on a mismatch, restarting services first.
+
+Four properties are load-bearing:
+
+- **The hash covers names and paths, never file contents.** The libnetwork key-value store's
+  bytes change on every dockerd run, so hashing them would make an honest second pass fail
+  every time — and the pressure would then be to drop the check rather than fix it. Section
+  1.14 greps `compute_inventory_sha` for any read of a file's bytes.
+- **The hashing pipeline runs under `set -o pipefail`, in a subshell.** The script has `set -e`
+  without `pipefail`, so a failing `sort` upstream of a succeeding `sha256sum` would produce a
+  confident hash of nothing — which a later run would happily "match". A failure is
+  `enumeration-failed`, never an empty inventory, by the same rule the enumeration already
+  follows.
+- **`LC_ALL=C sort` is what makes the hash reproducible at all.** Neither `ip` nor `find`
+  guarantees an order.
+- **The dry-run exit and the hash comparison both sit BEFORE the delete gate.** After it,
+  either could be answered past by a pre-declared `--confirm-delete`.
+
+**The two passes are a weakening, and it is stated rather than hidden.** Services restart in
+between, so dockerd recreates namespaces and interfaces: the hash proves the *set of names* is
+unchanged, not that the objects behind them are the same objects. What is untouched is the
+load-bearing invariant — the destructive run still enumerates after the stop and deletes
+exactly those captured arrays, never re-globbing, so a stale hash can never authorise deleting
+a name that run did not enumerate. Section 1.14 greps phase 4 for a re-glob.
+
+Freshness is documented, not enforced: nothing stops a caller passing an hour-old hash. A
+one-time token was considered and rejected in the design — validating a nonce needs persisted
+state that becomes its own stale artifact on a node nobody can reach.
+
+`--dry-run` beside `--confirm-delete`, `--no-confirm-delete` or `--expect-inventory-sha` is a
+parse-time usage error, and so is a hash that is not 64 lowercase hex characters. Neither
+writes a status file, because at that point the path is not known to be valid.
 
 Design and plan: `docs/superpowers/specs/2026-09-04-agent-mode-design.md` and
 `docs/superpowers/plans/2026-09-04-agent-mode-implementation.md`.
@@ -351,7 +388,7 @@ Every script except `simulate-upgrade.sh` declares `VERSION="x.y.z"` on ~line 4 
 | `upgrade-docker.sh` | 2.5.0 |
 | `rollback-docker.sh` | 2.2.1 |
 | `download-docker-packages.sh` | 2.3.0 |
-| `clean-swarm-networks.sh` | 1.2.0 |
+| `clean-swarm-networks.sh` | 1.3.0 |
 | `recover-dnf.sh` | 1.2.2 |
 
 Commit subjects carry the new version in parens, e.g. `Fix NVIDIA toolkit upgrade failures (v1.2.2)`, with a bullet list body.

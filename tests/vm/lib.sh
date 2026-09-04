@@ -629,6 +629,162 @@ assert_node_availability() {
     fi
 }
 
+# --- the overlay-network fixture for clean-swarm-networks.sh -------------
+#
+# Two things have to be true before an inventory case proves anything.
+#
+# The host must be IN a Swarm: on anything else the script refuses at the
+# allow-non-swarm gate, long before it stops a service or enumerates an object,
+# so every case below it would pass for the wrong reason.
+#
+# And the inventory must be NON-EMPTY: an empty one takes the nothing-to-clean
+# exit, which also passes without exercising a single line of the code under
+# test.
+#
+# So this builds a real single-node Swarm, a real attachable overlay network,
+# and a real container attached to it -- which produces namespace files under
+# /var/run/docker/netns, a populated libnetwork key-value store, and
+# docker_gwbridge. Those are the objects the script deletes.
+#
+# --restart=always is not decoration. Several cases stop and restart docker,
+# and a container that does not come back takes its network namespace with it,
+# so the fixture would quietly shrink between cases.
+SWARM_NET="agentmode-test"
+SWARM_NET_CANARY="agentmode-canary"
+KV_DB_PATH="/var/lib/docker/network/files/local-kv.db"
+
+swarm_net_fixture() {
+    # Idempotent: a suite that ended badly can leave the guest in a Swarm, and
+    # `docker swarm init` fails on an already-active one. Leaving first means a
+    # fixture failure is a real failure, not the previous suite's residue.
+    vm_try "docker swarm leave --force" >/dev/null 2>&1 || true
+    swarm_init || return 1
+    vm_try "docker rm -f $SWARM_NET_CANARY" >/dev/null 2>&1 || true
+    vm_try "docker network rm $SWARM_NET" >/dev/null 2>&1 || true
+    # EVERY running container contributes a network namespace, the baseline's
+    # `survivor` included, and several of these cases stop and start docker.
+    # A container with the default restart policy does not come back, so its
+    # namespace disappears for a reason that has nothing to do with a deletion
+    # -- and an inventory comparison would report that as a product failure.
+    vm_try "docker update --restart=always survivor" >/dev/null 2>&1 || true
+    vm_try "docker start survivor" >/dev/null 2>&1 || true
+    if ! vm "docker network create -d overlay --attachable $SWARM_NET" >/dev/null 2>&1; then
+        echo "  ${RED}ERROR${NC}: could not create the overlay network in the guest." >&2
+        vm_try "docker network create -d overlay --attachable $SWARM_NET 2>&1" | sed 's/^/       /' >&2
+        return 1
+    fi
+    if ! vm "docker run -d --restart=always --name $SWARM_NET_CANARY --network $SWARM_NET alpine:3.19 sleep infinity" >/dev/null 2>&1; then
+        echo "  ${RED}ERROR${NC}: could not attach a container to the overlay network." >&2
+        vm_try "docker run --rm --network $SWARM_NET alpine:3.19 true 2>&1" | sed 's/^/       /' >&2
+        return 1
+    fi
+    return 0
+}
+
+swarm_net_teardown() {
+    vm_try "docker update --restart=no $SWARM_NET_CANARY" >/dev/null 2>&1 || true
+    # Back to the baseline's own policy, so the fixture leaves nothing behind
+    # for the next suite to be surprised by.
+    vm_try "docker update --restart=no survivor" >/dev/null 2>&1 || true
+    vm_try "docker rm -f $SWARM_NET_CANARY" >/dev/null 2>&1 || true
+    vm_try "docker network rm $SWARM_NET" >/dev/null 2>&1 || true
+}
+
+# Wait for docker to be usable again after a stop/start cycle, so an inventory
+# read is taken from a settled daemon rather than mid-restart.
+docker_settle() {
+    vm_try "for i in \$(seq 1 30); do systemctl is-active docker 2>/dev/null | grep -qx active && docker info >/dev/null 2>&1 && break; sleep 1; done" >/dev/null 2>&1 || true
+}
+
+# The cleanup inventory as the script itself sees it, snapshotted for an
+# "unchanged" claim.
+#
+# The KEY field is the key-value store's inode. That file is exactly what phase
+# 4 removes, and dockerd opens an existing one rather than replacing it, so an
+# unchanged inode survives a stop/start cycle and a changed one means the file
+# was genuinely deleted. Counting namespace files cannot say that: stopping
+# docker tears namespaces down and starting it builds them again, so the count
+# moves for reasons that have nothing to do with a deletion.
+declare -A INV_NETNS INV_NSCOUNT INV_KVINO INV_GW INV_VXLAN
+capture_inventory() {
+    local name="$1"
+    INV_NETNS[$name]=$(vm_try "find /var/run/docker/netns -mindepth 1 -maxdepth 1 2>/dev/null | LC_ALL=C sort | tr '\n' ' '" | tail -1)
+    INV_NSCOUNT[$name]=$(vm_try "find /var/run/docker/netns -mindepth 1 -maxdepth 1 2>/dev/null | wc -l" | tail -1)
+    INV_KVINO[$name]=$(vm_try "stat -c %i $KV_DB_PATH 2>/dev/null || echo absent" | tail -1)
+    INV_GW[$name]=$(vm_try "ip link show docker_gwbridge >/dev/null 2>&1 && echo present || echo absent" | tail -1)
+    INV_VXLAN[$name]=$(vm_try "ip -o link show type vxlan 2>/dev/null | awk -F': ' 'NF>1{print \$2}' | LC_ALL=C sort | tr '\n' ' '" | tail -1)
+}
+
+# Assert nothing in the inventory was destroyed. Used by every cleanup case
+# that must not delete: the exit code alone proves nothing, because a run that
+# deleted the lot and then failed also exits non-zero.
+#
+# Every captured field is compared, not merely captured. "At least one
+# namespace survives" would pass a partial deletion, which is a failure mode
+# this script has -- phase 4 counts failures and carries on.
+#
+# The namespace COUNT is compared by default and the exact SET only with
+# `exact`. Where services were stopped and restarted, dockerd tore the
+# namespaces down and built them again, so the set is a statement about what
+# the daemon rebuilt; the count still catches a deletion that took one away.
+# Pass `exact` only for a case where nothing was stopped.
+assert_inventory_intact() {
+    local label="$1" name="$2" strict="${3:-}" got
+    got=$(vm_try "stat -c %i $KV_DB_PATH 2>/dev/null || echo absent" | tail -1)
+    if [ "$got" = "${INV_KVINO[$name]}" ] && [ "$got" != "absent" ]; then
+        ok "$label: key-value store still present, same inode ($got)"
+    else
+        bad "$label: key-value store inode ${INV_KVINO[$name]} -> $got -- it was DELETED"
+    fi
+    got=$(vm_try "ip link show docker_gwbridge >/dev/null 2>&1 && echo present || echo absent" | tail -1)
+    if [ "$got" = "present" ]; then
+        ok "$label: docker_gwbridge still present"
+    else
+        bad "$label: docker_gwbridge is $got -- it was DELETED"
+    fi
+    got=$(vm_try "ip -o link show type vxlan 2>/dev/null | awk -F': ' 'NF>1{print \$2}' | LC_ALL=C sort | tr '\n' ' '" | tail -1)
+    if [ "$got" = "${INV_VXLAN[$name]}" ]; then
+        ok "$label: the VXLAN interface list is unchanged (${INV_VXLAN[$name]:-<none>})"
+    else
+        bad "$label: VXLAN interfaces changed ('${INV_VXLAN[$name]}' -> '$got')"
+    fi
+    got=$(vm_try "find /var/run/docker/netns -mindepth 1 -maxdepth 1 2>/dev/null | wc -l" | tail -1)
+    if [ "$got" = "${INV_NSCOUNT[$name]}" ]; then
+        ok "$label: network namespace count unchanged ($got)"
+    else
+        bad "$label: namespace count ${INV_NSCOUNT[$name]} -> $got -- some were DELETED"
+    fi
+    if [ "$strict" = "exact" ]; then
+        got=$(vm_try "find /var/run/docker/netns -mindepth 1 -maxdepth 1 2>/dev/null | LC_ALL=C sort | tr '\n' ' '" | tail -1)
+        if [ "$got" = "${INV_NETNS[$name]}" ]; then
+            ok "$label: the exact set of network namespaces is unchanged"
+        else
+            bad "$label: network namespaces changed ('${INV_NETNS[$name]}' -> '$got')"
+        fi
+    fi
+    assert_vm_eq "$label: docker active"     "systemctl is-active docker" "active"
+    assert_vm_eq "$label: containerd active" "systemctl is-active containerd" "active"
+}
+
+# Count a phase banner in a log inside the guest. Every "did it get that far?"
+# assertion here is temporal: finding services active afterwards would also hold
+# after a stop, a delete and a restart, so the only honest question is whether
+# the phase ran at all.
+log_phase_count() {
+    local logfile="$1" banner="$2"
+    vm_try "grep -c '$banner' '$logfile' 2>/dev/null || echo 0" | tail -1
+}
+
+assert_phase_count_unchanged() {
+    local label="$1" logfile="$2" banner="$3" before="$4" after
+    after=$(log_phase_count "$logfile" "$banner")
+    if [ "$before" = "$after" ]; then
+        ok "$label: '$banner' never ran again (markers $after)"
+    else
+        bad "$label: '$banner' count changed ($before -> $after)"
+    fi
+}
+
 # Read one key out of a status file inside the guest. Prints nothing when the
 # file or the key is absent, so a caller comparing against an expected value
 # fails rather than silently matching.

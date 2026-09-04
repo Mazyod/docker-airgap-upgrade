@@ -29,6 +29,17 @@
 #           upgraded by a run that was supposed to refuse
 #        pairs with tier2-run.sh case 2.32
 #
+#   M4a  the inventory-hash comparison neutered so it always matches
+#        -> a run carrying a hash that describes a DIFFERENT inventory deletes
+#           this node's network state anyway
+#        pairs with tier2-run.sh case 2.40
+#
+#   M4b  --confirm-delete accepted with no inventory hash
+#        -> a pre-declared yes stops the services and deletes an inventory
+#           nothing had seen, which is the bypass the whole interface exists
+#           to prevent
+#        pairs with tier2-run.sh case 2.41
+#
 # This is DESTRUCTIVE: it runs real upgrades against mutant scripts. It resets
 # the baseline before and after every mutant.
 
@@ -41,9 +52,18 @@ require_relocated_xfs
 
 SF=/tmp/agent-mutant-status.kv
 MUT=/opt/docker-offline/upgrade-MUTANT.sh
+CMUT=/opt/docker-offline/clean-MUTANT.sh
+CLEANLOG=/var/log/docker-network-cleanup.log
 
 reset_all() {
-    vm "rm -f $MUT $SF" >/dev/null 2>&1
+    vm "rm -f $MUT $CMUT $SF" >/dev/null 2>&1
+    vm "rm -rf /root/docker-backup-*" >/dev/null 2>&1
+    # reset-baseline.sh does NOT leave the Swarm -- that state lives under the
+    # docker data root and survives a daemon restart -- so a mutant that builds
+    # the fixture again would fail at `docker swarm init` on an already-active
+    # Swarm and record a failure that has nothing to do with the mutation.
+    swarm_net_teardown
+    vm_try "docker swarm leave --force" >/dev/null 2>&1 || true
     ./reset-baseline.sh >/dev/null 2>&1
     vm "rm -rf /opt/docker-offline && tar xzf /opt/docker-upgrade-bundle.tar.gz -C /opt/" >/dev/null 2>&1
 }
@@ -367,6 +387,147 @@ if [ "$sw" = "inactive" ]; then
     trap - EXIT INT TERM
 else
     bad "M3 could not leave the Swarm (state '$sw') -- leaving the EXIT trap armed"
+fi
+
+#############################################
+head_ "M4a  the inventory-hash comparison neutered"
+#############################################
+# The hash is what makes a two-pass cleanup safe: pass one publishes what it
+# enumerated, pass two hashes ITS OWN enumeration and refuses on a mismatch.
+# Neuter the comparison and a caller carrying a hash that describes a different
+# node deletes this one's network state anyway.
+#
+# Case 2.40 asserts the key-value store's inode is unchanged and that phase 4
+# never ran, so it FAILS against this mutant. An exit-code check would not:
+# the mutant exits 0.
+reset_all
+
+# Without the fixture the mutant refuses at the allow-non-swarm gate and
+# reproduces nothing; with an empty inventory it takes the nothing-to-clean
+# exit and reproduces nothing either. Armed before the fixture exists, and INT
+# and TERM route through EXIT so a signal cannot leave the guest in a Swarm.
+clean_fixture_teardown() { swarm_net_teardown; vm_try "docker swarm leave --force" >/dev/null 2>&1 || true; }
+trap 'clean_fixture_teardown' EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+if swarm_net_fixture; then
+    ok "M4a fixture: single-node Swarm with an attached overlay network"
+else
+    bad "M4a fixture: could not build it -- the mutant proves nothing"
+fi
+docker_settle
+kv_before=$(vm_try "stat -c %i $KV_DB_PATH 2>/dev/null || echo absent" | tail -1)
+if [ "$kv_before" != "absent" ]; then
+    ok "M4a fixture: key-value store present before the mutant runs (inode $kv_before)"
+else
+    bad "M4a fixture: no key-value store -- nothing for the mutant to destroy"
+fi
+p4_before=$(vm_try "grep -c '=== Phase 4: Delete Network State ===' $CLEANLOG 2>/dev/null || echo 0" | tail -1)
+
+vm 'set -e
+cp /opt/docker-offline/clean-swarm-networks.sh /opt/docker-offline/clean-MUTANT.sh
+cat > /tmp/m4a.py <<"PYEOF"
+import pathlib
+p = pathlib.Path("/opt/docker-offline/clean-MUTANT.sh")
+s = p.read_text()
+# The mutation is ONE thing: whether the enumerated hash is compared against
+# the expected one. Everything else about the block is untouched.
+real = """if [ -n "$EXPECT_INVENTORY_SHA" ] && [ "$EXPECT_INVENTORY_SHA" != "$INVENTORY_SHA" ]; then"""
+assert real in s, "hash comparison not found -- update this mutant"
+s = s.replace(real, """if false; then   # MUTANT: the inventory hash is never compared""", 1)
+p.write_text(s)
+print("M4a built")
+PYEOF
+python3 /tmp/m4a.py
+chmod +x /opt/docker-offline/clean-MUTANT.sh
+grep -c MUTANT /opt/docker-offline/clean-MUTANT.sh'
+
+# EXACTLY case 2.40's invocation: a hash of 64 zeros, which no enumeration can
+# ever produce.
+ZEROSHA=$(printf '0%.0s' $(seq 1 64))
+vm "rm -f $SF" >/dev/null 2>&1
+mut_rc=$(vm_try "cd /opt/docker-offline && ./clean-MUTANT.sh --non-interactive --status-file=$SF --assume-drained --confirm-stop --confirm-delete --expect-inventory-sha=$ZEROSHA </dev/null >/dev/null 2>&1; echo \$?" | tail -1)
+docker_settle
+mut_deleted=$(vm_try "sed -n 's/^deleted=//p' $SF 2>/dev/null | head -1" | tail -1)
+kv_after=$(vm_try "stat -c %i $KV_DB_PATH 2>/dev/null || echo absent" | tail -1)
+p4_after=$(vm_try "grep -c '=== Phase 4: Delete Network State ===' $CLEANLOG 2>/dev/null || echo 0" | tail -1)
+echo "  mutant run: exit $mut_rc deleted=$mut_deleted"
+echo "              key-value store inode $kv_before -> $kv_after, phase 4 markers $p4_before -> $p4_after"
+if [ "$mut_deleted" = "true" ] && [ "$kv_after" != "$kv_before" ] && [ "$p4_after" -gt "$p4_before" ]; then
+    ok "M4a reproduced the hazard: a hash describing another inventory deleted this one"
+    echo "       Case 2.40 asserts deleted=false, an unchanged key-value store inode"
+    echo "       and an unchanged phase-4 marker count, so it FAILS against this mutant."
+else
+    bad "M4a did NOT reproduce the hazard (deleted=$mut_deleted, inode $kv_before->$kv_after, phase 4 $p4_before->$p4_after)"
+fi
+
+#############################################
+head_ "M4b  --confirm-delete accepted with no inventory hash"
+#############################################
+# The inventory is enumerated only AFTER the services stop, so a pre-declared
+# yes with no hash authorises deleting a list nothing has seen. That is the
+# bypass the whole interface exists to prevent, and it is why the hash is
+# required in EVERY mode rather than only under --non-interactive.
+#
+# Case 2.41 asserts the services were never stopped and the inventory is
+# intact, so it FAILS against this mutant.
+reset_all
+if swarm_net_fixture; then
+    ok "M4b fixture: single-node Swarm with an attached overlay network"
+else
+    bad "M4b fixture: could not build it -- the mutant proves nothing"
+fi
+docker_settle
+kv_before=$(vm_try "stat -c %i $KV_DB_PATH 2>/dev/null || echo absent" | tail -1)
+p2_before=$(vm_try "grep -c '=== Phase 2: Stop Services ===' $CLEANLOG 2>/dev/null || echo 0" | tail -1)
+p4_before=$(vm_try "grep -c '=== Phase 4: Delete Network State ===' $CLEANLOG 2>/dev/null || echo 0" | tail -1)
+
+vm 'set -e
+cp /opt/docker-offline/clean-swarm-networks.sh /opt/docker-offline/clean-MUTANT.sh
+cat > /tmp/m4b.py <<"PYEOF"
+import pathlib
+p = pathlib.Path("/opt/docker-offline/clean-MUTANT.sh")
+s = p.read_text()
+# The mutation is ONE thing: whether --confirm-delete requires a hash.
+real = """if [ "${GATE_ANSWERS[confirm-delete]:-}" = "y" ] && [ -z "$EXPECT_INVENTORY_SHA" ]; then"""
+assert real in s, "the sha-required guard was not found -- update this mutant"
+s = s.replace(real, """if false; then   # MUTANT: --confirm-delete no longer requires a hash""", 1)
+p.write_text(s)
+print("M4b built")
+PYEOF
+python3 /tmp/m4b.py
+chmod +x /opt/docker-offline/clean-MUTANT.sh
+grep -c MUTANT /opt/docker-offline/clean-MUTANT.sh'
+
+# EXACTLY case 2.41's non-interactive invocation: every earlier gate answered,
+# a status file supplied, --confirm-delete given, and no hash anywhere.
+vm "rm -f $SF" >/dev/null 2>&1
+mut_rc=$(vm_try "cd /opt/docker-offline && ./clean-MUTANT.sh --non-interactive --status-file=$SF --assume-drained --confirm-stop --confirm-delete </dev/null >/dev/null 2>&1; echo \$?" | tail -1)
+docker_settle
+mut_deleted=$(vm_try "sed -n 's/^deleted=//p' $SF 2>/dev/null | head -1" | tail -1)
+kv_after=$(vm_try "stat -c %i $KV_DB_PATH 2>/dev/null || echo absent" | tail -1)
+p2_after=$(vm_try "grep -c '=== Phase 2: Stop Services ===' $CLEANLOG 2>/dev/null || echo 0" | tail -1)
+p4_after=$(vm_try "grep -c '=== Phase 4: Delete Network State ===' $CLEANLOG 2>/dev/null || echo 0" | tail -1)
+echo "  mutant run: exit $mut_rc deleted=$mut_deleted"
+echo "              phase 2 markers $p2_before -> $p2_after, phase 4 markers $p4_before -> $p4_after"
+echo "              key-value store inode $kv_before -> $kv_after"
+if [ "$mut_deleted" = "true" ] && [ "$p2_after" -gt "$p2_before" ] &&
+   [ "$p4_after" -gt "$p4_before" ] && [ "$kv_after" != "$kv_before" ]; then
+    ok "M4b reproduced the hazard: it stopped the services and deleted an unseen inventory"
+    echo "       Case 2.41 asserts the phase-2 marker count is unchanged and the"
+    echo "       inventory intact, so it FAILS against this mutant."
+else
+    bad "M4b did NOT reproduce the hazard (deleted=$mut_deleted, phase 2 $p2_before->$p2_after, phase 4 $p4_before->$p4_after)"
+fi
+
+clean_fixture_teardown
+sw=$(vm_try "docker info --format '{{.Swarm.LocalNodeState}}'" | tr -d '\r' | tail -1)
+if [ "$sw" = "inactive" ]; then
+    ok "M4 teardown: the guest left the Swarm"
+    # Disarmed only on success; see tier2-run.sh for why.
+    trap - EXIT INT TERM
+else
+    bad "M4 teardown: guest is still '$sw' -- leaving the EXIT trap armed"
 fi
 
 #############################################

@@ -190,7 +190,7 @@ containerd bump they are inert or harmful. All three remain in git history at
 | `download-docker-packages.sh` | 2.3.0 | Download all packages, build the bundle | Online RHEL server |
 | `upgrade-docker.sh` | 2.5.0 | Perform the upgrade | Air-gapped servers |
 | `rollback-docker.sh` | 2.2.1 | Roll back to 29.1.5 | Failed upgrade recovery |
-| `clean-swarm-networks.sh` | 1.2.0 | Reset orphaned overlay network state | Node that can't rejoin overlays |
+| `clean-swarm-networks.sh` | 1.3.0 | Reset orphaned overlay network state | Node that can't rejoin overlays |
 | `recover-dnf.sh` | 1.2.2 | Fix dependency issues | Servers with broken dnf |
 | `simulate-upgrade.sh` | — | Test the upgrade path in a VM | RHEL test VM |
 
@@ -206,6 +206,15 @@ the thing it asserts. `--non-interactive` is a strictness switch, not a consent 
 grants nothing, and an unanswered question becomes a refusal that names the missing flag rather
 than a default. It requires `--status-file`, because without the record an exit 1 cannot be
 told from a failure. `rollback-docker.sh` still needs a terminal.
+
+`clean-swarm-networks.sh` also accepts `--dry-run` and `--expect-inventory-sha=SHA`. It is the
+one script that cannot be driven in a single unattended invocation, and the reason is
+structural: the inventory is enumerated only *after* the services stop, so nobody can be told
+it in advance. The dry run stops, enumerates, prints the inventory with its hash, restarts and
+exits 0; the real run hashes its own enumeration and refuses on a mismatch. The hash covers the
+set of names and paths, never file contents, and services restart between the two passes — so
+it proves the list is unchanged, not that the objects behind it are. See
+`docs/AGENT-RUNBOOK.md` for the two-pass procedure.
 
 `--preflight` runs every check that can be made with the node untouched and then exits,
 changing nothing: no service stopped, no package installed, no directory created. It exits 0

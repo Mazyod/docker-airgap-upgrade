@@ -1,7 +1,7 @@
 #!/bin/bash
 # clean-swarm-networks.sh
 # Reset orphaned Swarm overlay network state on a single node
-VERSION="1.2.0"
+VERSION="1.3.0"
 #
 # WHEN TO RUN THIS
 #
@@ -122,11 +122,16 @@ set_gate() {
     GATE_ANSWERS[$name]="$val"
 }
 
-# The inventory hash a caller expects the enumeration to produce.
-# --expect-inventory-sha arrives with --dry-run in a later change; the variable
-# exists now because --confirm-delete is refused without it in EVERY mode, and
-# that refusal has to have something to read.
+# The inventory hash a caller expects the enumeration to produce, from
+# --expect-inventory-sha. Empty means the caller stated no expectation, which
+# is the only state --confirm-delete is refused in.
 EXPECT_INVENTORY_SHA=""
+
+# --dry-run: stop, enumerate, print the inventory and its hash, restart, exit 0.
+# It reaches the delete gate's "no" branch by flag instead of by prompt, so it
+# is the existing decline path with a different trigger -- not a second, parallel
+# way through the script.
+DRY_RUN=false
 
 usage() {
     cat <<USAGE
@@ -141,6 +146,16 @@ Options:
   --non-interactive    Refuse, rather than prompt, when one of the questions
                        below has no answer. Never reads stdin.
                        Requires --status-file.
+  --dry-run            Stop services, enumerate exactly what a real run would
+                       delete, print it with its inventory hash, restart
+                       services and exit 0. Deletes nothing. Cannot be
+                       combined with a --confirm-delete answer or with
+                       --expect-inventory-sha.
+  --expect-inventory-sha=SHA
+                       Refuse unless the inventory THIS run enumerates hashes
+                       to SHA, 64 lowercase hex characters. Take the value
+                       from the immediately preceding --dry-run. Required
+                       whenever --confirm-delete is given.
   --help, -h           Show this help and exit.
   --version            Print the script version and exit.
 
@@ -189,6 +204,21 @@ while [ "$#" -gt 0 ]; do
             STATUS_FILE="$2"; shift
             ;;
         --non-interactive) NON_INTERACTIVE=true ;;
+        --dry-run) DRY_RUN=true ;;
+        --expect-inventory-sha=*)
+            EXPECT_INVENTORY_SHA="${1#*=}"
+            ;;
+        --expect-inventory-sha)
+            # An empty value must be rejected here too: accepted, it would
+            # leave the variable empty and --confirm-delete would then be
+            # refused for "no hash given", naming the flag the caller just
+            # passed.
+            if [ "$#" -lt 2 ] || [ -z "$2" ]; then
+                echo "ERROR: --expect-inventory-sha needs a 64-character hash" >&2
+                exit 1
+            fi
+            EXPECT_INVENTORY_SHA="$2"; shift
+            ;;
         # One arm per gate, spelled out rather than generated from a list. A
         # generated arm would accept --no-anything and silently record an
         # answer for a gate that does not exist; static check 1.14.1 compares
@@ -212,8 +242,49 @@ while [ "$#" -gt 0 ]; do
     shift
 done
 
-if [ "$NON_INTERACTIVE" = true ]; then
+# `mode` is one token. --dry-run wins over --non-interactive because the run
+# deletes nothing either way, and the dry-run branch keys off this value.
+# Resolved AFTER the loop so flag order on the command line cannot matter.
+if [ "$DRY_RUN" = true ]; then
+    MODE="dry-run"
+elif [ "$NON_INTERACTIVE" = true ]; then
     MODE="non-interactive"
+fi
+
+# A dry run's whole definition is that it reaches the delete gate's "no"
+# branch. A pre-declared delete answer on the same command line is two
+# contradictory instructions, and guessing which one wins is how a "dry run"
+# deletes something. An expected hash is equally contradictory: a dry run
+# publishes a hash, it does not check one.
+#
+# Rejected here, at parse time, with no status file written -- the same
+# treatment every other usage error gets, and the reason the runbook says a
+# caller reusing one status path must compare run_id before believing a file.
+if [ "$DRY_RUN" = true ]; then
+    dr_conflict=""
+    if [ -n "${GATE_ANSWERS[confirm-delete]:-}" ]; then
+        dr_conflict="--confirm-delete/--no-confirm-delete"
+    fi
+    if [ -n "$EXPECT_INVENTORY_SHA" ]; then
+        dr_conflict="${dr_conflict:+$dr_conflict and }--expect-inventory-sha"
+    fi
+    if [ -n "$dr_conflict" ]; then
+        echo "ERROR: --dry-run cannot be combined with $dr_conflict." >&2
+        echo "A dry run deletes nothing and checks no hash; it publishes one." >&2
+        exit 1
+    fi
+fi
+
+# Validated for SHAPE at parse time, so a typo is a usage error rather than a
+# mismatch. Reporting "the inventory changed" for a hash that could never have
+# been produced would send a caller looking at the node instead of at its own
+# command line.
+if [ -n "$EXPECT_INVENTORY_SHA" ] &&
+   ! printf '%s' "$EXPECT_INVENTORY_SHA" | grep -qE '^[0-9a-f]{64}$'; then
+    echo "ERROR: --expect-inventory-sha must be 64 lowercase hex characters." >&2
+    echo "Got: $EXPECT_INVENTORY_SHA" >&2
+    echo "Take the value from the immediately preceding --dry-run." >&2
+    exit 1
 fi
 
 # Exit 1 conflates refusal with failure, and 130 and 143 say nothing about
@@ -439,6 +510,11 @@ status_keys() {
     status_kv services_stopped "$SERVICES_STOPPED"
     status_kv docker_data_root "$DOCKER_DATA_ROOT"
     status_kv inventory_total "$INVENTORY_TOTAL"
+    # The hash of the list THIS run enumerated, and the one the caller said to
+    # expect. Both are reported so an audit can see which pair was compared,
+    # not merely that they agreed.
+    status_kv inventory_sha "$INVENTORY_SHA"
+    status_kv inventory_sha_expected "$EXPECT_INVENTORY_SHA"
     status_kv vxlan_count "$VXLAN_COUNT"
     status_kv netns_count "$NETNS_COUNT"
     status_kv kv_db_present "$KV_DB_PRESENT"
@@ -464,6 +540,13 @@ derive_next_action() {
         completed|nothing-to-do)
             if [ "$FAILED_ITEMS" != "0" ] && [ "$FAILED_ITEMS" != "unknown" ]; then
                 NEXT_ACTION="investigate"
+            elif [ "$MODE" = "dry-run" ] && [ "$DELETED" != true ] &&
+                 [ "$INVENTORY_TOTAL" != "0" ] && [ "$INVENTORY_TOTAL" != "unknown" ]; then
+                # A dry run that found something: the next step is the real
+                # pass, carrying the hash this one published. A dry run on a
+                # node with nothing to clean takes the nothing-to-do exit and
+                # gets `none`, because there is no second pass to make.
+                NEXT_ACTION="proceed"
             else
                 NEXT_ACTION="none"
             fi
@@ -479,6 +562,10 @@ derive_next_action() {
         # The only sha-free path to deletion is answering the live prompt AFTER
         # enumeration, which means running the dry run first.
         inventory-sha-required) NEXT_ACTION="rerun-dry-run"; return 0 ;;
+        # The node changed between the two passes, so the authorisation the
+        # caller holds describes a different inventory. Only a fresh dry run
+        # can produce one that describes this node.
+        inventory-changed)      NEXT_ACTION="rerun-dry-run"; return 0 ;;
     esac
     # As in the other two: only when the units are observed down.
     if [ "$SERVICES_STOPPED" = true ] &&
@@ -499,6 +586,9 @@ EXIT_CODE="unknown"
 SERVICES_STOPPED=false
 DOCKER_DATA_ROOT="unknown"
 INVENTORY_TOTAL="unknown"
+# Empty, not "unknown": it is a hash or it is nothing, and the run record's
+# documented domain for it is "sha256 of the canonical inventory, or empty".
+INVENTORY_SHA=""
 VXLAN_COUNT="unknown"
 NETNS_COUNT="unknown"
 KV_DB_PRESENT="unknown"
@@ -828,6 +918,52 @@ start_services() {
     return 0
 }
 
+# The canonical inventory string, hashed.
+#
+# NAMES AND PATHS ONLY -- never a file's contents. The libnetwork KV database's
+# bytes change on every dockerd run, so hashing them would guarantee a mismatch
+# between a dry run and the real one and make --expect-inventory-sha useless.
+# tests/static-checks.sh enforces that this block reads no file's bytes.
+#
+# One line per object:
+#     vxlan<TAB><interface name>
+#     netns<TAB><absolute path>
+#     kv<TAB><absolute path>        only when present
+#     gwbridge                      only when present
+#
+# `ip` and `find` guarantee no ordering, so the sort is what makes the hash
+# reproducible at all; LC_ALL=C so a locale cannot change it either. The four
+# prefixes are distinct, so a single sort of the whole list also keeps the
+# categories grouped.
+#
+# FAIL CLOSED. This script runs `set -e` without `pipefail`, so a failing
+# `sort` upstream of a succeeding `sha256sum` would yield a confident hash of
+# nothing -- and a confident hash of nothing is exactly what an attacker of
+# this protocol, or a bad day, would need. The pipeline therefore runs in a
+# subshell with pipefail set, and the caller treats a nonzero return as
+# enumeration-failed, never as an empty inventory. Same rule the enumeration
+# above already follows.
+compute_inventory_sha() {
+    local item
+    (
+        set -o pipefail
+        {
+            if [ "${#VXLAN_IFACES[@]}" -gt 0 ]; then
+                for item in "${VXLAN_IFACES[@]}"; do printf 'vxlan\t%s\n' "$item"; done
+            fi
+            if [ "${#NETNS_FILES[@]}" -gt 0 ]; then
+                for item in "${NETNS_FILES[@]}"; do printf 'netns\t%s\n' "$item"; done
+            fi
+            if [ "$KV_DB_PRESENT" = true ]; then
+                printf 'kv\t%s\n' "$KV_DB"
+            fi
+            if [ "$GWBRIDGE_PRESENT" = true ]; then
+                printf 'gwbridge\n'
+            fi
+        } | LC_ALL=C sort | sha256sum | awk '{print $1}'
+    )
+}
+
 
 #############################################
 # Flag consistency
@@ -842,9 +978,14 @@ start_services() {
 # That is the bypass this whole interface exists to prevent.
 #
 # The only sha-free path to deletion is answering the live prompt after
-# enumeration, which is what a human does today. --expect-inventory-sha, and
-# the --dry-run that produces a sha to pass, arrive in a later change; until
-# then this refusal is unconditional whenever --confirm-delete is given.
+# enumeration, which is what a human does today. The hash comes from the
+# immediately preceding --dry-run, which stops, enumerates and restarts without
+# deleting -- so something HAS seen a list, and this run refuses unless its own
+# enumeration produces the same one.
+#
+# What that buys is bounded, and the runbook says so: services restart between
+# the two passes, so a matching hash proves the set of NAMES is unchanged, not
+# that the objects behind them are the same objects.
 #
 # It sits HERE, before phase 1 and long before phase 2 stops anything, so a
 # refusal costs a node nothing.
@@ -962,7 +1103,29 @@ if ! VXLAN_RAW=$(ip -o link show type vxlan 2>&1); then
     echo "Refusing to delete an inventory that could not be read." >&2
     exit 1
 fi
-mapfile -t VXLAN_IFACES < <(printf '%s' "$VXLAN_RAW" | awk -F': ' 'NF > 1 { print $2 }')
+# The PARSE is status-checked as well as the command. `mapfile < <(cmd)`
+# returns 0 the moment it sees EOF, whatever the producer did, so a failing awk
+# would arrive as an empty array and be reported as "nothing to clean" -- the
+# same fail-open the capture above exists to avoid, one step further down.
+# pipefail is set inside the substitution because this script does not set it
+# globally.
+if ! VXLAN_PARSED=$(set -o pipefail; printf '%s' "$VXLAN_RAW" | awk -F': ' 'NF > 1 { print $2 }'); then
+    REFUSAL_REASON="enumeration-failed"
+    REFUSAL_DETAIL="could not parse the VXLAN interface list"
+    echo -e "${RED}ERROR: could not parse the VXLAN interface list${NC}" >&2
+    echo "Refusing to delete an inventory that could not be read." >&2
+    exit 1
+fi
+# A here-string on an empty value yields ONE empty element, which would be
+# reported as an interface and handed to `ip link del`. An empty parse means an
+# empty array.
+VXLAN_IFACES=()
+if [ -n "$VXLAN_PARSED" ] && ! mapfile -t VXLAN_IFACES <<< "$VXLAN_PARSED"; then
+    REFUSAL_REASON="enumeration-failed"
+    REFUSAL_DETAIL="could not read the VXLAN interface list into an array"
+    echo -e "${RED}ERROR: could not read the VXLAN interface list.${NC}" >&2
+    exit 1
+fi
 
 NETNS_DIR="/var/run/docker/netns"
 if [ ! -d "$NETNS_DIR" ]; then
@@ -976,7 +1139,15 @@ elif ! NETNS_RAW=$(find "$NETNS_DIR" -mindepth 1 -maxdepth 1 2>&1); then
     echo "Refusing to delete an inventory that could not be read." >&2
     exit 1
 else
-    mapfile -t NETNS_FILES < <(printf '%s' "$NETNS_RAW")
+    # Same rule as above: an empty result is an empty array, never one empty
+    # element, and there is no parse step here whose status could be lost.
+    NETNS_FILES=()
+    if [ -n "$NETNS_RAW" ] && ! mapfile -t NETNS_FILES <<< "$NETNS_RAW"; then
+        REFUSAL_REASON="enumeration-failed"
+        REFUSAL_DETAIL="could not read the namespace list into an array"
+        echo -e "${RED}ERROR: could not read the namespace list.${NC}" >&2
+        exit 1
+    fi
 fi
 
 GWBRIDGE_PRESENT=false
@@ -1025,6 +1196,47 @@ VXLAN_COUNT="${#VXLAN_IFACES[@]}"
 NETNS_COUNT="${#NETNS_FILES[@]}"
 INVENTORY_TOTAL="$TOTAL"
 
+# Hashed from the arrays enumerated moments ago, AFTER the stop -- the very
+# arrays phase 4 deletes from. The hash therefore describes this run's
+# inventory and nothing else.
+#
+# ONLY when the new interface needs it: a dry run publishes it, and a run
+# carrying --expect-inventory-sha compares against it. With no new flag the
+# transcript is exactly what it was and the hashing adds no way for the run to
+# fail -- which is the rule the whole interface is built under. (The
+# fail-closed parse checks above DO add refusals a previous version would have
+# sailed through; those are the deliberate fix for a fail-open enumeration, not
+# a side effect of these flags.) A record from a run that computed no hash
+# carries `inventory_sha=` empty, a documented value for that key.
+#
+# Computed before the nothing-to-clean exit below, so a dry run on a node with
+# nothing to clean still reports the hash of what it found.
+if [ "$DRY_RUN" = true ] || [ -n "$EXPECT_INVENTORY_SHA" ]; then
+    if ! INVENTORY_SHA=$(compute_inventory_sha); then
+        INVENTORY_SHA=""
+        REFUSAL_REASON="enumeration-failed"
+        REFUSAL_DETAIL="could not canonicalise or hash the enumerated inventory"
+        echo -e "${RED}ERROR: could not hash the enumerated inventory.${NC}" >&2
+        echo "Refusing to delete an inventory that could not be canonicalised." >&2
+        exit 1
+    fi
+    # Shape-checked as well as status-checked. A pipeline that succeeded but
+    # produced something that is not a digest is still a failure to enumerate,
+    # and publishing it would let a later run "match" it.
+    if ! printf '%s' "$INVENTORY_SHA" | grep -qE '^[0-9a-f]{64}$'; then
+        REFUSAL_REASON="enumeration-failed"
+        REFUSAL_DETAIL="inventory hash is not a sha256 digest: $INVENTORY_SHA"
+        echo -e "${RED}ERROR: the inventory hash is not a sha256 digest.${NC}" >&2
+        echo "Got: $INVENTORY_SHA" >&2
+        INVENTORY_SHA=""
+        exit 1
+    fi
+
+    echo ""
+    echo "Inventory hash: $INVENTORY_SHA"
+    echo "  covers the names and paths listed above, never their contents"
+fi
+
 if [ "$TOTAL" -eq 0 ]; then
     echo ""
     RESULT="nothing-to-do"
@@ -1044,6 +1256,52 @@ echo ""
 echo -e "${YELLOW}$TOTAL item(s) listed above will be DELETED.${NC}"
 echo -e "${YELLOW}Swarm recreates them on reconnect. Containers, images and${NC}"
 echo -e "${YELLOW}volumes are not affected.${NC}"
+
+# --dry-run reaches the delete gate's "no" branch by FLAG instead of by prompt.
+# It is the existing decline path -- restart the services this run stopped and
+# exit having deleted nothing -- reached a different way, not a second route
+# through the script. Its purpose is to publish the hash above.
+if [ "$DRY_RUN" = true ]; then
+    echo ""
+    echo -e "${GREEN}DRY RUN: nothing will be deleted.${NC}"
+    FAILED_ITEMS=0
+    OPERATION_COMPLETED=true
+    start_services
+    SERVICES_STOPPED=false
+    echo ""
+    echo "To delete exactly this inventory, re-run IMMEDIATELY with:"
+    echo "  --confirm-delete --expect-inventory-sha=$INVENTORY_SHA"
+    echo ""
+    echo "The services this run restarted recreate namespaces and interfaces,"
+    echo "so a matching hash proves the LIST of names is unchanged -- not that"
+    echo "the objects behind those names are the same objects. Run the second"
+    echo "pass immediately, and treat a mismatch as the node having moved."
+    exit 0
+fi
+
+# The real run hashes ITS OWN enumeration and compares. A mismatch means the
+# node changed between the two passes, so the authorisation the caller holds
+# describes a different inventory: restart and refuse rather than delete a list
+# nobody approved.
+#
+# This sits before the delete gate, so a mismatch cannot be answered past by a
+# pre-declared --confirm-delete.
+if [ -n "$EXPECT_INVENTORY_SHA" ] && [ "$EXPECT_INVENTORY_SHA" != "$INVENTORY_SHA" ]; then
+    REFUSAL_REASON="inventory-changed"
+    REFUSAL_DETAIL="expected $EXPECT_INVENTORY_SHA, enumerated $INVENTORY_SHA"
+    echo ""
+    echo -e "${RED}ERROR: this node's inventory does not match --expect-inventory-sha.${NC}"
+    echo "  expected:   $EXPECT_INVENTORY_SHA"
+    echo "  enumerated: $INVENTORY_SHA"
+    echo ""
+    echo "Nothing has been deleted. Restarting services."
+    FAILED_ITEMS=0
+    start_services
+    SERVICES_STOPPED=false
+    echo "Services restored. Run --dry-run again and pass the hash it prints."
+    exit 1
+fi
+
 echo ""
 if ! gate confirm-delete "Delete the state listed above? [y/N]" "n"; then
     REFUSAL_REASON="delete-declined"

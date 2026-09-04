@@ -626,6 +626,17 @@ cmp_fn verify_unit_stopped upgrade-docker.sh rollback-docker.sh clean-swarm-netw
 cmp_fn start_services      rollback-docker.sh clean-swarm-networks.sh
 cmp_fn prompt_yes_no       upgrade-docker.sh clean-swarm-networks.sh
 cmp_fn read_config_version upgrade-docker.sh rollback-docker.sh
+# The run-record machinery is duplicated across the three stateful scripts and
+# MUST NOT drift. A copy that loses the STATUS_OK accumulator or the terminator
+# check silently publishes truncated status files -- from one script only, which
+# is exactly the kind of divergence nobody notices.
+cmp_fn status_kv          upgrade-docker.sh rollback-docker.sh clean-swarm-networks.sh
+cmp_fn status_common      upgrade-docker.sh rollback-docker.sh clean-swarm-networks.sh
+cmp_fn write_status_file  upgrade-docker.sh rollback-docker.sh clean-swarm-networks.sh
+cmp_fn derive_result      upgrade-docker.sh rollback-docker.sh clean-swarm-networks.sh
+cmp_fn usage              upgrade-docker.sh rollback-docker.sh clean-swarm-networks.sh
+cmp_fn unit_state         upgrade-docker.sh rollback-docker.sh clean-swarm-networks.sh
+cmp_fn unit_is_stopped    upgrade-docker.sh rollback-docker.sh clean-swarm-networks.sh
 
 #############################################
 head_ "1.12  Every helper called is also defined"
@@ -643,7 +654,10 @@ for s in "${SCRIPTS[@]}"; do
     [ -f "$s" ] || continue
     for fn in prompt_yes_no verify_unit_stopped start_services stop_services \
               read_config_version config_is_loadable \
-              containerd_release_matches check_containerd_release; do
+              containerd_release_matches check_containerd_release \
+              status_kv status_common status_keys write_status_file \
+              derive_result derive_next_action capture_after_versions usage \
+              unit_state unit_is_stopped; do
         # Does the script reference it anywhere other than its own definition?
         refs=$(grep -vE '^\s*#' "$s" | grep -cE "(^|[^[:alnum:]_])${fn}( |$|\")" || true)
         defs=$(grep -cE "^${fn}\(\) \{" "$s" || true)
@@ -795,6 +809,147 @@ if [ -z "$fork_missing" ]; then
 else
     bad "AGENTS.md audience fork is incomplete:$fork_missing"
 fi
+
+# Every status key a script EMITS must be documented in AGENT-RUNBOOK.md, and
+# every documented key must be emitted. An agent branches on these; a key that
+# is written but undocumented is a contract nobody agreed to, and a key that is
+# documented but never written is one an agent will wait for for ever.
+#
+# Keys are extracted from the literal `status_kv <name>` call sites, which is
+# why the writers use one call per key rather than a loop.
+doc_keys_for() {
+    awk -v want="$1" '
+        $0 ~ "<!-- status-keys: " want " -->" { on = 1; next }
+        /<!-- \/status-keys -->/              { on = 0 }
+        # FIRST backticked token of the row only. Taking every one would pull
+        # in the value domains from the second column -- true, false, unknown
+        # -- and report them as undocumented keys. Each row names exactly one
+        # key for this reason; do not collapse rows with "/ `_after` /".
+        on && /^\| `[a-z0-9_]+` \|/ {
+            if (match($0, /`[a-z0-9_]+`/))
+                print substr($0, RSTART + 1, RLENGTH - 2)
+        }
+    ' docs/AGENT-RUNBOOK.md | LC_ALL=C sort -u
+}
+
+emitted_keys_for() {
+    # Comments are stripped first: prose like "a status_kv that fails" would
+    # otherwise be read as a key named "that".
+    grep -vE '^[[:space:]]*#' "$1" \
+        | grep -oE '(^|[^a-z_])status_kv [a-z0-9_]+' \
+        | grep -oE 'status_kv [a-z0-9_]+' | awk '{print $2}' | LC_ALL=C sort -u
+}
+
+if [ ! -f docs/AGENT-RUNBOOK.md ]; then
+    bad "docs/AGENT-RUNBOOK.md is missing; cannot check status keys"
+else
+    common_doc=$(doc_keys_for common)
+    if [ -z "$common_doc" ]; then
+        bad "AGENT-RUNBOOK.md has no 'common' status-key block"
+    fi
+    for s in upgrade-docker.sh rollback-docker.sh clean-swarm-networks.sh; do
+        emitted=$(emitted_keys_for "$s")
+        documented=$(printf '%s\n%s\n' "$common_doc" "$(doc_keys_for "$s")" | LC_ALL=C sort -u | grep . || true)
+        undoc=$(comm -23 <(printf '%s\n' "$emitted") <(printf '%s\n' "$documented") | grep . || true)
+        unemit=$(comm -13 <(printf '%s\n' "$emitted") <(printf '%s\n' "$documented") | grep . || true)
+        if [ -z "$undoc" ] && [ -z "$unemit" ]; then
+            ok "$s status keys match AGENT-RUNBOOK.md ($(printf '%s\n' "$emitted" | grep -c .) keys)"
+        else
+            [ -n "$undoc" ] && bad "$s emits undocumented status keys: $(printf '%s' "$undoc" | tr '\n' ' ')"
+            [ -n "$unemit" ] && bad "$s documented but never emitted: $(printf '%s' "$unemit" | tr '\n' ' ')"
+        fi
+    done
+fi
+
+# The parser must be inert with zero arguments: it is the only new code on the
+# default path. A `while [ "$#" -gt 0 ]` loop over an empty "$@" runs zero
+# times -- but the loop existing proves nothing if a bare `$1` is read before
+# it. Require the loop AND require that nothing reads a positional parameter
+# outside a function before it.
+for s in upgrade-docker.sh rollback-docker.sh clean-swarm-networks.sh; do
+    loop=$(grep -n 'while \[ "\$#" -gt 0 \]; do' "$s" | head -1 | cut -d: -f1)
+    if [ -z "$loop" ]; then
+        bad "$s does not guard its argument parser on \$#"
+        continue
+    fi
+    # Positional reads before the loop, ignoring comments and function bodies
+    # (a function's $1 is its own argument, not the script's).
+    early=$(awk -v stop="$loop" '
+        NR >= stop { exit }
+        /^[a-z_]+\(\) \{/ { infn = 1 }
+        infn && /^\}/       { infn = 0; next }
+        infn                { next }
+        /^[[:space:]]*#/    { next }
+        /\$[1-9]|\$\{[1-9]|\$@|\$\*/ { print NR ": " $0 }
+    ' "$s")
+    if [ -z "$early" ]; then
+        ok "$s reads no positional parameter before its argument loop"
+    else
+        bad "$s reads a positional parameter before its argument loop"
+        printf '%s\n' "$early" | sed 's/^/       /'
+    fi
+done
+
+# The top-of-script ordering is load-bearing and easy to undo by accident:
+#   parser -> traps -> startup record -> root check -> tee
+# Each step is where it is for a reason; see CLAUDE.md.
+for s in upgrade-docker.sh rollback-docker.sh clean-swarm-networks.sh; do
+    l_parse=$(grep -n 'while \[ "\$#" -gt 0 \]; do' "$s" | head -1 | cut -d: -f1)
+    l_trap=$(grep -n "^trap on_exit EXIT" "$s" | head -1 | cut -d: -f1)
+    l_start=$(grep -n '^    if ! write_status_file; then' "$s" | head -1 | cut -d: -f1)
+    l_root=$(grep -n 'id -u 2>/dev/null' "$s" | head -1 | cut -d: -f1)
+    l_tee=$(grep -n '^exec > >(tee -a' "$s" | head -1 | cut -d: -f1)
+    if [ -n "$l_parse" ] && [ -n "$l_trap" ] && [ -n "$l_start" ] &&
+       [ -n "$l_root" ] && [ -n "$l_tee" ] &&
+       [ "$l_parse" -lt "$l_trap" ] && [ "$l_trap" -lt "$l_start" ] &&
+       [ "$l_start" -lt "$l_root" ] && [ "$l_root" -lt "$l_tee" ]; then
+        ok "$s orders parser, traps, startup record, root check and tee correctly"
+    else
+        bad "$s prologue order wrong (parse@${l_parse:-?} trap@${l_trap:-?} start@${l_start:-?} root@${l_root:-?} tee@${l_tee:-?})"
+    fi
+done
+
+# The status write must sit BEFORE on_exit's rc==0 short-circuit. After it, a
+# successful run never updates the startup record and reports result=running
+# for ever -- the single most common outcome an agent needs to confirm.
+for s in upgrade-docker.sh rollback-docker.sh clean-swarm-networks.sh; do
+    w=$(grep -n 'write_status_file || true' "$s" | tail -1 | cut -d: -f1)
+    # shellcheck disable=SC2016  # a literal grep pattern, not an expansion
+    c=$(grep -n '\[ "\$rc" -eq 0 \] && exit 0' "$s" | head -1 | cut -d: -f1)
+    if [ -z "$c" ]; then
+        # clean-swarm-networks.sh has no short-circuit: its trap always writes.
+        # It has the opposite requirement -- the write must come AFTER the
+        # trap's start_services recovery, or the record claims the node is down
+        # when the trap just brought it back up.
+        r=$(grep -n 'if start_services; then' "$s" | tail -1 | cut -d: -f1)
+        # Not merely after the recovery CALL: after the assignments that record
+        # what the recovery achieved. Writing between the two would publish
+        # services_stopped=true for a node the trap had just brought back.
+        f=$(grep -n 'SERVICES_STOPPED=false' "$s" | awk -F: -v r="${r:-0}" '$1 > r {print $1; exit}')
+        if [ -n "$w" ] && [ -n "$r" ] && [ -n "$f" ] && [ "$w" -gt "$f" ]; then
+            ok "$s writes its run record after the trap's recovery bookkeeping"
+        else
+            bad "$s status write at ${w:-?} is not after its recovery at ${r:-?}/${f:-?}"
+        fi
+    elif [ -n "$w" ] && [ "$w" -lt "$c" ]; then
+        ok "$s writes its run record before the rc==0 short-circuit"
+    else
+        bad "$s status write is at ${w:-?}, after the rc==0 short-circuit at ${c:-?}"
+    fi
+done
+
+# The root check must precede the log redirection. After it, a non-root run
+# cannot open the log and the process substitution swallows every line the
+# script prints -- measured, that produced no output at all.
+for s in upgrade-docker.sh rollback-docker.sh clean-swarm-networks.sh; do
+    r=$(grep -n 'id -u 2>/dev/null' "$s" | head -1 | cut -d: -f1)
+    t=$(grep -n '^exec > >(tee -a' "$s" | head -1 | cut -d: -f1)
+    if [ -n "$r" ] && [ -n "$t" ] && [ "$r" -lt "$t" ]; then
+        ok "$s checks for root before installing the log redirection"
+    else
+        bad "$s root check missing or after the tee (root@${r:-?}, tee@${t:-?})"
+    fi
+done
 
 #############################################
 head_ "1.3  Upstream package availability"

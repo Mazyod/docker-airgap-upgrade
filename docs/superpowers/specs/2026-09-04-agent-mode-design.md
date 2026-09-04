@@ -496,11 +496,19 @@ the documented list.
 | `nvidia` | `installed` \| `absent` \| `skipped-corrupt` \| `not-attempted` |
 | `docker_ce_before` / `docker_ce_after` / `docker_ce_expected` | version, or `absent` |
 | `containerd_io_before` / `_after` / `_expected` | version, or `absent` |
+| `containerd_io_release_before` / `_after` / `_expected` | RPM `%{RELEASE}`, or `absent` |
 | `buildx_before` / `_after` / `_expected` | version, or `absent` |
 | `compose_before` / `_after` / `_expected` | version, or `absent` |
 
 The `*_expected` keys exist so `docs/AGENT-RUNBOOK.md` can talk about the target versions
 without naming them, which is what keeps it off the version-sync list in `CLAUDE.md`.
+
+The `*_release_*` keys were added during implementation, after a retarget made the RPM
+`%{RELEASE}` load-bearing: the same containerd `%{VERSION}` has been published more than once
+carrying different `runc` builds, so the version alone no longer identifies what is installed.
+A record that could not distinguish them would be exactly the ambiguity the release assertion
+exists to remove. `_expected` is `unknown` until the RHEL major is detected, because the
+constant is only the numeric half of the release string.
 
 ### `rollback-docker.sh` keys
 

@@ -42,6 +42,7 @@ VM_ARCH="${VM_ARCH:-amd64}"
 # The versions under test. Keep in sync with the scripts -- see CLAUDE.md.
 BASELINE_DOCKER="29.1.5"
 BASELINE_CONTAINERD="2.2.1"
+BASELINE_CONTAINERD_RELEASE="1"
 BASELINE_BUILDX="0.30.1"
 BASELINE_COMPOSE="5.0.1"
 TARGET_DOCKER="29.8.0"
@@ -345,6 +346,107 @@ assert_vm_fails() {
         ok "$label (exit $rc)"
     else
         bad "$label (expected non-zero, got 0)"
+    fi
+}
+
+# --- agent-mode state helpers -------------------------------------------
+#
+# assert_untouched in tier2-run.sh checks docker-ce and the docker service
+# only, which can miss a partial containerd or plugin change. These are the
+# strict versions, used by the agent-mode cases. assert_untouched itself is
+# deliberately NOT changed: doing so would alter the pre-existing assertion
+# count and break the interactive-path regression gate.
+
+# Package versions for a whole profile: baseline | target.
+assert_pkg_profile() {
+    local label="$1" profile="$2"
+    local d c b m
+    case "$profile" in
+        baseline) d="$BASELINE_DOCKER"; c="$BASELINE_CONTAINERD"; b="$BASELINE_BUILDX"; m="$BASELINE_COMPOSE" ;;
+        target)   d="$TARGET_DOCKER";   c="$TARGET_CONTAINERD";   b="$TARGET_BUILDX";   m="$TARGET_COMPOSE" ;;
+        *) bad "$label: unknown package profile '$profile'"; return ;;
+    esac
+    assert_vm_eq "$label: docker-ce $d"             "rpm -q docker-ce --queryformat '%{VERSION}'" "$d"
+    assert_vm_eq "$label: docker-ce-cli $d"         "rpm -q docker-ce-cli --queryformat '%{VERSION}'" "$d"
+    assert_vm_eq "$label: containerd.io $c"         "rpm -q containerd.io --queryformat '%{VERSION}'" "$c"
+    assert_vm_eq "$label: buildx $b"                "rpm -q docker-buildx-plugin --queryformat '%{VERSION}'" "$b"
+    assert_vm_eq "$label: compose $m"               "rpm -q docker-compose-plugin --queryformat '%{VERSION}'" "$m"
+}
+
+# Snapshot the state an "unchanged" claim is about. A profile alone cannot
+# express this: the backup count grows with every upgrade, and some cases
+# deliberately create more than one, so "unchanged" has to be measured against
+# the moment before the invocation under test.
+#
+# It captures config sha, backup count and the canary. It does NOT capture the
+# service states: assert_strict_state_unchanged requires both units to be
+# `active` afterwards, which is the right assertion for every case that uses
+# it. A case that starts from stopped services needs its own assertion.
+capture_strict_state() {
+    local name="$1"
+    STRICT_CONF_SHA[$name]=$(vm_try "sha256sum /etc/containerd/config.toml 2>/dev/null | cut -d' ' -f1" | tail -1)
+    STRICT_BACKUPS[$name]=$(vm_try "ls -d /root/docker-backup-*/ 2>/dev/null | wc -l" | tail -1)
+    STRICT_CANARY[$name]=$(vm_try "docker start survivor >/dev/null 2>&1; docker exec survivor cat /data/canary.txt 2>/dev/null" | tail -1)
+}
+
+assert_strict_state_unchanged() {
+    local label="$1" name="$2" got
+    got=$(vm_try "sha256sum /etc/containerd/config.toml 2>/dev/null | cut -d' ' -f1" | tail -1)
+    if [ "$got" = "${STRICT_CONF_SHA[$name]}" ]; then
+        ok "$label: containerd config unchanged"
+    else
+        bad "$label: containerd config CHANGED (${STRICT_CONF_SHA[$name]:0:12} -> ${got:0:12})"
+    fi
+    got=$(vm_try "ls -d /root/docker-backup-*/ 2>/dev/null | wc -l" | tail -1)
+    if [ "$got" = "${STRICT_BACKUPS[$name]}" ]; then
+        ok "$label: no new backup directory ($got)"
+    else
+        bad "$label: backup count changed (${STRICT_BACKUPS[$name]} -> $got)"
+    fi
+    assert_vm_eq "$label: docker still active"     "systemctl is-active docker" "active"
+    assert_vm_eq "$label: containerd still active" "systemctl is-active containerd" "active"
+    got=$(vm_try "docker start survivor >/dev/null 2>&1; docker exec survivor cat /data/canary.txt 2>/dev/null" | tail -1)
+    if [ "$got" = "${STRICT_CANARY[$name]}" ]; then
+        ok "$label: canary data intact"
+    else
+        bad "$label: canary data changed ('${STRICT_CANARY[$name]}' -> '$got')"
+    fi
+}
+declare -A STRICT_CONF_SHA STRICT_BACKUPS STRICT_CANARY
+
+assert_untouched_strict() {
+    local label="$1" profile="$2" name="$3"
+    assert_pkg_profile "$label" "$profile"
+    assert_strict_state_unchanged "$label" "$name"
+}
+
+# Read one key out of a status file inside the guest. Prints nothing when the
+# file or the key is absent, so a caller comparing against an expected value
+# fails rather than silently matching.
+status_key() {
+    local path="$1" key="$2"
+    vm_try "sed -n 's/^${key}=//p' '$path' 2>/dev/null | head -1" | tail -1
+}
+
+assert_status_key() {
+    local label="$1" path="$2" key="$3" want="$4" got
+    got=$(status_key "$path" "$key")
+    if [ "$got" = "$want" ]; then
+        ok "$label: $key=$want"
+    else
+        bad "$label: $key is '$got', want '$want'"
+    fi
+}
+
+# A record is only readable if its last line is the terminator. Anything else
+# is a partial write and must be treated as unknown, not as its last result.
+assert_status_complete() {
+    local label="$1" path="$2" got
+    got=$(vm_try "tail -n 1 '$path' 2>/dev/null" | tail -1)
+    if [ "$got" = "status_complete=1" ]; then
+        ok "$label: status file is complete"
+    else
+        bad "$label: status file does not end in status_complete=1 (got '$got')"
     fi
 }
 

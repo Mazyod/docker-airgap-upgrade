@@ -1,7 +1,7 @@
 #!/bin/bash
 # upgrade-docker.sh
 # Run on each AIR-GAPPED server to upgrade Docker 29.1.5 → 29.8.0
-VERSION="2.2.0"
+VERSION="2.3.0"
 #
 # Prerequisites:
 # - Extract docker-upgrade-bundle.tar.gz to /opt/
@@ -18,7 +18,7 @@ VERSION="2.2.0"
 # to avoid SSL certificate issues with corporate satellite servers
 # (e.g., "SSL certificate problem: EE certificate key too weak")
 #
-# SCOPE OF THIS VERSION (2.2.0)
+# SCOPE OF THIS VERSION (2.3.0)
 #
 # This upgrade crosses containerd 2.2.1 -> 2.3.4: a MINOR containerd bump, not
 # the 1.7 -> 2.x MAJOR boundary the 28.5.1 -> 29.1.5 migration crossed. 2.3 is
@@ -64,15 +64,357 @@ GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
 NC='\033[0m' # No Color
 
-# Log file
-exec > >(tee -a /var/log/docker-upgrade.log) 2>&1
+#############################################
+# Agent-mode identity
+#############################################
+SCRIPT_NAME="upgrade-docker.sh"
+LOG_FILE="/var/log/docker-upgrade.log"
 
-echo "=========================================="
-echo "Docker Upgrade: 29.1.5 → 29.8.0"
-echo "Script Version: $VERSION"
-echo "Server: $(hostname)"
-echo "Date: $(date)"
-echo "=========================================="
+#############################################
+# Agent-mode run record
+#############################################
+# --status-file=PATH writes a flat key=value record of this run. Nothing else
+# about the script changes: with no arguments the behaviour is exactly what it
+# was, and there is still no way to answer a prompt from a flag. That arrives
+# in a later change.
+#
+# Everything here runs BEFORE `exec > >(tee ...)` further down, and the order
+# is load-bearing:
+#
+#   globals -> parser -> traps -> startup record -> root check -> tee -> banner
+#
+#   - The parser precedes the tee because --help must not need write access to
+#     /var/log.
+#   - The traps precede the root check so a non-root refusal is still reported.
+#   - The root check precedes the tee because a non-root run cannot open the
+#     log, and the process substitution then swallows every line the script
+#     prints: measured, a non-root run produced NO output at all. An
+#     unexplained silent exit is the worst possible failure for an operator
+#     with no internet.
+STATUS_FILE=""
+STATUS_WRITTEN=false
+STATUS_OK=true
+LOG_STARTED=false
+MODE="interactive"
+RESULT="running"
+REFUSAL_REASON=""
+REFUSAL_DETAIL=""
+NEXT_ACTION="none"
+OPERATION_COMPLETED=false
+ENDED="unknown"
+STARTED="unknown"
+RUN_ID="unknown"
+
+# Slice 4 populates these; declared here because the parser will own them, and
+# assigning GATE_ANSWERS[x] before `declare -A` would create an indexed array
+# that cannot be converted afterwards.
+# shellcheck disable=SC2034  # reserved for the gate flags; see the agent-mode plan
+NON_INTERACTIVE=false
+# shellcheck disable=SC2034  # reserved for the gate flags; see the agent-mode plan
+declare -A GATE_ANSWERS=()
+
+usage() {
+    cat <<USAGE
+$SCRIPT_NAME $VERSION
+
+Usage: $SCRIPT_NAME [OPTIONS]
+
+Options:
+  --status-file=PATH   Write a key=value record of this run to PATH. Written
+                       once at startup with result=running and again on every
+                       exit path, including success and interrupts.
+  --help               Show this help and exit.
+  --version            Print the script version and exit.
+
+With no options the behaviour is unchanged: the script is interactive and
+every prompt refuses a closed stdin. See docs/AGENT-RUNBOOK.md.
+USAGE
+}
+
+# Inert with zero arguments: the loop body never runs, so nothing is assigned
+# and nothing is touched. The timestamp and correlation id below are computed
+# only when a record will actually be written, so a run with no status file
+# does no extra work beyond this loop and the root check.
+while [ "$#" -gt 0 ]; do
+    case "$1" in
+        --status-file=*)
+            STATUS_FILE="${1#*=}"
+            if [ -z "$STATUS_FILE" ]; then
+                echo "ERROR: --status-file needs a path" >&2
+                exit 1
+            fi
+            ;;
+        --status-file)
+            # An empty value must be rejected here too. Accepted, it would
+            # leave STATUS_FILE empty and the run would silently behave as if
+            # no status file had been asked for at all.
+            if [ "$#" -lt 2 ] || [ -z "$2" ]; then
+                echo "ERROR: --status-file needs a path" >&2
+                exit 1
+            fi
+            STATUS_FILE="$2"; shift
+            ;;
+        --help|-h) usage; exit 0 ;;
+        --version) echo "$SCRIPT_NAME $VERSION"; exit 0 ;;
+        *)
+            echo "ERROR: unrecognised argument: $1" >&2
+            echo "Try --help." >&2
+            exit 1
+            ;;
+    esac
+    shift
+done
+
+if [ -n "$STATUS_FILE" ]; then
+    if [ "${STATUS_FILE#/}" = "$STATUS_FILE" ]; then
+        echo "ERROR: --status-file must be an absolute path: $STATUS_FILE" >&2
+        exit 1
+    fi
+    # A directory would otherwise "succeed": mktemp makes a sibling and `mv`
+    # drops it INSIDE the directory, so the startup write returns 0 and no
+    # record exists at the path the caller asked for. `mv -fT` refuses that,
+    # but say so here rather than at the rename.
+    if [ -d "$STATUS_FILE" ]; then
+        echo "ERROR: --status-file is a directory: $STATUS_FILE" >&2
+        exit 1
+    fi
+    STARTED=$(date -u +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || echo "unknown")
+    # A correlation id, not a guaranteed-unique key: epoch plus pid collides
+    # under pid reuse, hence the random suffix. Lets a caller that reuses one
+    # status-file path tell this run's record from the previous run's.
+    RUN_ID="$(date -u +%s 2>/dev/null || echo 0)-$$-$(od -An -N2 -tx1 /dev/urandom 2>/dev/null | tr -d ' \n' || echo 0000)"
+fi
+
+# Quiet, bounded probes of unit state, for the run record and for
+# derive_next_action. `systemctl is-active` is NOT used: it returns nonzero for
+# `activating`, for `deactivating`, and for failing to reach systemd at all, so
+# treating nonzero as "stopped" fails open -- the exact trap verify_unit_stopped
+# exists to avoid, and one CLAUDE.md calls out by name. These fail CLOSED: an
+# unreachable systemd reads as unknown, never as stopped.
+#
+# `timeout` bounds them because they run inside the EXIT trap, and a trap that
+# hangs on a sick systemd is worse than a missing key.
+unit_state() {
+    local out
+    out=$(timeout --kill-after=2 5 systemctl show "$1" \
+              --property=ActiveState --value 2>/dev/null) || return 1
+    [ -n "$out" ] || return 1
+    printf '%s\n' "$out"
+}
+
+# The same rule verify_unit_stopped applies: a SUCCESSFUL show, an ActiveState
+# of inactive or failed, and MainPID 0. Anything else is not "stopped".
+unit_is_stopped() {
+    local out st pid
+    # ONE call for both properties. Two calls can straddle a state change: the
+    # first sees docker.socket inactive, the socket activates, the second still
+    # reads MainPID=0, and a live socket is classified as stopped. That is the
+    # unit whose survival socket-activates dockerd mid-transaction.
+    out=$(timeout --kill-after=2 5 systemctl show "$1" \
+              --property=ActiveState --property=MainPID 2>/dev/null) || return 1
+    st=$(printf '%s\n' "$out" | sed -n 's/^ActiveState=//p' | head -1)
+    pid=$(printf '%s\n' "$out" | sed -n 's/^MainPID=//p' | head -1)
+    case "$st" in
+        inactive|failed) : ;;
+        *) return 1 ;;
+    esac
+    [ "$pid" = "0" ]
+}
+
+# Values are single-line and unquoted; a consumer splits on the FIRST '='.
+# A failed write flips STATUS_OK, which is what stops a truncated file being
+# published -- see write_status_file.
+status_kv() {
+    printf '%s=%s\n' "$1" "${2//[$'\n\r']/ }" || STATUS_OK=false
+}
+
+status_common() {
+    status_kv schema 1
+    status_kv run_id "$RUN_ID"
+    status_kv script "$SCRIPT_NAME"
+    status_kv script_version "$VERSION"
+    status_kv started "$STARTED"
+    status_kv ended "$ENDED"
+    status_kv host "$(hostname 2>/dev/null || echo unknown)"
+    status_kv rhel "$(rpm -E %rhel 2>/dev/null || echo unknown)"
+    status_kv mode "$MODE"
+    status_kv result "$RESULT"
+    status_kv exit_code "$EXIT_CODE"
+    status_kv phase "$CURRENT_PHASE"
+    status_kv refusal_reason "$REFUSAL_REASON"
+    status_kv refusal_detail "$REFUSAL_DETAIL"
+    status_kv next_action "$NEXT_ACTION"
+    status_kv log "$LOG_FILE"
+    status_kv log_started "$LOG_STARTED"
+    # Observed at write time. SERVICES_STOPPED records that the script BEGAN
+    # stopping services, which is what the recovery logic needs; it is not a
+    # claim that the units actually reached inactive. A failed or partial stop
+    # leaves it true while docker is still up, so report both.
+    status_kv docker_active "$(unit_state docker || echo unknown)"
+    status_kv docker_socket_active "$(unit_state docker.socket || echo unknown)"
+    status_kv containerd_active "$(unit_state containerd || echo unknown)"
+}
+
+# Writes to a temp file beside the destination and renames, so a reader never
+# sees a half-written record, and NEVER through the tee'd stdout -- the process
+# substitution's flush ordering at exit is not guaranteed.
+#
+# Publishing requires BOTH the STATUS_OK accumulator and the status_complete
+# terminator. Either alone can be satisfied by a truncated file: the call site
+# guards this with `|| true`, which suspends `set -e` for the whole function,
+# so a status_kv that fails mid-file is followed by later ones that succeed --
+# terminator included.
+write_status_file() {
+    [ -n "$STATUS_FILE" ] || return 0
+    local tmp last
+    # mktemp, not ".tmp.$$": exclusive creation, so a stale temp left by a
+    # killed run whose pid was later reused cannot be inspected and published.
+    tmp=$(mktemp "${STATUS_FILE}.tmp.XXXXXX" 2>/dev/null) || return 1
+    STATUS_OK=true
+    {
+        status_common
+        status_keys
+        [ "$STATUS_OK" = true ] && status_kv status_complete 1
+    } > "$tmp" 2>/dev/null || STATUS_OK=false
+    if [ "$STATUS_OK" = true ] && last=$(tail -n 1 "$tmp" 2>/dev/null) &&
+       [ "$last" = "status_complete=1" ]; then
+        # -T: treat the destination as a file, never as a directory to move
+        # into. GNU userland is assumed throughout these scripts.
+        mv -fT "$tmp" "$STATUS_FILE" 2>/dev/null && return 0
+    fi
+    rm -f "$tmp"
+    return 1
+}
+
+# TOTAL: always returns 0. A nonzero return would abort the EXIT trap under
+# `set -e`, replacing 130 or 143 with this function's status and writing no
+# final record -- on exactly the interrupted run someone needs to read.
+derive_result() {
+    local rc="$1"
+    if [ "$rc" -eq 130 ] || [ "$rc" -eq 143 ]; then
+        RESULT="interrupted"
+    elif [ -n "$REFUSAL_REASON" ]; then
+        RESULT="refused"
+    elif [ "$rc" -eq 3 ]; then
+        RESULT="nothing-to-do"
+    elif [ "$rc" -eq 2 ] && [ "$OPERATION_COMPLETED" = true ]; then
+        RESULT="completed"
+    elif [ "$rc" -eq 0 ]; then
+        case "$RESULT" in
+            ready|nothing-to-do) : ;;
+            *) RESULT="completed" ;;
+        esac
+    else
+        RESULT="failed"
+    fi
+    [ -n "$STATUS_FILE" ] && ENDED=$(date -u +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || echo "unknown")
+    EXIT_CODE="$rc"
+    return 0
+}
+
+# Script-specific half of the run record. status_kv, status_common,
+# write_status_file and derive_result above are byte-identical across the three
+# stateful scripts and are drift-checked by tests/static-checks.sh; only this
+# function differs.
+#
+# Everything here is READ from variables the phases already maintain. Nothing
+# in this function may change state -- it runs inside the EXIT trap.
+status_keys() {
+    local root="${CONTAINERD_ROOT:-unknown}" relocated="unknown" present="unknown"
+    if [ "$root" != "unknown" ]; then
+        if [ "$root" = "/var/lib/containerd" ]; then relocated=false; else relocated=true; fi
+        if [ -d "$root" ]; then present=true; else present=false; fi
+    fi
+    local rbsafe="unknown"
+    if [ -n "${CONFIG_VERSION+x}" ]; then
+        if [ -z "$CONFIG_VERSION" ]; then
+            rbsafe=true
+        elif [ "${#CONFIG_VERSION}" -le 4 ] &&
+             [ "$CONFIG_VERSION" -le "${ROLLBACK_SAFE_CONFIG_VERSION:-3}" ]; then
+            rbsafe=true
+        else
+            rbsafe=false
+        fi
+    fi
+    status_kv services_stopped "$SERVICES_STOPPED"
+    status_kv pkg_state "$PKG_STATE"
+    status_kv backup_dir "${BACKUP_DIR:-}"
+    status_kv swarm_active "${SWARM_ACTIVE:-unknown}"
+    status_kv swarm_role "$SWARM_ROLE_TOKEN"
+    status_kv swarm_node_id "${SWARM_NODE_ID:-}"
+    status_kv node_availability_before "${NODE_AVAILABILITY:-unknown}"
+    status_kv node_availability_after "$NODE_AVAILABILITY_AFTER"
+    status_kv drain_performed "$DRAIN_PERFORMED"
+    status_kv tasks_remaining "${TASKS:-n/a}"
+    status_kv containerd_config "${CONTAINERD_CONF:-/etc/containerd/config.toml}"
+    status_kv containerd_config_version "${CONFIG_VERSION:-unknown}"
+    status_kv containerd_config_rollback_safe "$rbsafe"
+    status_kv containerd_root "$root"
+    status_kv containerd_root_relocated "$relocated"
+    status_kv containerd_root_present "$present"
+    status_kv rpmnew_present "$(if [ -f "${CONTAINERD_CONF:-/etc/containerd/config.toml}.rpmnew" ]; then echo true; else echo false; fi)"
+    status_kv nvidia "$NVIDIA_RESULT"
+    status_kv docker_ce_before "${CURRENT_DOCKER:-unknown}"
+    status_kv docker_ce_after "$AFTER_DOCKER"
+    status_kv docker_ce_expected "${EXPECTED_DOCKER_VERSION:-unknown}"
+    status_kv docker_ce_cli_before "${CURRENT_DOCKER_CLI:-unknown}"
+    status_kv docker_ce_cli_after "$AFTER_DOCKER_CLI"
+    status_kv containerd_io_before "${CURRENT_CONTAINERD:-unknown}"
+    status_kv containerd_io_after "$AFTER_CONTAINERD"
+    status_kv containerd_io_expected "${EXPECTED_CONTAINERD_VERSION:-unknown}"
+    status_kv containerd_io_release_before "${CURRENT_CONTAINERD_REL:-unknown}"
+    status_kv containerd_io_release_after "$AFTER_CONTAINERD_REL"
+    status_kv containerd_io_release_expected "${EXPECTED_CT_REL_FULL:-unknown}"
+    status_kv buildx_before "${CURRENT_BUILDX:-unknown}"
+    status_kv buildx_after "$AFTER_BUILDX"
+    status_kv buildx_expected "${EXPECTED_BUILDX_VERSION:-unknown}"
+    status_kv compose_before "${CURRENT_COMPOSE:-unknown}"
+    status_kv compose_after "$AFTER_COMPOSE"
+    status_kv compose_expected "${EXPECTED_COMPOSE_VERSION:-unknown}"
+}
+
+# The token form of the decision on_exit already prints in English. It never
+# says "rollback": CLAUDE.md is explicit that retry-versus-rollback is an
+# operator judgement that depends on why the run failed, and a token that made
+# that call would contradict the invariant the trap exists to honour.
+derive_next_action() {
+    case "$RESULT" in
+        completed|nothing-to-do)
+            NEXT_ACTION="none"
+            return 0
+            ;;
+    esac
+    case "$REFUSAL_REASON" in
+        not-root)  NEXT_ACTION="rerun-as-root"; return 0 ;;
+        bad-usage) NEXT_ACTION="none";          return 0 ;;
+    esac
+    # start-services only when the units are OBSERVED down. SERVICES_STOPPED
+    # is set before the first stop command, so a stop that failed partway
+    # leaves it true with docker still running -- telling an agent to start an
+    # already-running daemon, and hiding a genuinely stuck unit behind a
+    # confident instruction.
+    if [ "$SERVICES_STOPPED" = true ] &&
+       [ "$PKG_STATE" = "untouched" ] &&
+       unit_is_stopped docker && unit_is_stopped docker.socket &&
+       unit_is_stopped containerd; then
+        NEXT_ACTION="start-services"
+    else
+        NEXT_ACTION="investigate"
+    fi
+    return 0
+}
+
+# Captured at a point where rpm is known to have exited. Doing this inside the
+# EXIT trap instead would risk `rpm -q` blocking on the rpmdb lock if the run
+# was killed mid-transaction, and a trap that hangs is worse than a missing key.
+capture_after_versions() {
+    AFTER_DOCKER=$(rpm -q docker-ce --queryformat '%{VERSION}' 2>/dev/null || echo "absent")
+    AFTER_DOCKER_CLI=$(rpm -q docker-ce-cli --queryformat '%{VERSION}' 2>/dev/null || echo "absent")
+    AFTER_CONTAINERD=$(rpm -q containerd.io --queryformat '%{VERSION}' 2>/dev/null || echo "absent")
+    AFTER_CONTAINERD_REL=$(rpm -q containerd.io --queryformat '%{RELEASE}' 2>/dev/null || echo "absent")
+    AFTER_BUILDX=$(rpm -q docker-buildx-plugin --queryformat '%{VERSION}' 2>/dev/null || echo "absent")
+    AFTER_COMPOSE=$(rpm -q docker-compose-plugin --queryformat '%{VERSION}' 2>/dev/null || echo "absent")
+}
 
 #############################################
 # Failure Handling
@@ -98,10 +440,54 @@ SERVICES_STOPPED=false
 #   installed  - rpm returned success
 PKG_STATE="untouched"
 
+# Every variable status_keys reads is initialised HERE, before the trap is
+# armed. The startup record is written moments later, and a key with no value
+# would violate its own documented domain. "unknown" means "not observed at the
+# time this record was written", which is the normal state of most keys in a
+# startup record.
+EXIT_CODE="unknown"
+SWARM_ROLE_TOKEN="unknown"
+NODE_AVAILABILITY_AFTER="unknown"
+DRAIN_PERFORMED=false
+NVIDIA_RESULT="not-attempted"
+AFTER_DOCKER="unknown"
+AFTER_DOCKER_CLI="unknown"
+AFTER_CONTAINERD="unknown"
+AFTER_CONTAINERD_REL="unknown"
+# The full expected %{RELEASE}. The constant further down is only its numeric
+# half, and a record carrying "2" would be as ambiguous as the version-only
+# check the release assertion exists to replace. Declared HERE, with the other
+# globals the writer reads, because the startup record is written long before
+# RHEL_VER is known; the real value is assigned the moment it is.
+EXPECTED_CT_REL_FULL="unknown"
+AFTER_BUILDX="unknown"
+AFTER_COMPOSE="unknown"
+
 # shellcheck disable=SC2329  # invoked indirectly by `trap on_exit EXIT` below
 on_exit() {
     local rc=$?
+
+    # BEFORE the rc==0 short-circuit below. Placed after it, a successful
+    # upgrade -- the single most common outcome anyone needs to confirm --
+    # would leave the startup record saying result=running for ever.
+    # `|| true` so a failing write cannot replace the real exit code with its
+    # own, and STATUS_WRITTEN so gate-style exits cannot re-enter the trap.
+    if [ "$STATUS_WRITTEN" != true ]; then
+        STATUS_WRITTEN=true
+        derive_result "$rc" || true
+        derive_next_action || true
+        write_status_file || true
+    fi
+
     [ "$rc" -eq 0 ] && exit 0
+
+    # A usage error or a non-root invocation already printed the one line that
+    # explains it, and nothing has happened yet. The full state report below
+    # would bury that line under twenty lines about packages and services that
+    # were never touched.
+    case "$REFUSAL_REASON" in
+        not-root|bad-usage) exit "$rc" ;;
+    esac
 
     echo ""
     echo -e "${RED}==========================================${NC}"
@@ -176,6 +562,44 @@ on_exit() {
 trap on_exit EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
+
+# Written once here with result=running, and again from the EXIT trap on every
+# path. Without the startup record, a run killed hard enough that the trap
+# never fires leaves a caller reading the PREVIOUS run's file and believing it.
+#
+# This write is also the writability check, and it must succeed. A create-and-
+# remove probe beside the file proves less: it never exercises the rename,
+# which is what a sticky directory or a root-owned existing target blocks.
+if [ -n "$STATUS_FILE" ]; then
+    EXIT_CODE="unknown"
+    if ! write_status_file; then
+        REFUSAL_REASON="bad-usage"
+        REFUSAL_DETAIL="cannot write status file: $STATUS_FILE"
+        echo "ERROR: cannot write status file: $STATUS_FILE" >&2
+        exit 1
+    fi
+fi
+
+# Before the tee, deliberately -- see the ordering note above.
+if [ "$(id -u 2>/dev/null || echo 1)" != "0" ]; then
+    REFUSAL_REASON="not-root"
+    REFUSAL_DETAIL="must run as root"
+    echo "ERROR: $SCRIPT_NAME must be run as root." >&2
+    echo "It stops services, replaces packages and writes to /var/log." >&2
+    exit 1
+fi
+
+# Log file
+exec > >(tee -a /var/log/docker-upgrade.log) 2>&1
+LOG_STARTED=true
+
+echo "=========================================="
+echo "Docker Upgrade: 29.1.5 → 29.8.0"
+echo "Script Version: $VERSION"
+echo "Server: $(hostname)"
+echo "Date: $(date)"
+echo "=========================================="
+
 
 #############################################
 # Expected package versions
@@ -390,9 +814,15 @@ wait_for_services() {
 
 # Detect RHEL version
 RHEL_VER=$(rpm -E %rhel)
+# Assigned the moment RHEL_VER exists, not after the payload checks: a release
+# rejection would otherwise report the expected release as "unknown" when it
+# was already knowable.
+EXPECTED_CT_REL_FULL="${EXPECTED_CONTAINERD_RELEASE}.el${RHEL_VER}"
 PKG_DIR="/opt/docker-offline/rhel${RHEL_VER}"
 
 if [ ! -d "$PKG_DIR" ]; then
+    REFUSAL_REASON="payload-invalid"
+    REFUSAL_DETAIL="package directory not found: $PKG_DIR"
     echo -e "${RED}ERROR: Package directory not found: $PKG_DIR${NC}"
     echo "Please extract docker-upgrade-bundle.tar.gz to /opt/"
     exit 1
@@ -426,6 +856,8 @@ PKG_FILES=("$PKG_DIR"/*.rpm)
 shopt -u nullglob
 
 if [ "${#PKG_FILES[@]}" -eq 0 ]; then
+    REFUSAL_REASON="payload-invalid"
+    REFUSAL_DETAIL="no .rpm files in $PKG_DIR"
     echo -e "${RED}ERROR: No .rpm files found in $PKG_DIR${NC}"
     echo "The bundle is empty or was extracted to the wrong location."
     exit 1
@@ -577,6 +1009,8 @@ check_containerd_release "$FOUND_CONTAINERD_REL" "$EXPECTED_CONTAINERD_RELEASE"
 
 if [ "$PKG_ERRORS" -gt 0 ]; then
     echo ""
+    REFUSAL_REASON="payload-invalid"
+    REFUSAL_DETAIL="$PKG_ERRORS problem(s) with the package payload"
     echo -e "${RED}ERROR: $PKG_ERRORS problem(s) with the package payload.${NC}"
     echo "Nothing on this node has been changed. Re-transfer the correct bundle:"
     echo "  expected docker-ce $EXPECTED_DOCKER_VERSION, containerd.io $EXPECTED_CONTAINERD_VERSION-$EXPECTED_CONTAINERD_RELEASE"
@@ -594,6 +1028,8 @@ if ! rpm -Uvh --test --force "${PKG_FILES[@]}" 2>&1; then
     echo -e "${RED}ERROR: rpm rejected the upgrade transaction (dry run).${NC}"
     echo "Nothing on this node has been changed. The output above says why."
     echo ""
+    REFUSAL_REASON="dry-run-failed"
+    REFUSAL_DETAIL="rpm --test refused the transaction"
     echo "Common causes: unsatisfied dependency, or insufficient space in /var."
     echo "  df -h /var /usr"
     exit 1
@@ -633,6 +1069,8 @@ case "$CURRENT_CONTAINERD" in
         echo "orphaned-network cleanup that migration requires were removed in"
         echo "v2.0.0."
         echo ""
+        REFUSAL_REASON="containerd-1x"
+        REFUSAL_DETAIL="containerd.io $CURRENT_CONTAINERD predates the supported range"
         echo "Use upgrade-docker.sh v1.2.3 (commit 974683a) for that path."
         echo ""
         echo "Aborting. Nothing has been changed."
@@ -663,6 +1101,9 @@ if [ "$CURRENT_DOCKER" = "$EXPECTED_DOCKER_VERSION" ] &&
     echo "  containerd.io $CURRENT_CONTAINERD-$CURRENT_CONTAINERD_REL, buildx $CURRENT_BUILDX,"
     echo "  compose $CURRENT_COMPOSE"
     if ! prompt_yes_no "Re-run the upgrade anyway? [y/N]" "n"; then
+        # Exit 0 here has always meant "nothing done", which is indistinguishable
+        # from "upgrade completed" by status alone. The record separates them.
+        RESULT="nothing-to-do"
         echo "Nothing to do. Exiting without changes."
         exit 0
     fi
@@ -692,6 +1133,8 @@ else
         echo "  this node has:       ${CURRENT_DOCKER:-absent} / containerd.io ${CURRENT_CONTAINERD:-absent}"
         echo ""
         if ! prompt_yes_no "Continue from this unverified starting version? [y/N]" "n"; then
+            REFUSAL_REASON="unverified-baseline"
+            REFUSAL_DETAIL="declined to upgrade from ${CURRENT_DOCKER:-absent} / containerd.io ${CURRENT_CONTAINERD:-absent}"
             echo "Aborting. Nothing has been changed."
             exit 0
         fi
@@ -726,8 +1169,10 @@ if [ "$SWARM_STATE" = "active" ]; then
 
     if [ "$SWARM_ROLE" = "true" ]; then
         IS_MANAGER=true
+        SWARM_ROLE_TOKEN="manager"
         echo "This node is a Swarm MANAGER (Node ID: $SWARM_NODE_ID)"
     else
+        SWARM_ROLE_TOKEN="worker"
         echo "This node is a Swarm WORKER (Node ID: $SWARM_NODE_ID)"
     fi
 
@@ -752,6 +1197,7 @@ if [ "$SWARM_STATE" = "active" ]; then
             if prompt_yes_no "Drain this node now? [Y/n]" "y"; then
                 echo "Draining node..."
                 docker node update --availability drain "$SWARM_NODE_ID"
+                DRAIN_PERFORMED=true
 
                 echo "Waiting for tasks to migrate..."
                 sleep 10
@@ -775,6 +1221,8 @@ if [ "$SWARM_STATE" = "active" ]; then
                 # migrated" precisely when we could not tell.
                 if [ "$TASKS" = "unknown" ]; then
                     if ! prompt_yes_no "Continue with upgrade anyway? [y/N]" "n"; then
+                        REFUSAL_REASON="tasks-present"
+                        REFUSAL_DETAIL="task count could not be confirmed after the drain"
                         echo "Aborting. Confirm the drain from a manager and re-run."
                         exit 1
                     fi
@@ -783,6 +1231,8 @@ if [ "$SWARM_STATE" = "active" ]; then
                     docker node ps "$SWARM_NODE_ID" --filter "desired-state=running" || true
                     echo ""
                     if ! prompt_yes_no "Continue with upgrade anyway? [y/N]" "n"; then
+                        REFUSAL_REASON="tasks-present"
+                        REFUSAL_DETAIL="$TASKS task(s) still on this node after the drain"
                         echo "Aborting. Please wait for tasks to migrate and re-run."
                         exit 1
                     fi
@@ -810,6 +1260,8 @@ if [ "$SWARM_STATE" = "active" ]; then
             echo ""
 
             if ! prompt_yes_no "Has this node been drained from a manager? [y/N]" "n"; then
+                REFUSAL_REASON="drain-unconfirmed"
+                REFUSAL_DETAIL="worker drain was not attested"
                 echo "Aborting. Please drain this node from a manager and re-run."
                 exit 1
             fi
@@ -818,6 +1270,7 @@ if [ "$SWARM_STATE" = "active" ]; then
         echo "Node is already drained/paused. Proceeding with upgrade."
     fi
 else
+    SWARM_ROLE_TOKEN="none"
     echo "This node is NOT part of a Docker Swarm."
 fi
 
@@ -903,6 +1356,8 @@ done
 
 if [ "$STOP_FAILED" -gt 0 ]; then
     echo ""
+    REFUSAL_REASON="stop-failed"
+    REFUSAL_DETAIL="$STOP_FAILED unit(s) not conclusively stopped"
     echo -e "${RED}ERROR: $STOP_FAILED unit(s) not conclusively stopped.${NC}"
     echo "Refusing to replace packages under a running daemon."
     echo "Investigate with: systemctl status docker docker.socket containerd"
@@ -942,6 +1397,7 @@ echo "Running rpm upgrade..."
 PKG_STATE="attempted"
 rpm -Uvh --force "${PKG_FILES[@]}"
 PKG_STATE="installed"
+capture_after_versions
 
 echo -e "${GREEN}Packages upgraded.${NC}"
 
@@ -1124,6 +1580,8 @@ if [ ! -d "$CONTAINERD_ROOT" ]; then
         echo ""
         echo "Once the filesystem is mounted, re-run this script."
         echo ""
+        REFUSAL_REASON="relocated-root-missing"
+        REFUSAL_DETAIL="$CONTAINERD_ROOT does not exist; its filesystem is probably not mounted"
         echo -e "${YELLOW}NOTE: this is phase 6 -- packages have ALREADY been${NC}"
         echo -e "${YELLOW}installed and services are stopped. See the state report${NC}"
         echo -e "${YELLOW}below for exactly where this node stands.${NC}"
@@ -1139,6 +1597,11 @@ fi
 #############################################
 # Phase 7: Handle NVIDIA Toolkit (if present)
 #############################################
+if [ "$NVIDIA_INSTALLED" != true ]; then
+    # No toolkit on this node, so phase 7 does not run at all. Distinct from
+    # "phase 7 never reached", which the initial not-attempted still means.
+    NVIDIA_RESULT="toolkit-absent"
+fi
 if [ "$NVIDIA_INSTALLED" = true ]; then
     echo ""
     echo "=== Phase 7: Upgrade NVIDIA Container Toolkit ==="
@@ -1163,6 +1626,7 @@ CURRENT_PHASE="phase 7 (nvidia toolkit)"
             fi
         done
         if [ "$NVIDIA_CORRUPT" -gt 0 ]; then
+            NVIDIA_RESULT="skipped-corrupt"
             echo -e "${YELLOW}Skipping NVIDIA upgrade: $NVIDIA_CORRUPT corrupt package(s).${NC}"
             echo "GPU workloads will keep using the currently installed toolkit."
             NVIDIA_FILES=()
@@ -1179,8 +1643,10 @@ CURRENT_PHASE="phase 7 (nvidia toolkit)"
         # Install NVIDIA packages
         echo "Installing ${#NVIDIA_FILES[@]} NVIDIA package(s)..."
         if rpm -Uvh --force "${NVIDIA_FILES[@]}"; then
+            NVIDIA_RESULT="installed"
             echo -e "${GREEN}NVIDIA packages installed.${NC}"
         else
+            NVIDIA_RESULT="install-failed"
             echo -e "${YELLOW}WARNING: Some NVIDIA packages failed to install.${NC}"
             echo "You may need to manually resolve dependencies."
         fi
@@ -1203,6 +1669,13 @@ CURRENT_PHASE="phase 7 (nvidia toolkit)"
 
         echo "NVIDIA toolkit upgrade complete."
     else
+        # NVIDIA_FILES is also emptied above when every package failed its
+        # digest check, so this branch is reached for both "none shipped" and
+        # "all corrupt". The message is unchanged for both -- only the recorded
+        # token distinguishes them.
+        if [ "$NVIDIA_RESULT" != "skipped-corrupt" ]; then
+            NVIDIA_RESULT="payload-missing"
+        fi
         echo -e "${YELLOW}WARNING: NVIDIA packages not found in $NVIDIA_DIR${NC}"
         echo "GPU functionality may not work. Continuing anyway..."
     fi
@@ -1352,6 +1825,8 @@ fi
 
 if [ "$VERIFY_FAILED" -ne 0 ]; then
     echo ""
+    REFUSAL_REASON="verification-failed"
+    REFUSAL_DETAIL="installed versions do not match the upgrade target"
     echo -e "${RED}ERROR: installed versions do not match the upgrade target.${NC}"
     echo "Services are running, but this node was NOT upgraded as intended."
     echo "Inspect: rpm -qa | grep -E '(docker|containerd)'"
@@ -1392,6 +1867,10 @@ CURRENT_PHASE="phase 10 (swarm reactivation)"
     if [ "$IS_MANAGER" = true ]; then
         # Manager can reactivate itself
         CURRENT_AVAILABILITY=$(docker node inspect "$SWARM_NODE_ID" --format '{{.Spec.Availability}}' 2>/dev/null || echo "unknown")
+        # Recorded as soon as it is known, then overwritten if the node is
+        # actually reactivated below. Assigning it only after the prompt means
+        # an EOF there reports "unknown" for a value just observed.
+        NODE_AVAILABILITY_AFTER="$CURRENT_AVAILABILITY"
         echo "Current node availability: $CURRENT_AVAILABILITY"
 
         if [ "$CURRENT_AVAILABILITY" = "drain" ]; then
@@ -1399,6 +1878,7 @@ CURRENT_PHASE="phase 10 (swarm reactivation)"
             if prompt_yes_no "Set this node back to ACTIVE? [Y/n]" "y"; then
                 echo "Activating node..."
                 docker node update --availability active "$SWARM_NODE_ID"
+                NODE_AVAILABILITY_AFTER="active"
 
                 echo ""
                 wait_for_services
@@ -1411,6 +1891,7 @@ CURRENT_PHASE="phase 10 (swarm reactivation)"
                 echo "Services on this node:"
                 docker node ps "$SWARM_NODE_ID" | head -20
             else
+                NODE_AVAILABILITY_AFTER="drain"
                 echo ""
                 echo "Node remains drained. To activate later, run:"
                 echo "  docker node update --availability active $SWARM_NODE_ID"
@@ -1436,6 +1917,7 @@ fi
 #############################################
 echo ""
 echo -e "${GREEN}==========================================${NC}"
+OPERATION_COMPLETED=true
 echo -e "${GREEN}UPGRADE COMPLETE${NC}"
 echo -e "${GREEN}==========================================${NC}"
 echo ""

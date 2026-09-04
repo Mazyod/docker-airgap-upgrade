@@ -1,7 +1,7 @@
 #!/bin/bash
 # rollback-docker.sh
 # Emergency rollback: Docker 29.8.0 → 29.1.5
-VERSION="2.1.1"
+VERSION="2.2.0"
 #
 # Use this script if:
 # - Services fail to start after upgrade
@@ -44,24 +44,315 @@ GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
 NC='\033[0m' # No Color
 
-exec > >(tee -a /var/log/docker-rollback.log) 2>&1
-
-echo "=========================================="
-echo "Docker Rollback: 29.8.0 → 29.1.5"
-echo "Script Version: $VERSION"
-echo "Server: $(hostname)"
-echo "Date: $(date)"
-echo "=========================================="
+#############################################
+# Agent-mode identity
+#############################################
+SCRIPT_NAME="rollback-docker.sh"
+LOG_FILE="/var/log/docker-rollback.log"
 
 #############################################
-# Expected package versions
+# Agent-mode run record
 #############################################
-# Asserted against RPM metadata, not filenames.
-# Keep in sync with download-docker-packages.sh, upgrade-docker.sh,
-# simulate-upgrade.sh and README.md -- see CLAUDE.md.
-ROLLBACK_DOCKER_VERSION="29.1.5"
-ROLLBACK_CONTAINERD_VERSION="2.2.1"
-ALLOWED_PKGS="docker-ce docker-ce-cli containerd.io"
+# --status-file=PATH writes a flat key=value record of this run. Nothing else
+# about the script changes: with no arguments the behaviour is exactly what it
+# was, and there is still no way to answer a prompt from a flag. That arrives
+# in a later change.
+#
+# Everything here runs BEFORE `exec > >(tee ...)` further down, and the order
+# is load-bearing:
+#
+#   globals -> parser -> traps -> startup record -> root check -> tee -> banner
+#
+#   - The parser precedes the tee because --help must not need write access to
+#     /var/log.
+#   - The traps precede the root check so a non-root refusal is still reported.
+#   - The root check precedes the tee because a non-root run cannot open the
+#     log, and the process substitution then swallows every line the script
+#     prints: measured, a non-root run produced NO output at all. An
+#     unexplained silent exit is the worst possible failure for an operator
+#     with no internet.
+STATUS_FILE=""
+STATUS_WRITTEN=false
+STATUS_OK=true
+LOG_STARTED=false
+MODE="interactive"
+RESULT="running"
+REFUSAL_REASON=""
+REFUSAL_DETAIL=""
+NEXT_ACTION="none"
+OPERATION_COMPLETED=false
+ENDED="unknown"
+STARTED="unknown"
+RUN_ID="unknown"
+
+# Slice 4 populates these; declared here because the parser will own them, and
+# assigning GATE_ANSWERS[x] before `declare -A` would create an indexed array
+# that cannot be converted afterwards.
+# shellcheck disable=SC2034  # reserved for the gate flags; see the agent-mode plan
+NON_INTERACTIVE=false
+# shellcheck disable=SC2034  # reserved for the gate flags; see the agent-mode plan
+declare -A GATE_ANSWERS=()
+
+usage() {
+    cat <<USAGE
+$SCRIPT_NAME $VERSION
+
+Usage: $SCRIPT_NAME [OPTIONS]
+
+Options:
+  --status-file=PATH   Write a key=value record of this run to PATH. Written
+                       once at startup with result=running and again on every
+                       exit path, including success and interrupts.
+  --help               Show this help and exit.
+  --version            Print the script version and exit.
+
+With no options the behaviour is unchanged: the script is interactive and
+every prompt refuses a closed stdin. See docs/AGENT-RUNBOOK.md.
+USAGE
+}
+
+# Inert with zero arguments: the loop body never runs, so nothing is assigned
+# and nothing is touched. The timestamp and correlation id below are computed
+# only when a record will actually be written, so a run with no status file
+# does no extra work beyond this loop and the root check.
+while [ "$#" -gt 0 ]; do
+    case "$1" in
+        --status-file=*)
+            STATUS_FILE="${1#*=}"
+            if [ -z "$STATUS_FILE" ]; then
+                echo "ERROR: --status-file needs a path" >&2
+                exit 1
+            fi
+            ;;
+        --status-file)
+            # An empty value must be rejected here too. Accepted, it would
+            # leave STATUS_FILE empty and the run would silently behave as if
+            # no status file had been asked for at all.
+            if [ "$#" -lt 2 ] || [ -z "$2" ]; then
+                echo "ERROR: --status-file needs a path" >&2
+                exit 1
+            fi
+            STATUS_FILE="$2"; shift
+            ;;
+        --help|-h) usage; exit 0 ;;
+        --version) echo "$SCRIPT_NAME $VERSION"; exit 0 ;;
+        *)
+            echo "ERROR: unrecognised argument: $1" >&2
+            echo "Try --help." >&2
+            exit 1
+            ;;
+    esac
+    shift
+done
+
+if [ -n "$STATUS_FILE" ]; then
+    if [ "${STATUS_FILE#/}" = "$STATUS_FILE" ]; then
+        echo "ERROR: --status-file must be an absolute path: $STATUS_FILE" >&2
+        exit 1
+    fi
+    # A directory would otherwise "succeed": mktemp makes a sibling and `mv`
+    # drops it INSIDE the directory, so the startup write returns 0 and no
+    # record exists at the path the caller asked for. `mv -fT` refuses that,
+    # but say so here rather than at the rename.
+    if [ -d "$STATUS_FILE" ]; then
+        echo "ERROR: --status-file is a directory: $STATUS_FILE" >&2
+        exit 1
+    fi
+    STARTED=$(date -u +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || echo "unknown")
+    # A correlation id, not a guaranteed-unique key: epoch plus pid collides
+    # under pid reuse, hence the random suffix. Lets a caller that reuses one
+    # status-file path tell this run's record from the previous run's.
+    RUN_ID="$(date -u +%s 2>/dev/null || echo 0)-$$-$(od -An -N2 -tx1 /dev/urandom 2>/dev/null | tr -d ' \n' || echo 0000)"
+fi
+
+# Quiet, bounded probes of unit state, for the run record and for
+# derive_next_action. `systemctl is-active` is NOT used: it returns nonzero for
+# `activating`, for `deactivating`, and for failing to reach systemd at all, so
+# treating nonzero as "stopped" fails open -- the exact trap verify_unit_stopped
+# exists to avoid, and one CLAUDE.md calls out by name. These fail CLOSED: an
+# unreachable systemd reads as unknown, never as stopped.
+#
+# `timeout` bounds them because they run inside the EXIT trap, and a trap that
+# hangs on a sick systemd is worse than a missing key.
+unit_state() {
+    local out
+    out=$(timeout --kill-after=2 5 systemctl show "$1" \
+              --property=ActiveState --value 2>/dev/null) || return 1
+    [ -n "$out" ] || return 1
+    printf '%s\n' "$out"
+}
+
+# The same rule verify_unit_stopped applies: a SUCCESSFUL show, an ActiveState
+# of inactive or failed, and MainPID 0. Anything else is not "stopped".
+unit_is_stopped() {
+    local out st pid
+    # ONE call for both properties. Two calls can straddle a state change: the
+    # first sees docker.socket inactive, the socket activates, the second still
+    # reads MainPID=0, and a live socket is classified as stopped. That is the
+    # unit whose survival socket-activates dockerd mid-transaction.
+    out=$(timeout --kill-after=2 5 systemctl show "$1" \
+              --property=ActiveState --property=MainPID 2>/dev/null) || return 1
+    st=$(printf '%s\n' "$out" | sed -n 's/^ActiveState=//p' | head -1)
+    pid=$(printf '%s\n' "$out" | sed -n 's/^MainPID=//p' | head -1)
+    case "$st" in
+        inactive|failed) : ;;
+        *) return 1 ;;
+    esac
+    [ "$pid" = "0" ]
+}
+
+# Values are single-line and unquoted; a consumer splits on the FIRST '='.
+# A failed write flips STATUS_OK, which is what stops a truncated file being
+# published -- see write_status_file.
+status_kv() {
+    printf '%s=%s\n' "$1" "${2//[$'\n\r']/ }" || STATUS_OK=false
+}
+
+status_common() {
+    status_kv schema 1
+    status_kv run_id "$RUN_ID"
+    status_kv script "$SCRIPT_NAME"
+    status_kv script_version "$VERSION"
+    status_kv started "$STARTED"
+    status_kv ended "$ENDED"
+    status_kv host "$(hostname 2>/dev/null || echo unknown)"
+    status_kv rhel "$(rpm -E %rhel 2>/dev/null || echo unknown)"
+    status_kv mode "$MODE"
+    status_kv result "$RESULT"
+    status_kv exit_code "$EXIT_CODE"
+    status_kv phase "$CURRENT_PHASE"
+    status_kv refusal_reason "$REFUSAL_REASON"
+    status_kv refusal_detail "$REFUSAL_DETAIL"
+    status_kv next_action "$NEXT_ACTION"
+    status_kv log "$LOG_FILE"
+    status_kv log_started "$LOG_STARTED"
+    # Observed at write time. SERVICES_STOPPED records that the script BEGAN
+    # stopping services, which is what the recovery logic needs; it is not a
+    # claim that the units actually reached inactive. A failed or partial stop
+    # leaves it true while docker is still up, so report both.
+    status_kv docker_active "$(unit_state docker || echo unknown)"
+    status_kv docker_socket_active "$(unit_state docker.socket || echo unknown)"
+    status_kv containerd_active "$(unit_state containerd || echo unknown)"
+}
+
+# Writes to a temp file beside the destination and renames, so a reader never
+# sees a half-written record, and NEVER through the tee'd stdout -- the process
+# substitution's flush ordering at exit is not guaranteed.
+#
+# Publishing requires BOTH the STATUS_OK accumulator and the status_complete
+# terminator. Either alone can be satisfied by a truncated file: the call site
+# guards this with `|| true`, which suspends `set -e` for the whole function,
+# so a status_kv that fails mid-file is followed by later ones that succeed --
+# terminator included.
+write_status_file() {
+    [ -n "$STATUS_FILE" ] || return 0
+    local tmp last
+    # mktemp, not ".tmp.$$": exclusive creation, so a stale temp left by a
+    # killed run whose pid was later reused cannot be inspected and published.
+    tmp=$(mktemp "${STATUS_FILE}.tmp.XXXXXX" 2>/dev/null) || return 1
+    STATUS_OK=true
+    {
+        status_common
+        status_keys
+        [ "$STATUS_OK" = true ] && status_kv status_complete 1
+    } > "$tmp" 2>/dev/null || STATUS_OK=false
+    if [ "$STATUS_OK" = true ] && last=$(tail -n 1 "$tmp" 2>/dev/null) &&
+       [ "$last" = "status_complete=1" ]; then
+        # -T: treat the destination as a file, never as a directory to move
+        # into. GNU userland is assumed throughout these scripts.
+        mv -fT "$tmp" "$STATUS_FILE" 2>/dev/null && return 0
+    fi
+    rm -f "$tmp"
+    return 1
+}
+
+# TOTAL: always returns 0. A nonzero return would abort the EXIT trap under
+# `set -e`, replacing 130 or 143 with this function's status and writing no
+# final record -- on exactly the interrupted run someone needs to read.
+derive_result() {
+    local rc="$1"
+    if [ "$rc" -eq 130 ] || [ "$rc" -eq 143 ]; then
+        RESULT="interrupted"
+    elif [ -n "$REFUSAL_REASON" ]; then
+        RESULT="refused"
+    elif [ "$rc" -eq 3 ]; then
+        RESULT="nothing-to-do"
+    elif [ "$rc" -eq 2 ] && [ "$OPERATION_COMPLETED" = true ]; then
+        RESULT="completed"
+    elif [ "$rc" -eq 0 ]; then
+        case "$RESULT" in
+            ready|nothing-to-do) : ;;
+            *) RESULT="completed" ;;
+        esac
+    else
+        RESULT="failed"
+    fi
+    [ -n "$STATUS_FILE" ] && ENDED=$(date -u +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || echo "unknown")
+    EXIT_CODE="$rc"
+    return 0
+}
+
+# Script-specific half of the run record. status_kv, status_common,
+# write_status_file and derive_result above are byte-identical across the three
+# stateful scripts and are drift-checked by tests/static-checks.sh.
+#
+# Read-only: this runs inside the EXIT trap.
+status_keys() {
+    status_kv services_stopped "$SERVICES_STOPPED"
+    status_kv pkg_state "$PKG_STATE"
+    status_kv config_backup_selected "${BACKUP_DIR:-none}"
+    status_kv config_backup_candidates "$CONFIG_BACKUP_CANDIDATES"
+    status_kv config_version_on_disk "$CONFIG_VERSION_ON_DISK"
+    status_kv config_version_effective "$CONFIG_VERSION_EFFECTIVE"
+    status_kv config_rollback_safe "$CONFIG_ROLLBACK_SAFE"
+    status_kv containerd_config "${CONTAINERD_CONF:-/etc/containerd/config.toml}"
+    status_kv docker_ce_before "$BEFORE_DOCKER"
+    status_kv docker_ce_after "$AFTER_DOCKER"
+    status_kv docker_ce_expected "${ROLLBACK_DOCKER_VERSION:-unknown}"
+    status_kv containerd_io_before "$BEFORE_CONTAINERD"
+    status_kv containerd_io_after "$AFTER_CONTAINERD"
+    status_kv containerd_io_expected "${ROLLBACK_CONTAINERD_VERSION:-unknown}"
+}
+
+# Token form of the decision on_exit already prints in English. It never says
+# "rollback" -- you are already reading one -- and it never names a retry
+# target after a partial transaction: CLAUDE.md is explicit that this is an
+# operator judgement that depends on why it failed.
+derive_next_action() {
+    case "$RESULT" in
+        completed|nothing-to-do)
+            NEXT_ACTION="none"
+            return 0
+            ;;
+    esac
+    case "$REFUSAL_REASON" in
+        not-root)  NEXT_ACTION="rerun-as-root"; return 0 ;;
+        bad-usage) NEXT_ACTION="none";          return 0 ;;
+        config-version-blocks-rollback) NEXT_ACTION="restore-config"; return 0 ;;
+    esac
+    # start-services only when the units are OBSERVED down. SERVICES_STOPPED
+    # is set before the first stop command, so a stop that failed partway
+    # leaves it true with docker still running -- telling an agent to start an
+    # already-running daemon, and hiding a genuinely stuck unit behind a
+    # confident instruction.
+    if [ "$SERVICES_STOPPED" = true ] &&
+       [ "$PKG_STATE" = "untouched" ] &&
+       unit_is_stopped docker && unit_is_stopped docker.socket &&
+       unit_is_stopped containerd; then
+        NEXT_ACTION="start-services"
+    else
+        NEXT_ACTION="investigate"
+    fi
+    return 0
+}
+
+# Captured where rpm is known to have exited. Querying inside the EXIT trap
+# instead would risk blocking on the rpmdb lock after a kill mid-transaction,
+# and a trap that hangs is worse than a missing key.
+capture_after_versions() {
+    AFTER_DOCKER=$(rpm -q docker-ce --queryformat '%{VERSION}' 2>/dev/null || echo "absent")
+    AFTER_CONTAINERD=$(rpm -q containerd.io --queryformat '%{VERSION}' 2>/dev/null || echo "absent")
+}
 
 #############################################
 # Failure Handling
@@ -74,10 +365,40 @@ SERVICES_STOPPED=false
 #   untouched | attempted | installed
 PKG_STATE="untouched"
 
+# Initialised before the trap is armed and before the startup record is
+# written, so no key is emitted without a value in its documented domain.
+EXIT_CODE="unknown"
+CONFIG_BACKUP_CANDIDATES=""
+CONFIG_VERSION_ON_DISK="unknown"
+CONFIG_VERSION_EFFECTIVE="unknown"
+CONFIG_ROLLBACK_SAFE="unknown"
+BEFORE_DOCKER="unknown"
+BEFORE_CONTAINERD="unknown"
+AFTER_DOCKER="unknown"
+AFTER_CONTAINERD="unknown"
+
 # shellcheck disable=SC2329  # invoked indirectly by `trap on_exit EXIT` below
 on_exit() {
     local rc=$?
+
+    # BEFORE the rc==0 short-circuit: placed after it, a successful rollback
+    # would leave the startup record saying result=running for ever.
+    if [ "$STATUS_WRITTEN" != true ]; then
+        STATUS_WRITTEN=true
+        derive_result "$rc" || true
+        derive_next_action || true
+        write_status_file || true
+    fi
+
     [ "$rc" -eq 0 ] && exit 0
+
+    # A usage error or a non-root invocation already printed the one line that
+    # explains it, and nothing has happened yet. The full state report below
+    # would bury that line under twenty lines about packages and services that
+    # were never touched.
+    case "$REFUSAL_REASON" in
+        not-root|bad-usage) exit "$rc" ;;
+    esac
 
     echo ""
     echo -e "${RED}==========================================${NC}"
@@ -130,6 +451,48 @@ on_exit() {
 trap on_exit EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
+
+# Written once here with result=running, and again from the EXIT trap on every
+# path. See the ordering note above; this file follows the same contract as
+# upgrade-docker.sh.
+if [ -n "$STATUS_FILE" ]; then
+    EXIT_CODE="unknown"
+    if ! write_status_file; then
+        REFUSAL_REASON="bad-usage"
+        REFUSAL_DETAIL="cannot write status file: $STATUS_FILE"
+        echo "ERROR: cannot write status file: $STATUS_FILE" >&2
+        exit 1
+    fi
+fi
+
+if [ "$(id -u 2>/dev/null || echo 1)" != "0" ]; then
+    REFUSAL_REASON="not-root"
+    REFUSAL_DETAIL="must run as root"
+    echo "ERROR: $SCRIPT_NAME must be run as root." >&2
+    echo "It stops services, replaces packages and writes to /var/log." >&2
+    exit 1
+fi
+
+exec > >(tee -a /var/log/docker-rollback.log) 2>&1
+LOG_STARTED=true
+
+echo "=========================================="
+echo "Docker Rollback: 29.8.0 → 29.1.5"
+echo "Script Version: $VERSION"
+echo "Server: $(hostname)"
+echo "Date: $(date)"
+echo "=========================================="
+
+#############################################
+# Expected package versions
+#############################################
+# Asserted against RPM metadata, not filenames.
+# Keep in sync with download-docker-packages.sh, upgrade-docker.sh,
+# simulate-upgrade.sh and README.md -- see CLAUDE.md.
+ROLLBACK_DOCKER_VERSION="29.1.5"
+ROLLBACK_CONTAINERD_VERSION="2.2.1"
+ALLOWED_PKGS="docker-ce docker-ce-cli containerd.io"
+
 
 #############################################
 # Helper Functions
@@ -267,6 +630,8 @@ RHEL_VER=$(rpm -E %rhel)
 ROLLBACK_DIR="/opt/docker-offline/rollback-rhel${RHEL_VER}"
 
 if [ ! -d "$ROLLBACK_DIR" ]; then
+    REFUSAL_REASON="payload-invalid"
+    REFUSAL_DETAIL="rollback directory not found: $ROLLBACK_DIR"
     echo -e "${RED}ERROR: Rollback directory not found: $ROLLBACK_DIR${NC}"
     exit 1
 fi
@@ -283,11 +648,17 @@ echo ""
 echo "=== Phase 0: Validate Rollback Payload ==="
 CURRENT_PHASE="phase 0 (validate payload)"
 
+# Captured before anything is touched, for the run record. Read-only.
+BEFORE_DOCKER=$(rpm -q docker-ce --queryformat '%{VERSION}' 2>/dev/null || echo "absent")
+BEFORE_CONTAINERD=$(rpm -q containerd.io --queryformat '%{VERSION}' 2>/dev/null || echo "absent")
+
 shopt -s nullglob
 PKG_FILES=("$ROLLBACK_DIR"/*.rpm)
 shopt -u nullglob
 
 if [ "${#PKG_FILES[@]}" -eq 0 ]; then
+    REFUSAL_REASON="payload-invalid"
+    REFUSAL_DETAIL="no .rpm files in $ROLLBACK_DIR"
     echo -e "${RED}ERROR: No .rpm files found in $ROLLBACK_DIR${NC}"
     exit 1
 fi
@@ -399,6 +770,8 @@ check_version "containerd.io" "$FOUND_CONTAINERD" "$ROLLBACK_CONTAINERD_VERSION"
 
 if [ "$PKG_ERRORS" -gt 0 ]; then
     echo ""
+    REFUSAL_REASON="payload-invalid"
+    REFUSAL_DETAIL="$PKG_ERRORS problem(s) with the rollback payload"
     echo -e "${RED}ERROR: $PKG_ERRORS problem(s) with the rollback payload.${NC}"
     echo "Nothing on this node has been changed."
     exit 1
@@ -417,6 +790,8 @@ echo "Dry-running the downgrade transaction..."
 # this script" advice impossible to follow on exactly the node that needs it.
 if ! rpm -Uvh --test --oldpackage --replacepkgs "$CONTAINERD_RPM" "${DOCKER_RPMS[@]}" 2>&1; then
     echo ""
+    REFUSAL_REASON="dry-run-failed"
+    REFUSAL_DETAIL="rpm --test refused the rollback transaction"
     echo -e "${RED}ERROR: rpm rejected the downgrade transaction (dry run).${NC}"
     echo "Nothing on this node has been changed. The output above says why."
     echo ""
@@ -451,6 +826,7 @@ BACKUP_DIRS=(/root/docker-backup-*/)
 shopt -u nullglob
 
 BACKUP_DIR=""
+CONFIG_BACKUP_CANDIDATES=$(printf '%s,' "${BACKUP_DIRS[@]%/}" | sed 's/,$//')
 if [ "${#BACKUP_DIRS[@]}" -eq 0 ]; then
     echo "No /root/docker-backup-* directories found."
     echo "The existing containerd config will be kept as-is."
@@ -472,6 +848,8 @@ else
         echo "upgrade you are rolling back."
         echo ""
         if ! prompt_yes_no "Use the backup marked above? [Y/n]" "y"; then
+            REFUSAL_REASON="config-backup-declined"
+            REFUSAL_DETAIL="operator declined the newest backup: $BACKUP_DIR"
             echo ""
             echo "Aborting. Nothing has been changed."
             echo "To use a different backup, copy its config.toml into place"
@@ -581,10 +959,21 @@ else
     EFFECTIVE_DESC=""
 fi
 
+CONFIG_VERSION_ON_DISK=$(read_config_version "$CONTAINERD_CONF" 2>/dev/null | grep . || echo "absent")
+if [ -f "$CONTAINERD_CONF" ] && [ "$CONFIG_VERSION_ON_DISK" = "absent" ]; then
+    CONFIG_VERSION_ON_DISK="unset"
+fi
+
 if [ -z "$EFFECTIVE_CONF" ]; then
+    # Phase 3 generates a default from the rollback binary itself, so there is
+    # no version to judge and nothing that could block the rollback.
+    CONFIG_VERSION_EFFECTIVE="none"
+    CONFIG_ROLLBACK_SAFE=true
     echo "No config and no backup. Phase 3 generates a default after the"
     echo "downgrade, so it will carry containerd $ROLLBACK_CONTAINERD_VERSION's own version."
 elif config_is_loadable "$EFFECTIVE_CONF"; then
+    CONFIG_VERSION_EFFECTIVE=$(read_config_version "$EFFECTIVE_CONF" | grep . || echo "unset")
+    CONFIG_ROLLBACK_SAFE=true
     echo "Will load: $EFFECTIVE_DESC"
     echo "Config version $(read_config_version "$EFFECTIVE_CONF" | grep . || echo unset) -- containerd $ROLLBACK_CONTAINERD_VERSION can load it."
 else
@@ -602,6 +991,10 @@ else
     shopt -u nullglob
 
     BAD_VERSION=$(read_config_version "$EFFECTIVE_CONF" | grep . || echo "unreadable")
+    CONFIG_VERSION_EFFECTIVE="$BAD_VERSION"
+    CONFIG_ROLLBACK_SAFE=false
+    REFUSAL_REASON="config-version-blocks-rollback"
+    REFUSAL_DETAIL="containerd $ROLLBACK_CONTAINERD_VERSION cannot load version $BAD_VERSION in $EFFECTIVE_CONF"
 
     echo ""
     echo -e "${RED}=========================================="
@@ -692,6 +1085,8 @@ done
 
 if [ "$STOP_FAILED" -gt 0 ]; then
     echo ""
+    REFUSAL_REASON="stop-failed"
+    REFUSAL_DETAIL="$STOP_FAILED unit(s) not conclusively stopped"
     echo -e "${RED}ERROR: $STOP_FAILED unit(s) not conclusively stopped.${NC}"
     echo "Refusing to downgrade packages under a running daemon."
     echo "Investigate with: systemctl status docker docker.socket containerd"
@@ -723,6 +1118,7 @@ echo "docker-ce / docker-ce-cli to $ROLLBACK_DOCKER_VERSION (single transaction)
 rpm -Uvh --oldpackage --replacepkgs "$CONTAINERD_RPM" "${DOCKER_RPMS[@]}"
 
 PKG_STATE="installed"
+capture_after_versions
 echo "Packages downgraded."
 
 #############################################
@@ -821,6 +1217,8 @@ assert_installed docker-ce-cli "$ROLLBACK_DOCKER_VERSION"
 assert_installed containerd.io "$ROLLBACK_CONTAINERD_VERSION"
 
 if [ "$VERIFY_FAILED" -ne 0 ]; then
+    REFUSAL_REASON="verification-failed"
+    REFUSAL_DETAIL="installed versions do not match the rollback target"
     echo ""
     echo -e "${RED}ERROR: rollback did not produce the expected versions.${NC}"
     echo "Services are running, but this node is NOT on $ROLLBACK_DOCKER_VERSION."
@@ -838,6 +1236,7 @@ docker ps -a
 
 echo ""
 echo "=========================================="
+OPERATION_COMPLETED=true
 echo -e "${GREEN}ROLLBACK COMPLETE${NC}"
 echo "=========================================="
 echo ""

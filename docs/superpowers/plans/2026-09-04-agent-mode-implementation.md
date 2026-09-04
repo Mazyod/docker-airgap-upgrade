@@ -118,7 +118,7 @@ root check lands here because it belongs structurally beside the parser: both mu
 | File | Anchor | Change |
 |---|---|---|
 | `upgrade-docker.sh` | after the colour vars (~:66), before `exec > >(tee` (:68) | `usage()`; **all parser-owned globals initialised first**, including `declare -A GATE_ANSWERS=()` and `NON_INTERACTIVE=false` even though slice 4 is what populates them; then the parser; then `RUN_ID` and `STARTED` |
-| `upgrade-docker.sh` | move the `EXPECTED_*` / `SUPPORTED_FROM_*` constants (:186–:206) above the startup write | so the startup record can emit the `*_expected` keys instead of empty strings |
+| `upgrade-docker.sh` | ~~move the `EXPECTED_*` constants above the startup write~~ | **Not done, deliberately.** That block is exactly where the concurrent retarget lands, and moving it would guarantee a conflict for no functional gain: `unknown` is a member of every key's domain, so the startup record emits `docker_ce_expected=unknown` and the final record carries the real value. The `*_expected` keys are only ever read from a final record |
 | `upgrade-docker.sh` | **move** the failure-handling block (:77–:176) to sit immediately after the parser, still before the tee | `status_kv()`, `write_status_file()`, `derive_result()`, the `RESULT` / `REFUSAL_REASON` / `NEXT_ACTION` / `STATUS_WRITTEN` globals, then `on_exit()` and the three traps, unchanged in content |
 | `upgrade-docker.sh` | after the traps | startup write: `RESULT="running"`, then `write_status_file` **required to succeed** — on failure set `REFUSAL_REASON=bad-usage`, report the path, exit 1 |
 | `upgrade-docker.sh` | after the startup write | `id -u` root check |
@@ -268,6 +268,30 @@ mutant reproduces its hazard.
   never exercised and the mutant proves nothing. Confirm the mutant publishes a file that ends
   in `status_complete=1` but is **missing that key**, and that 2.29g FAILS against it. A
   last-line check alone cannot catch this, which is exactly why both mechanisms exist.
+
+### Deviations recorded during implementation
+
+- **The `EXPECTED_*` constants stay where they are**, per the table above.
+- **Three keys added after the rebase onto the retarget**: `containerd_io_release_before`,
+  `_after` and `_expected`. The retarget made the RPM `%{RELEASE}` load-bearing, and a record
+  carrying only the version could not say which of two builds was installed. Documented in the
+  design and the runbook.
+- **Two keys added beyond the spec: `docker_active` and `containerd_active`**, read at write
+  time. `services_stopped` records that the script *began* stopping services, which is what the
+  recovery logic needs; a stop that fails partway leaves it true with docker still running.
+  Without an observed pair, `next_action=start-services` could be emitted for a node whose
+  daemon is up. `derive_next_action` now requires both units to be observed down.
+- **`refusal_reason` is set at every deliberate exit**, not only the two the first draft had.
+  Without that, `derive_result` classified every phase-0 rejection as `failed` rather than
+  `refused`, and both exit-0 declines as `completed`. The spec always required `result` to be
+  precise; this is what makes it so. The full token list is in `docs/AGENT-RUNBOOK.md`.
+- **The NVIDIA token set is wider than the spec's four**: `toolkit-absent` (no toolkit on the
+  node, so phase 7 never ran) is distinct from `payload-missing` (toolkit present, bundle
+  shipped no NVIDIA packages) and from `not-attempted` (the run ended before phase 7).
+- **`clean-swarm-networks.sh` arms its traps before `start_services` is defined.** Safe because
+  `on_exit` only calls it when `SERVICES_STOPPED` is true, which cannot happen until phase 2.
+  Arming them after the helpers instead would leave an interrupt during the root check with no
+  record at all.
 
 ### Version bump
 

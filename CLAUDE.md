@@ -27,6 +27,7 @@ tests/vm/build-bundle.sh      # real download-docker-packages.sh run
 tests/vm/tier2-run.sh         # Tier 2 cases: reject / upgrade / rollback
 tests/vm/config-version-check.sh  # containerd config v3/v4 boundary + the rollback guard
 tests/vm/negative-control.sh  # prove test 2.4 catches the regression
+tests/vm/agent-mode-negative-control.sh  # prove the agent-mode guard tests can fail
 tests/vm/reset-baseline.sh    # back to S1 between destructive runs
 ```
 
@@ -110,11 +111,11 @@ Consequences the scripts encode:
   grep in 1.4b. Extract the real functions, never reimplement them; a copy is the next
   thing to drift. Note what 1.4b can and cannot do: it catches negation, a discarded
   exit status, a transformed input and a duplicate definition, but no text check can
-  prove a call site is wired to a real node. Tier 2 cases 2.6a and 2.6b are what close
-  that, and they have not run.
+  prove a call site is wired to a real node. Tier 2 case 2.6a is what closes that.
 
-The phase 0 release assertion is **not yet Tier 2 tested** — see case 2.6a in
-`docs/TEST-PLAN.md` for what it must assert.
+The phase 0 release assertion **has now run in Tier 2**: case 2.6a stages the real upstream
+RPM of the wrong build, and asserts the run is refused on the release, that the refusal
+explains the runc difference, and that it happens in phase 0 before the Swarm drain.
 
 ### The containerd config version is asymmetric — this is the sharp edge
 
@@ -204,16 +205,60 @@ checks — and it **always rebuilds the bundle from the current checkout** rathe
 reusing whatever is in the VM. Release notes enumerate every package from RPM
 metadata, never filenames.
 
+## Agent mode — the run record is a compatibility surface
+
+`upgrade-docker.sh`, `rollback-docker.sh` and `clean-swarm-networks.sh` accept
+`--status-file=PATH` and write a flat `key=value` record of the run. Callers branch on those
+keys, so **the key names are a contract**: adding one is a minor change, removing or
+repurposing one is not. `tests/static-checks.sh` section 1.14 fails if the keys a script emits
+and the keys `docs/AGENT-RUNBOOK.md` documents disagree in either direction.
+
+Four properties of the writer are load-bearing and each has a specific failure mode:
+
+- **The status write precedes `on_exit`'s `rc == 0` short-circuit.** After it, a successful run
+  never supersedes its own startup record and reports `result=running` for ever.
+- **It publishes only when the `STATUS_OK` accumulator is true *and* the last line is
+  `status_complete=1`.** Either alone can be satisfied by a truncated file: the call site's
+  `|| true` suspends `set -e` for the writer's whole dynamic extent, so a `status_kv` that
+  fails mid-file is followed by later ones that succeed, terminator included.
+- **It writes through a direct redirect to a `mktemp` file, then renames** — never through the
+  tee'd stdout, whose flush ordering at exit is not guaranteed.
+- **`derive_result` is total and always returns 0.** A nonzero return would abort the EXIT trap
+  under `set -e`, replacing 130 or 143 with its own status and writing no final record.
+
+`status_kv`, `status_common`, `write_status_file`, `derive_result` and `usage` are
+byte-identical across the three scripts and are drift-checked in section 1.11. Only
+`status_keys` and `derive_next_action` differ.
+
+**`clean-swarm-networks.sh` writes its record after its trap's service recovery**, not before
+the report. Its trap restarts what it stopped, unlike the other two; writing first would
+publish `services_stopped=true` and `next_action=start-services` for a node the trap had just
+brought back.
+
+**`next_action` never says `rollback`.** Retry versus rollback after an rpm transaction is an
+operator judgement that depends on why it failed, which is the same reason the trap does not
+auto-restart services.
+
+The ordering at the top of each script is also load-bearing: **globals → parser → traps →
+startup record → root check → tee → banner.** The parser precedes the tee because `--help` must
+not need write access to `/var/log`; the traps precede the root check so a non-root refusal is
+still reported; and the root check precedes the tee because a non-root run cannot open the log
+and the process substitution then swallows every line the script prints — measured, that
+produced no output at all.
+
+Design and plan: `docs/superpowers/specs/2026-09-04-agent-mode-design.md` and
+`docs/superpowers/plans/2026-09-04-agent-mode-implementation.md`.
+
 ## Script versioning convention
 
 Every script except `simulate-upgrade.sh` declares `VERSION="x.y.z"` on ~line 4 and echoes it in its startup banner. Only the scripts actually changed get bumped — versions across scripts drift on purpose. Currently:
 
 | Script | Version |
 |---|---|
-| `upgrade-docker.sh` | 2.2.0 |
-| `rollback-docker.sh` | 2.1.1 |
+| `upgrade-docker.sh` | 2.3.0 |
+| `rollback-docker.sh` | 2.2.0 |
 | `download-docker-packages.sh` | 2.3.0 |
-| `clean-swarm-networks.sh` | 1.0.0 |
+| `clean-swarm-networks.sh` | 1.1.0 |
 | `recover-dnf.sh` | 1.2.2 |
 
 Commit subjects carry the new version in parens, e.g. `Fix NVIDIA toolkit upgrade failures (v1.2.2)`, with a bullet list body.

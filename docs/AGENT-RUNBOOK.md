@@ -49,9 +49,14 @@ propagates its own status, and an interrupt exits 130 or 143. **The important po
 nonzero status alone does not distinguish a safe refusal from a failure after the node was
 modified.** You must read the output.
 
-**Nothing is machine-readable.** There is no status file and no structured output. The anchors
-below are real strings the scripts print today, but they are prose and they are not a
-contract. Match them loosely and treat a non-match as unknown, never as good news.
+**The prose output is still not a contract, but there is now a status file.** Pass
+`--status-file=PATH` to the upgrade, rollback or cleanup script and it writes a flat
+`key=value` record of the run — see the status-file section below. Use it in preference to
+matching output.
+
+Without that flag nothing is machine-readable. The anchors below are real strings the scripts
+print today, but they are prose. Match them loosely and treat a non-match as unknown, never as
+good news.
 
 Some lines carry ANSI colour codes mid-line. `Packages:  UNKNOWN` does **not** match, because
 an escape sequence sits between the colon and the word. Match `UNKNOWN - the rpm transaction`
@@ -59,8 +64,10 @@ instead. `Packages:  UNCHANGED` and `Packages:  NEW` have no such escape and do 
 
 ## Preconditions
 
-- **Run as root.** No script checks this. A non-root run fails partway with a permission error
-  and no explanation.
+- **Run as root.** The upgrade, rollback and cleanup scripts now check this before they do
+  anything else and refuse with a clear message. They have to check early: the log redirection
+  they set up cannot open its file as a non-root user, and every line the script prints then
+  disappears into it. Measured, a non-root run before the check produced no output at all.
 - **Extract the bundle into an empty directory.** `rm -rf /opt/docker-offline` first, then
   extract the tarball into `/opt`. This is not tidiness: the previous bundle has an identical
   directory layout, so leftovers appear as duplicate packages and the run is refused.
@@ -166,6 +173,242 @@ A manager that ends the run drained is offered a reactivation prompt that defaul
 Answer yes only if you recorded `active`. If you recorded `pause` or `drain`, answer **no** —
 it prints the command and leaves the node drained — then set the recorded value yourself.
 A worker is never offered the prompt and always needs this step done from a manager.
+
+## Flags
+
+Three flags exist today, on `upgrade-docker.sh`, `rollback-docker.sh` and
+`clean-swarm-networks.sh`. **None of them answers a prompt.** There is still no way to run
+these scripts without a terminal.
+
+| Flag | Effect |
+|---|---|
+| `--status-file=PATH` | Write a `key=value` record of the run to PATH. Absolute paths only |
+| `--help` | Usage, exit 0. Works as any user and touches nothing |
+| `--version` | The script's version, exit 0 |
+
+An unrecognised argument is now a usage error: it exits 1 with a message and writes no status
+file. It used to be ignored silently.
+
+`recover-dnf.sh` and the two build-host scripts take no flags.
+
+### The status file
+
+Written twice: once at startup with `result=running`, and once from the exit trap on every
+path — success, refusal, failure, and interrupts. It is written to a temporary file and
+renamed, so a reader never sees a half-written record.
+
+Rules for reading it:
+
+- **The last line is always `status_complete=1`.** A file without it is incomplete; treat it as
+  unknown, not as whatever its `result` says.
+- **`result=running` means no complete final record was published** — a kill, a power loss, or
+  a trap that fired and could not write. The run started and did not report an outcome.
+- **A missing file means the run never started.** A usage error writes nothing, because at that
+  point the path is not known to be usable. A non-root refusal *does* write one.
+- **Check `run_id` before trusting a file at a path you reuse.** A usage error leaves the
+  previous run's record in place. Better: use a fresh path per run.
+- **`unknown` is a valid value for any key.** It means "not observed when this record was
+  written", which is the normal state of most keys in a startup record.
+- Split each line on the **first** `=`. Values are single-line and unquoted.
+
+If the path cannot be written, the script says so and exits 1 **before touching anything**.
+That check is the startup write itself, so a path that passes has been proven writable, not
+merely probed.
+
+### Keys every script writes
+
+<!-- status-keys: common -->
+
+| Key | Values |
+|---|---|
+| `schema` | `1` |
+| `run_id` | correlation id for this invocation |
+| `script` | script basename |
+| `script_version` | the script's version |
+| `started` | ISO 8601 UTC, or `unknown` |
+| `ended` | ISO 8601 UTC, or `unknown` |
+| `host` | hostname |
+| `rhel` | RHEL major, or `unknown` |
+| `mode` | `interactive` — the only mode that exists today |
+| `result` | `running` \| `completed` \| `nothing-to-do` \| `refused` \| `failed` \| `interrupted` |
+| `exit_code` | integer, or `unknown` in a startup record |
+| `phase` | the phase the script was in |
+| `refusal_reason` | a token, or empty. See the refusal table below |
+| `refusal_detail` | one line of free text, or empty |
+| `next_action` | `none` \| `start-services` \| `investigate` \| `rerun-as-root` \| `restore-config` |
+| `log` | log file path |
+| `log_started` | `true` \| `false` — false for exits before the log redirection was installed, whose output reached the terminal only |
+| `docker_active` | `active` \| `inactive` \| `failed` \| `activating` \| `deactivating` \| `unknown` |
+| `docker_socket_active` | same as `docker_active` |
+| `containerd_active` | same as `docker_active` |
+| `status_complete` | `1`, always the final line |
+
+The three `*_active` keys are read at the moment the record is written, from
+`systemctl show`, never from `systemctl is-active` — that returns nonzero for `activating`,
+for `deactivating`, and for failing to reach systemd, so treating nonzero as "stopped" fails
+open. An unreachable systemd reads here as `unknown`.
+`services_stopped` is not the same thing: it records that the script *began* stopping
+services, which is what its recovery logic needs. A stop that failed partway leaves
+`services_stopped=true` with docker still `active`. Trust the observed pair.
+
+### `refusal_reason` tokens
+
+| Token | Meaning | Scripts |
+|---|---|---|
+| `not-root` | not run as root | all three |
+| `bad-usage` | bad argument, or an unusable `--status-file` path | all three |
+| `payload-invalid` | the RPM payload failed validation | upgrade, rollback |
+| `dry-run-failed` | `rpm --test` refused the transaction | upgrade, rollback |
+| `containerd-1x` | containerd 1.x found; this script does not cross that boundary | upgrade |
+| `unverified-baseline` | operator declined an untested starting version | upgrade |
+| `tasks-present` | tasks remained, or could not be counted, after the drain | upgrade |
+| `drain-unconfirmed` | the drain attestation was declined | upgrade, cleanup |
+| `stop-failed` | a unit was not conclusively stopped | all three |
+| `relocated-root-missing` | the configured containerd root does not exist | upgrade |
+| `verification-failed` | installed versions do not match the target | upgrade, rollback |
+| `config-version-blocks-rollback` | the config the rollback would load is one it cannot read | rollback |
+| `config-backup-declined` | operator declined the newest backup | rollback |
+| `non-swarm-declined` | declined to clean a host that is not in a Swarm | cleanup |
+| `stop-declined` | declined to stop services | cleanup |
+| `delete-declined` | declined to delete the enumerated inventory | cleanup |
+| `enumeration-failed` | the inventory could not be read, so nothing was deleted | cleanup |
+
+An empty `refusal_reason` with `result=failed` means the run died somewhere that has no
+token — read `phase`, `pkg_state` and the log.
+
+**An end-of-file refusal is one of those.** The prompt helper exits 1 without setting a token,
+so a run killed by a closed stdin records `result=failed` with an empty `refusal_reason`. The
+log line `stdin closed - cannot read an answer.` is what identifies it. The helper is
+deliberately left byte-identical in this change, so this is documented rather than fixed.
+
+`next_action=start-services` is emitted only when docker, `docker.socket` **and** containerd
+are all conclusively stopped, by the same rule the scripts use internally: a successful
+`systemctl show`, an `ActiveState` of `inactive` or `failed`, and `MainPID=0`. Anything else
+gives `investigate`.
+
+<!-- /status-keys -->
+
+`next_action` never says `rollback`. After an rpm transaction, retry versus rollback depends on
+why it failed, and the script must not make that call for you. `investigate` is the honest
+answer; read `pkg_state` and `refusal_detail`.
+
+### Keys `upgrade-docker.sh` adds
+
+<!-- status-keys: upgrade-docker.sh -->
+
+| Key | Values |
+|---|---|
+| `services_stopped` | `true` \| `false` |
+| `pkg_state` | `untouched` \| `attempted` \| `installed` |
+| `backup_dir` | path, or empty |
+| `swarm_active` | `true` \| `false` \| `unknown` |
+| `swarm_role` | `manager` \| `worker` \| `none` \| `unknown` |
+| `swarm_node_id` | node id, or empty |
+| `node_availability_before` | `active` \| `drain` \| `pause` \| `unknown` |
+| `node_availability_after` | same, or `unknown` if the run never reached reactivation |
+| `drain_performed` | `true` \| `false` — whether **this run** drained the node |
+| `tasks_remaining` | integer \| `unknown` \| `n/a` |
+| `containerd_config` | path |
+| `containerd_config_version` | integer \| `unknown` |
+| `containerd_config_rollback_safe` | `true` \| `false` \| `unknown` |
+| `containerd_root` | path, or `unknown` |
+| `containerd_root_relocated` | `true` \| `false` \| `unknown` |
+| `containerd_root_present` | `true` \| `false` \| `unknown` |
+| `rpmnew_present` | `true` \| `false` |
+| `nvidia` | `installed` \| `install-failed` \| `skipped-corrupt` \| `payload-missing` \| `toolkit-absent` \| `not-attempted` |
+| `docker_ce_before` | version \| `absent` \| `unknown` |
+| `docker_ce_after` | version \| `absent` \| `unknown` |
+| `docker_ce_expected` | version \| `unknown` |
+| `docker_ce_cli_before` | version \| `absent` \| `unknown` |
+| `docker_ce_cli_after` | version \| `absent` \| `unknown` |
+| `containerd_io_before` | version \| `absent` \| `unknown` |
+| `containerd_io_after` | version \| `absent` \| `unknown` |
+| `containerd_io_expected` | version \| `unknown` |
+| `containerd_io_release_before` | RPM release, shaped `<release>.el<rhel-major>` \| `absent` \| `unknown` |
+| `containerd_io_release_after` | RPM release \| `absent` \| `unknown` |
+| `containerd_io_release_expected` | RPM release \| `unknown` |
+| `buildx_before` | version \| `absent` \| `unknown` |
+| `buildx_after` | version \| `absent` \| `unknown` |
+| `buildx_expected` | version \| `unknown` |
+| `compose_before` | version \| `absent` \| `unknown` |
+| `compose_after` | version \| `absent` \| `unknown` |
+| `compose_expected` | version \| `unknown` |
+
+<!-- /status-keys -->
+
+`drain_performed` records what this run did, not what the cluster looks like. A node you
+drained yourself in step one shows `false`.
+
+**Check the containerd release, not only its version.** The same containerd version has been
+published more than once with different `runc` builds inside, so the version alone does not
+identify what is installed. On a **completed** upgrade, `containerd_io_release_after` must equal
+`containerd_io_release_expected`. The upgrade asserts this itself in phase 0 for the bundle and
+again in phase 9 for what was actually installed, but the record is where you confirm it. On a
+run that never reached the package transaction, `containerd_io_release_after` is legitimately
+`unknown` — that is not a mismatch.
+
+The `nvidia` tokens distinguish four ways the toolkit step can end without installing:
+`toolkit-absent` means the node has no NVIDIA toolkit so phase 7 never ran, `payload-missing`
+means it does but the bundle shipped no NVIDIA packages, `skipped-corrupt` means they failed
+their digest check, and `not-attempted` means the run ended before phase 7.
+
+### Keys `rollback-docker.sh` adds
+
+<!-- status-keys: rollback-docker.sh -->
+
+| Key | Values |
+|---|---|
+| `services_stopped` | `true` \| `false` |
+| `pkg_state` | `untouched` \| `attempted` \| `installed` |
+| `config_backup_selected` | path, or `none` |
+| `config_backup_candidates` | comma-separated paths, or empty |
+| `config_version_on_disk` | integer \| `unset` \| `absent` \| `unknown` |
+| `config_version_effective` | integer \| `unset` \| `none` \| `unreadable` \| `unknown` |
+| `config_rollback_safe` | `true` \| `false` \| `unknown` |
+| `containerd_config` | path |
+| `docker_ce_before` | version \| `absent` \| `unknown` |
+| `docker_ce_after` | version \| `absent` \| `unknown` |
+| `docker_ce_expected` | version \| `unknown` |
+| `containerd_io_before` | version \| `absent` \| `unknown` |
+| `containerd_io_after` | version \| `absent` \| `unknown` |
+| `containerd_io_expected` | version \| `unknown` |
+
+<!-- /status-keys -->
+
+`config_version_effective` is what phase 0c actually judged: the selected backup's version when
+a backup will be restored, the on-disk file's otherwise, and `none` when phase 3 will generate
+a fresh default. Reading only `config_version_on_disk` can tell you the opposite of what the
+guard decided.
+
+### Keys `clean-swarm-networks.sh` adds
+
+<!-- status-keys: clean-swarm-networks.sh -->
+
+| Key | Values |
+|---|---|
+| `services_stopped` | `true` \| `false` |
+| `docker_data_root` | path, or `unknown` |
+| `inventory_total` | integer, or `unknown` |
+| `vxlan_count` | integer, or `unknown` |
+| `netns_count` | integer, or `unknown` |
+| `kv_db_present` | `true` \| `false` \| `unknown` |
+| `gwbridge_present` | `true` \| `false` \| `unknown` |
+| `deleted` | `true` \| `false` |
+| `failed_items` | integer, or `unknown` |
+| `recovery_attempted` | `true` \| `false` |
+| `recovery_succeeded` | `true` \| `false` \| `n/a` |
+
+<!-- /status-keys -->
+
+This script's exit trap **restarts the services it stopped**, unlike the other two. Its record
+is written after that attempt, so `recovery_attempted` and `recovery_succeeded` say whether the
+trap had to intervene and whether it worked. For where the node actually ended up, read the
+three `*_active` keys: they are observed at write time. `services_stopped` remains a statement
+about what the script began doing, and a partially failed recovery does not make it false.
+
+A failed recovery is recorded as `result=failed` even when the run was refused, because a node
+that is down is the fact that matters; `refusal_reason` still says what led there. An interrupt
+keeps `result=interrupted`, so the record never contradicts its own `exit_code`.
 
 ## The prompts, and how to answer each
 
@@ -407,7 +650,8 @@ Stop and report. Do not improvise on a disconnected production node.
   sits at the end and older runs sit above it. They contain ANSI escapes.
 - Backups are `/root/docker-backup-<timestamp>/`, named so that lexical order is chronological.
 
-A note on what does not exist: there is no `--yes`, no `--non-interactive`, no `--preflight`
-and no status file. If you find yourself wanting one, that is the correct instinct and the work
-is planned — but do not invent flags. An unrecognised argument is silently ignored today, which
-means a run you believe was non-interactive is an ordinary interactive run waiting on a prompt.
+A note on what does not exist yet: there is no `--yes`, no `--non-interactive` and no
+`--preflight`. Only `--status-file`, `--help` and `--version` exist, and none of them answers a
+prompt. If you find yourself wanting the others, that is the correct instinct and the work is
+planned — but do not invent flags. An unrecognised argument is now a usage error, so a
+misspelled flag fails loudly instead of being ignored.

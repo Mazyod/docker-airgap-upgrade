@@ -20,6 +20,11 @@
 #   tests/vm/tier2-run.sh reject     # rejection tests only
 #   tests/vm/tier2-run.sh upgrade    # upgrade + assertions only
 #   tests/vm/tier2-run.sh rollback   # rollback only
+#   tests/vm/tier2-run.sh agent      # agent-mode cases only (2.29a-2.29h)
+#
+# The `agent` phase is separate on purpose. The reject/upgrade/rollback phases
+# are the interactive-path regression gate and their assertion count must not
+# move; agent-mode cases are added beside them, never inside them.
 
 set -uo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")" || exit 1
@@ -356,6 +361,246 @@ assert_vm_eq "2.16 docker running after rollback" "systemctl is-active docker" "
 assert_vm_eq "2.16 canary data survived rollback" \
     "docker start survivor >/dev/null 2>&1; docker exec survivor cat /data/canary.txt" \
     "VOLUME-CANARY-DATA"
+fi
+
+#############################################
+if [ "$PHASE_ARG" = "agent" ]; then
+head_ "2.29  Agent mode: the run record"
+#############################################
+# Slice 2 of the agent-mode plan: the argument parser, the root check and
+# --status-file. NO prompt behaviour changes in this slice, so every case here
+# still runs on a terminal or with stdin closed exactly as before.
+#
+# Runs from a reset S1 baseline and leaves one.
+./reset-baseline.sh >/dev/null 2>&1
+restore_pkgs
+SF=/tmp/agent-status.kv
+vm "rm -f $SF" >/dev/null 2>&1
+
+# --- 2.29a: zero arguments behave exactly as before ---
+capture_strict_state a29a
+out=$(run_upgrade)
+if printf '%s' "$out" | grep -q "UPGRADE COMPLETE"; then
+    ok "2.29a zero-argument run still completes"
+else
+    bad "2.29a zero-argument run did NOT complete"
+    printf '%s\n' "$out" | tail -20 | sed 's/^/       /'
+fi
+assert_pkg_profile "2.29a" target
+assert_vm_eq "2.29a containerd config unchanged by the upgrade" \
+    "sha256sum /etc/containerd/config.toml | cut -d' ' -f1" "${STRICT_CONF_SHA[a29a]}"
+assert_vm_eq "2.29a canary data intact" \
+    "docker start survivor >/dev/null 2>&1; docker exec survivor cat /data/canary.txt" \
+    "VOLUME-CANARY-DATA"
+
+# --- 2.29b: the record of a successful run ---
+./reset-baseline.sh >/dev/null 2>&1
+restore_pkgs
+vm "rm -f $SF" >/dev/null 2>&1
+out=$(vm_try "cd /opt/docker-offline && ./upgrade-docker.sh --status-file=$SF </dev/null 2>&1")
+if printf '%s' "$out" | grep -q "UPGRADE COMPLETE"; then
+    ok "2.29b run with --status-file completed"
+else
+    bad "2.29b run with --status-file did NOT complete"
+    printf '%s\n' "$out" | tail -20 | sed 's/^/       /'
+fi
+assert_status_complete "2.29b" "$SF"
+assert_status_key "2.29b" "$SF" result completed
+assert_status_key "2.29b" "$SF" exit_code 0
+assert_status_key "2.29b" "$SF" pkg_state installed
+assert_status_key "2.29b" "$SF" services_stopped false
+assert_status_key "2.29b" "$SF" next_action none
+assert_status_key "2.29b" "$SF" mode interactive
+assert_status_key "2.29b" "$SF" log_started true
+assert_status_key "2.29b" "$SF" containerd_root "$RELOCATED_ROOT"
+assert_status_key "2.29b" "$SF" containerd_root_relocated true
+assert_status_key "2.29b" "$SF" containerd_root_present true
+assert_status_key "2.29b" "$SF" docker_ce_after "$TARGET_DOCKER"
+assert_status_key "2.29b" "$SF" docker_ce_expected "$TARGET_DOCKER"
+assert_status_key "2.29b" "$SF" containerd_io_after "$TARGET_CONTAINERD"
+# The release, not only the version: the same containerd version has shipped
+# with two different runc builds, so a record carrying the version alone cannot
+# say which one is installed.
+assert_status_key "2.29b" "$SF" containerd_io_release_after "${TARGET_CONTAINERD_RELEASE}.el${VM_RELEASE}"
+assert_status_key "2.29b" "$SF" containerd_io_release_expected "${TARGET_CONTAINERD_RELEASE}.el${VM_RELEASE}"
+assert_status_key "2.29b" "$SF" containerd_io_release_before "${BASELINE_CONTAINERD_RELEASE}.el${VM_RELEASE}"
+assert_status_key "2.29b" "$SF" docker_ce_before "$BASELINE_DOCKER"
+# result=running would mean the trap never updated the startup record. That is
+# the exact failure the write-before-short-circuit ordering exists to prevent,
+# and mutant M1a in agent-mode-negative-control.sh reproduces it.
+r=$(status_key "$SF" result)
+if [ "$r" != "running" ]; then
+    ok "2.29b startup record was superseded by the final one"
+else
+    bad "2.29b record still says result=running after a successful upgrade"
+fi
+
+# --- 2.29c: the record of a phase 0 refusal, and the node is untouched ---
+./reset-baseline.sh >/dev/null 2>&1
+restore_pkgs
+capture_strict_state a29c
+vm "rm -f $SF && rm -f $PKG_DIR/*.rpm && cp /opt/docker-offline/rollback-rhel9/*.rpm $PKG_DIR/" >/dev/null 2>&1
+vm_try "cd /opt/docker-offline && ./upgrade-docker.sh --status-file=$SF </dev/null 2>&1" >/dev/null
+assert_status_complete "2.29c" "$SF"
+assert_status_key "2.29c" "$SF" result refused
+assert_status_key "2.29c" "$SF" pkg_state untouched
+assert_status_key "2.29c" "$SF" services_stopped false
+assert_untouched_strict "2.29c" baseline a29c
+restore_pkgs
+
+# --- 2.29d: a non-root refusal still writes a record ---
+vm "rm -f $SF" >/dev/null 2>&1
+capture_strict_state a29d
+rc=$(vm_try "runuser -u nobody -- /opt/docker-offline/upgrade-docker.sh --status-file=$SF; echo \$?" | tail -1)
+if [ "$rc" = "1" ]; then
+    ok "2.29d non-root run exits 1"
+else
+    bad "2.29d non-root run exited '$rc', want 1"
+fi
+assert_status_complete "2.29d" "$SF"
+assert_status_key "2.29d" "$SF" result refused
+assert_status_key "2.29d" "$SF" refusal_reason not-root
+assert_status_key "2.29d" "$SF" next_action rerun-as-root
+assert_status_key "2.29d" "$SF" log_started false
+# An early record must say `unknown`, never an empty string: every key has to
+# stay inside its documented domain even before anything has been observed.
+assert_status_key "2.29d" "$SF" containerd_io_release_expected unknown
+assert_status_key "2.29d" "$SF" containerd_io_release_after unknown
+assert_untouched_strict "2.29d" baseline a29d
+
+# --- 2.29e: a usage error writes NOTHING ---
+vm "rm -f $SF" >/dev/null 2>&1
+capture_strict_state a29e
+rc=$(vm_try "cd /opt/docker-offline && ./upgrade-docker.sh --nonsense-flag --status-file=$SF </dev/null >/dev/null 2>&1; echo \$?" | tail -1)
+if [ "$rc" = "1" ]; then
+    ok "2.29e unrecognised argument exits 1"
+else
+    bad "2.29e unrecognised argument exited '$rc', want 1"
+fi
+if vm_try "test -e $SF; echo \$?" | tail -1 | grep -qx 1; then
+    ok "2.29e usage error wrote no status file"
+else
+    bad "2.29e usage error wrote a status file"
+fi
+assert_untouched_strict "2.29e" baseline a29e
+
+# --- 2.29f: run_id differs between runs, and every record terminates ---
+vm "rm -f $SF" >/dev/null 2>&1
+vm_try "runuser -u nobody -- /opt/docker-offline/upgrade-docker.sh --status-file=$SF" >/dev/null
+id1=$(status_key "$SF" run_id)
+vm_try "runuser -u nobody -- /opt/docker-offline/upgrade-docker.sh --status-file=$SF" >/dev/null
+id2=$(status_key "$SF" run_id)
+if [ -n "$id1" ] && [ -n "$id2" ] && [ "$id1" != "$id2" ]; then
+    ok "2.29f run_id differs between runs ($id1 / $id2)"
+else
+    bad "2.29f run_id did not change ('$id1' / '$id2')"
+fi
+assert_status_complete "2.29f" "$SF"
+
+# --- 2.29g: every documented key is present, not merely the terminator ---
+# This is what catches a mid-file write failure. A last-line check alone
+# cannot: the terminator is written after the failure and still lands.
+# The key list comes from the script itself, not from a copy maintained here:
+# a hand-written list drifts, and a drifted list turns this from a check into
+# decoration. tests/static-checks.sh already proves the script's keys and the
+# runbook's agree, so either source is the same set.
+mapfile -t DOC_KEYS < <(grep -vE '^[[:space:]]*#' "$HARNESS_REPO_DIR/upgrade-docker.sh" \
+    | grep -oE '(^|[^a-z_])status_kv [a-z0-9_]+' \
+    | grep -oE 'status_kv [a-z0-9_]+' | awk '{print $2}' | LC_ALL=C sort -u)
+missing=""
+for k in "${DOC_KEYS[@]}"; do
+    vm_try "grep -q '^${k}=' $SF; echo \$?" | tail -1 | grep -qx 0 || missing="$missing $k"
+done
+if [ -z "$missing" ] && [ "${#DOC_KEYS[@]}" -gt 40 ]; then
+    ok "2.29g all ${#DOC_KEYS[@]} documented keys are present in the record"
+else
+    bad "2.29g record is missing keys:${missing:- (or the key list is empty: ${#DOC_KEYS[@]})}"
+fi
+
+# --- 2.29h: an unwritable status path refuses before anything happens ---
+capture_strict_state a29h
+rc=$(vm_try "cd /opt/docker-offline && ./upgrade-docker.sh --status-file=/nonexistent-dir/s.kv </dev/null >/dev/null 2>&1; echo \$?" | tail -1)
+if [ "$rc" = "1" ]; then
+    ok "2.29h unwritable status path exits 1"
+else
+    bad "2.29h unwritable status path exited '$rc', want 1"
+fi
+out=$(vm_try "cd /opt/docker-offline && ./upgrade-docker.sh --status-file=/nonexistent-dir/s.kv </dev/null 2>&1")
+if printf '%s' "$out" | grep -q "cannot write status file"; then
+    ok "2.29h names the path it could not write"
+else
+    bad "2.29h did not name the unwritable path"
+fi
+assert_untouched_strict "2.29h" baseline a29h
+
+# --- 2.29i: rollback and cleanup write records too ---
+vm "rm -f $SF" >/dev/null 2>&1
+capture_strict_state a29i
+vm_try "runuser -u nobody -- /opt/docker-offline/rollback-docker.sh --status-file=$SF" >/dev/null
+assert_status_key "2.29i rollback" "$SF" script rollback-docker.sh
+assert_status_key "2.29i rollback" "$SF" refusal_reason not-root
+assert_status_key "2.29i rollback" "$SF" result refused
+assert_status_complete "2.29i rollback" "$SF"
+# The guard's job is to stop a non-root run doing anything. Asserting the
+# status alone would pass for a run that downgraded the node and then failed.
+assert_untouched_strict "2.29i rollback" baseline a29i
+
+vm "rm -f $SF" >/dev/null 2>&1
+capture_strict_state a29i2
+# Seed one object inside cleanup's exact deletion scope. Without it this case
+# proves nothing about the destructive path: the S1 baseline is deliberately
+# not a Swarm node, so it has no VXLAN interfaces, no docker_gwbridge and an
+# empty netns directory, and a cleanup that deleted everything it could find
+# would still leave the node looking untouched.
+vm "mkdir -p /var/run/docker/netns && touch /var/run/docker/netns/agent-canary" >/dev/null 2>&1
+vm_try "runuser -u nobody -- /opt/docker-offline/clean-swarm-networks.sh --status-file=$SF" >/dev/null
+assert_status_key "2.29i cleanup" "$SF" script clean-swarm-networks.sh
+assert_status_key "2.29i cleanup" "$SF" refusal_reason not-root
+assert_status_key "2.29i cleanup" "$SF" result refused
+assert_status_key "2.29i cleanup" "$SF" deleted false
+assert_status_complete "2.29i cleanup" "$SF"
+assert_untouched_strict "2.29i cleanup" baseline a29i2
+if vm_try "test -e /var/run/docker/netns/agent-canary; echo \$?" | tail -1 | grep -qx 0; then
+    ok "2.29i cleanup: the seeded netns object survived the refusal"
+else
+    bad "2.29i cleanup: the seeded netns object was DELETED by a non-root run"
+fi
+vm "rm -f /var/run/docker/netns/agent-canary" >/dev/null 2>&1
+
+# --- 2.29j: an exit-0 decline is distinguishable from a completed upgrade ---
+# Exit 0 has meant three different things in this script for as long as it has
+# existed. The record is what separates them; the exit code still cannot.
+#
+# This covers the already-at-target decline. The unverified-baseline decline
+# takes the same path through derive_result and is not separately staged here,
+# because reaching it needs a version that is neither the baseline nor the
+# target -- a fixture this suite does not have.
+./reset-baseline.sh >/dev/null 2>&1
+restore_pkgs
+vm_try "cd /opt/docker-offline && ./upgrade-docker.sh --status-file=$SF </dev/null 2>&1" >/dev/null
+capture_strict_state a29j
+vm "rm -f $SF" >/dev/null 2>&1
+# Already at target now. Answer "no" on a real stream -- with stdin closed the
+# EOF guard fires first and this would test the wrong thing.
+rc=$(vm_try "cd /opt/docker-offline && printf 'n\n' | ./upgrade-docker.sh --status-file=$SF >/dev/null 2>&1; echo \$?" | tail -1)
+if [ "$rc" = "0" ]; then
+    ok "2.29j already-at-target decline still exits 0"
+else
+    bad "2.29j already-at-target decline exited '$rc', want 0"
+fi
+assert_status_key "2.29j" "$SF" result nothing-to-do
+assert_status_key "2.29j" "$SF" pkg_state untouched
+assert_status_complete "2.29j" "$SF"
+assert_strict_state_unchanged "2.29j" a29j
+r=$(status_key "$SF" result)
+if [ "$r" != "completed" ]; then
+    ok "2.29j a decline is not recorded as a completed upgrade"
+else
+    bad "2.29j decline recorded as result=completed -- exit 0 is still ambiguous"
+fi
+
+vm "rm -f $SF" >/dev/null 2>&1
+./reset-baseline.sh >/dev/null 2>&1
 fi
 
 summary

@@ -172,13 +172,16 @@ containerd bump they are inert or harmful. All three remain in git history at
 | Script | Version | Purpose | Run On |
 |---|---|---|---|
 | `download-docker-packages.sh` | 2.3.0 | Download all packages, build the bundle | Online RHEL server |
-| `upgrade-docker.sh` | 2.2.0 | Perform the upgrade | Air-gapped servers |
-| `rollback-docker.sh` | 2.1.1 | Roll back to 29.1.5 | Failed upgrade recovery |
-| `clean-swarm-networks.sh` | 1.0.0 | Reset orphaned overlay network state | Node that can't rejoin overlays |
+| `upgrade-docker.sh` | 2.3.0 | Perform the upgrade | Air-gapped servers |
+| `rollback-docker.sh` | 2.2.0 | Roll back to 29.1.5 | Failed upgrade recovery |
+| `clean-swarm-networks.sh` | 1.1.0 | Reset orphaned overlay network state | Node that can't rejoin overlays |
 | `recover-dnf.sh` | 1.2.2 | Fix dependency issues | Servers with broken dnf |
 | `simulate-upgrade.sh` | — | Test the upgrade path in a VM | RHEL test VM |
 
 Script versions drift on purpose — only scripts that actually changed get bumped.
+
+The three stateful scripts accept `--status-file=PATH`, `--help` and `--version`, and refuse
+to run as a non-root user. No flag answers a prompt.
 
 **Running these from an agent rather than by hand?** Read `docs/AGENT-RUNBOOK.md`, which covers the prompts, the ambiguous exit codes and the failure decision table in one place. Note that the upgrade, rollback and network-cleanup scripts are interactive today and refuse a closed stdin, so an agent needs a real terminal. (`recover-dnf.sh` is the exception: it skips its Option A and exits 0.)
 

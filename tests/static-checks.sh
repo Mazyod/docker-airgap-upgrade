@@ -738,7 +738,6 @@ cmp_fn status_kv          upgrade-docker.sh rollback-docker.sh clean-swarm-netwo
 cmp_fn status_common      upgrade-docker.sh rollback-docker.sh clean-swarm-networks.sh
 cmp_fn write_status_file  upgrade-docker.sh rollback-docker.sh clean-swarm-networks.sh
 cmp_fn derive_result      upgrade-docker.sh rollback-docker.sh clean-swarm-networks.sh
-cmp_fn usage              upgrade-docker.sh rollback-docker.sh clean-swarm-networks.sh
 cmp_fn unit_state         upgrade-docker.sh rollback-docker.sh clean-swarm-networks.sh
 cmp_fn unit_is_stopped    upgrade-docker.sh rollback-docker.sh clean-swarm-networks.sh
 
@@ -1054,6 +1053,177 @@ for s in upgrade-docker.sh rollback-docker.sh clean-swarm-networks.sh; do
         bad "$s root check missing or after the tee (root@${r:-?}, tee@${t:-?})"
     fi
 done
+
+# Every flag a parser accepts must appear in that script's own usage text, and
+# every flag the usage text advertises must be accepted. `usage` used to be
+# drift-checked for byte-identity across the three scripts, which stopped being
+# meaningful the moment their interfaces diverged -- and byte-identity never
+# proved the text matched the parser anyway.
+for s in upgrade-docker.sh rollback-docker.sh clean-swarm-networks.sh; do
+    parsed=$(awk '/^while \[ "\$#" -gt 0 \]; do/,/^done$/' "$s" \
+        | grep -oE '^[[:space:]]*-[a-z|=*-]+\)' | tr -d ' )' | tr '|' '\n' \
+        | sed 's/=\*$//' | grep -E '^-' | LC_ALL=C sort -u)
+    documented=$(awk '/^usage\(\) \{/,/^\}/' "$s" \
+        | grep -oE '^  -[a-z, -]*[a-z]' | tr ',' '\n' | tr -d ' ' \
+        | grep -E '^-' | LC_ALL=C sort -u)
+    undoc=$(comm -23 <(printf '%s\n' "$parsed") <(printf '%s\n' "$documented") | grep . || true)
+    unparsed=$(comm -13 <(printf '%s\n' "$parsed") <(printf '%s\n' "$documented") | grep . || true)
+    if [ -z "$undoc" ] && [ -z "$unparsed" ]; then
+        ok "$s usage text matches its parser ($(printf '%s\n' "$parsed" | grep -c .) flags)"
+    else
+        [ -n "$undoc" ] && bad "$s accepts undocumented flags: $(printf '%s' "$undoc" | tr '\n' ' ')"
+        [ -n "$unparsed" ] && bad "$s documents flags it does not accept: $(printf '%s' "$unparsed" | tr '\n' ' ')"
+    fi
+done
+
+# --preflight must be READ-ONLY. Its whole value is that it converts an abort
+# past the point of no return into a refusal on a healthy node, and a preflight
+# that mutates anything destroys that.
+#
+# Comments are stripped first: the block explains which mutations it avoids, and
+# a grep that reads its own prose as code reports the explanation as the crime.
+if ! grep -q '^preflight_report() {' upgrade-docker.sh; then
+    bad "upgrade-docker.sh has no preflight_report to check"
+else
+    # Scope: preflight_report, plus PHASE 0 -- the two regions every preflight
+    # run executes unconditionally. Phase 1 is deliberately NOT scanned. It
+    # contains a real `docker node update --availability drain`, in a branch
+    # preflight never enters, and no text check can decide that reachability.
+    # A scan that included it would report the drain as a violation for ever,
+    # and a check that always fails gets disabled, which is worse than a check
+    # with a stated limit. The phase-1 guard is asserted separately below.
+    pf_from=$(grep -n '^CURRENT_PHASE="phase 0 (validate packages)"' upgrade-docker.sh | head -1 | cut -d: -f1)
+    pf_to=$(grep -n '^CURRENT_PHASE="phase 1 (swarm drain)"' upgrade-docker.sh | head -1 | cut -d: -f1)
+    pf=$( { awk '/^preflight_report\(\) \{/,/^\}/' upgrade-docker.sh
+            if [ -n "$pf_from" ] && [ -n "$pf_to" ]; then
+                sed -n "${pf_from},${pf_to}p" upgrade-docker.sh
+            fi; } | grep -vE '^[[:space:]]*#' \
+        | grep -vE '^[[:space:]]*echo ([^>]|$)*$')
+    # Widened past the obvious few: touch, cp, mv, sed -i, tee and a systemctl
+    # restart all mutate, and a blacklist that omits them invites them.
+    # shellcheck disable=SC2016  # a literal grep pattern, not an expansion
+    muts=$(printf '%s\n' "$pf" | grep -nE 'mkdir|touch[[:space:]]|(^|[^a-z_-])cp[[:space:]]|(^|[^a-z_-])mv[[:space:]]|sed[[:space:]]+-i|(^|[^a-z_-])tee[[:space:]]|systemctl[[:space:]]+(start|stop|restart|enable|disable)|dnf[[:space:]]+(clean|install|remove|upgrade)|rpm[[:space:]]+--rebuilddb|(^|[^-])rpm[[:space:]]+-e|docker[[:space:]]+node[[:space:]]+update|(^|[^-])rm[[:space:]]+-|truncate[[:space:]]|chmod[[:space:]]|chown[[:space:]]|(^|[^a-z_-])ln[[:space:]]|(^|[^a-z_-])mount[[:space:]]|umount[[:space:]]|systemctl[[:space:]]+mask|>[[:space:]]*"?\$CONTAINERD_CONF' || true)
+    # rpm -Uvh is only allowed with --test, which changes nothing.
+    rpmm=$(printf '%s\n' "$pf" | grep -E 'rpm -Uvh' | grep -v -- '--test' || true)
+    # Any redirect that lands in a FILE. A command blacklist cannot catch
+    # `echo x > /somewhere`, and that writes just as surely as touch does.
+    # /dev/null and fd duplications are the only permitted targets.
+    # `-` before `>` is an ASCII arrow in report text, not a redirect. Every
+    # other non-fd, non-dup `>` that lands on a name is one.
+    #
+    # Parameter expansions are blanked first. A `>` inside `${...}` is part of a
+    # default value, never a redirect -- `${found:-<none>}` in phase 0 is the
+    # live example. Only the body is removed, so a genuine `> "${FILE}"` still
+    # shows its `>` followed by a quote and is still caught.
+    redir=$(printf '%s\n' "$pf" | sed 's/\${[^{}]*}/${}/g' \
+        | grep -nE '(^|[^0-9&<>-])>>?[[:space:]]*[^&[:space:]]' \
+        | grep -v '/dev/null' || true)
+    if [ -z "$muts" ] && [ -z "$rpmm" ] && [ -z "$redir" ]; then
+        ok "upgrade-docker.sh preflight path contains none of the known mutators"
+    else
+        bad "upgrade-docker.sh preflight_report contains a mutating command"
+        printf '%s\n%s\n%s\n' "$muts" "$rpmm" "$redir" | grep . | sed 's/^/       /'
+    fi
+fi
+
+# preflight_report must CALL the hoisted checks. Without this, deleting the
+# call leaves every other static check green -- the phase-6 enforcement check
+# still finds phase 6's own call, and the read-only scan is happier with less
+# code, not less happy. Tier 2 mutant M2 proves the behavioural hazard; this
+# catches the deletion at Tier 1, where it is cheap.
+pf_body=$(awk '/^preflight_report\(\) \{/,/^\}/' upgrade-docker.sh | grep -vE '^[[:space:]]*#')
+pf_missing=""
+for fn in read_config_version read_containerd_root relocated_root_is_missing; do
+    printf '%s\n' "$pf_body" | grep -q "$fn" || pf_missing="$pf_missing $fn"
+done
+if [ -z "$pf_missing" ]; then
+    ok "upgrade-docker.sh preflight_report calls all three hoisted readers"
+else
+    bad "upgrade-docker.sh preflight_report does not call:$pf_missing"
+fi
+
+# The --preflight arm must not assign STATUS_FILE. Case 2.30b2 checks one
+# sentinel path, which cannot catch a regression that picks a different default.
+pf_arm_body=$(grep -E '^[[:space:]]*--preflight\)' upgrade-docker.sh || true)
+if printf '%s\n' "$pf_arm_body" | grep -q 'STATUS_FILE'; then
+    bad "upgrade-docker.sh --preflight assigns STATUS_FILE"
+else
+    ok "upgrade-docker.sh --preflight writes no status file of its own"
+fi
+
+# tests/vm/negative-control.sh locates phase 6 by a marker before searching for
+# its anchor. It used to take the first match, which silently moved into
+# preflight_report when that grew the same `-f` test -- the mutant then patched
+# code a normal run never executes, changed nothing, and the control reported
+# that the hazard it exists to prove was not real.
+if grep -q 'phase 6 (containerd config)' tests/vm/negative-control.sh; then
+    ok "negative-control.sh scopes its mutation to phase 6"
+else
+    bad "negative-control.sh does not scope its mutation to phase 6"
+fi
+
+# Preflight must not advertise gate keys it cannot compute. Two of the six
+# gates depend on what the run DOES, not on what a node at rest looks like, and
+# a list that silently omits them is worse than no list.
+if grep -qE '^[[:space:]]*status_kv gates_' upgrade-docker.sh; then
+    bad "upgrade-docker.sh emits gate keys; preflight cannot predict them yet"
+else
+    ok "upgrade-docker.sh emits no gate keys"
+fi
+
+# The preflight exit must sit AFTER phase 0 and BEFORE phase 2. Earlier and it
+# skips the payload validation that is the bulk of what it exists to run;
+# later and it has already repaired dnf and written a backup.
+# shellcheck disable=SC2016  # a literal grep pattern, not an expansion
+pf_exit=$(grep -n 'exit "\$PREFLIGHT_RC"' upgrade-docker.sh | head -1 | cut -d: -f1)
+p0=$(grep -n '^CURRENT_PHASE="phase 0 (validate packages)"' upgrade-docker.sh | head -1 | cut -d: -f1)
+p2=$(grep -n '^CURRENT_PHASE="phase 2 (pre-upgrade checks)"' upgrade-docker.sh | head -1 | cut -d: -f1)
+# Phase 1's preflight arm must come FIRST, so the drain and the attestation sit
+# in elif branches behind it and preflight cannot reach either. This is what
+# the read-only scan above deliberately does not try to prove textually.
+# The CONDITION, not the message it prints: a mutant that swapped the guard for
+# `if false` kept the message and sailed through a message-based check. Grepping
+# for a string the call site supplies proves nothing about the call site.
+p1_start=$(grep -n '^CURRENT_PHASE="phase 1 (swarm drain)"' upgrade-docker.sh | head -1 | cut -d: -f1)
+# shellcheck disable=SC2016  # a literal grep pattern, not an expansion
+pf_arm=$(grep -n 'if \[ "\$MODE" = "preflight" \]; then' upgrade-docker.sh \
+    | awk -F: -v p="${p1_start:-0}" '$1 > p {print $1; exit}')
+# shellcheck disable=SC2016  # a literal grep pattern, not an expansion
+drain_line=$(grep -n 'docker node update --availability drain "\$SWARM_NODE_ID"' upgrade-docker.sh | head -1 | cut -d: -f1)
+# "Before" is not enough: turning the following `elif` into a separate `if`
+# would leave the arm first AND let preflight fall through into the drain.
+# Require the availability branch between them to be an elif, and require no
+# sibling `if` on the same variable.
+# shellcheck disable=SC2016  # literal grep patterns, not expansions
+avail_elif=$(sed -n "${pf_arm:-1},${drain_line:-1}p" upgrade-docker.sh \
+    | grep -cE '^    elif \[ "\$NODE_AVAILABILITY"' || true)
+# shellcheck disable=SC2016  # literal grep pattern, not an expansion
+avail_if=$(sed -n "${pf_arm:-1},${drain_line:-1}p" upgrade-docker.sh \
+    | grep -cE '^    if \[ "\$NODE_AVAILABILITY"' || true)
+if [ -n "$pf_arm" ] && [ -n "$drain_line" ] && [ "$pf_arm" -lt "$drain_line" ] &&
+   [ "$avail_elif" -ge 1 ] && [ "$avail_if" -eq 0 ]; then
+    ok "upgrade-docker.sh phase 1 gates the drain behind its preflight arm"
+else
+    bad "upgrade-docker.sh phase 1 drain is not behind the preflight arm (arm@${pf_arm:-?} drain@${drain_line:-?} elif=$avail_elif if=$avail_if)"
+fi
+
+p1=$(grep -n '^CURRENT_PHASE="phase 1 (swarm drain)"' upgrade-docker.sh | head -1 | cut -d: -f1)
+if [ -n "$pf_exit" ] && [ -n "$p0" ] && [ -n "$p1" ] && [ -n "$p2" ] &&
+   [ "$p0" -lt "$p1" ] && [ "$p1" -lt "$pf_exit" ] && [ "$pf_exit" -lt "$p2" ]; then
+    ok "upgrade-docker.sh preflight exits after phases 0 and 1, before phase 2"
+else
+    bad "upgrade-docker.sh preflight exit misplaced (p0@${p0:-?} p1@${p1:-?} exit@${pf_exit:-?} p2@${p2:-?})"
+fi
+
+# Phase 6 must still ENFORCE what preflight predicts, through the same helpers,
+# so the two cannot answer differently. Preflight predicts; phase 6 enforces.
+p6=$(grep -n '^CURRENT_PHASE="phase 6 (containerd config)"' upgrade-docker.sh | head -1 | cut -d: -f1)
+enf=$(grep -n 'relocated_root_is_missing' upgrade-docker.sh | awk -F: -v p="${p6:-0}" '$1 > p {print $1; exit}')
+if [ -n "$enf" ]; then
+    ok "upgrade-docker.sh phase 6 still enforces the relocated-root check"
+else
+    bad "upgrade-docker.sh phase 6 no longer calls relocated_root_is_missing"
+fi
 
 #############################################
 head_ "1.3  Upstream package availability"

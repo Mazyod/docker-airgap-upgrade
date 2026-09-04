@@ -15,9 +15,14 @@
 #        -> a successful run leaves the record saying result=running
 #        pairs with tier2-run.sh case 2.29b
 #
-#   M1b  STATUS_OK accumulator removed, one key's write made to fail
+#   M1b  STATUS_OK accumulator removed, one selected key made to fail
 #        -> a truncated record is published carrying the terminator
 #        pairs with tier2-run.sh case 2.29g
+#
+#   M2   the hoisted relocated-root check deleted from preflight
+#        -> preflight reports ready for a node the real run refuses in phase 6,
+#           AFTER the rpm transaction and with services stopped
+#        pairs with tier2-run.sh case 2.30c
 #
 # This is DESTRUCTIVE: it runs real upgrades against mutant scripts. It resets
 # the baseline before and after every mutant.
@@ -162,6 +167,102 @@ if [ "$last" = "status_complete=1" ] && [ "${has_key:-0}" = "0" ]; then
 else
     bad "M1b did NOT reproduce the hazard (last=[$last], key rows=$has_key)"
 fi
+
+#############################################
+head_ "M2  preflight without the hoisted relocated-root check"
+#############################################
+# Confirming only that the mutant reports "ready" would prove nothing: case
+# 2.30c's untouched-state assertions still pass against it, because a preflight
+# that gives the wrong answer still touches nothing. The hazard is what happens
+# when an agent BELIEVES that answer, so this mutant follows the ready through
+# into a real upgrade and asserts the hazard reproduces: packages replaced,
+# services stopped, and the run aborted in phase 6.
+#
+# That is precisely the state the hoist exists to prevent, and it leaves the
+# guest wrecked -- hence the reset immediately afterwards.
+reset_all
+vm 'set -e
+cp /opt/docker-offline/upgrade-docker.sh /opt/docker-offline/upgrade-MUTANT.sh
+cat > /tmp/m2.py <<"PYEOF"
+import pathlib
+p = pathlib.Path("/opt/docker-offline/upgrade-MUTANT.sh")
+s = p.read_text()
+# Delete only the hoisted check inside preflight_report. Phase 6 keeps its own,
+# so the mutant still refuses -- just far too late to be free, which is the
+# whole point.
+start = s.index("    CONTAINERD_ROOT=$(read_containerd_root \"$CONTAINERD_CONF\")")
+marker = "    if relocated_root_is_missing \"$CONTAINERD_ROOT\"; then"
+i = s.index(marker, start)
+j = s.index("    elif [ \"$CONTAINERD_ROOT\" != \"/var/lib/containerd\" ]; then", i)
+s = s[:i] + "    if false; then   # MUTANT: hoisted relocated-root check deleted" + chr(10) + "        :" + chr(10) + s[j:]
+p.write_text(s)
+print("M2 built")
+PYEOF
+python3 /tmp/m2.py
+chmod +x /opt/docker-offline/upgrade-MUTANT.sh
+grep -c MUTANT /opt/docker-offline/upgrade-MUTANT.sh'
+
+# Stage the hazard by pointing the config at an absent relocated root, with
+# services left running. NOT by unmounting /data: the harness creates a shadow
+# /data/containerd before it mounts and gives containerd RequiresMountsFor, so
+# an unmount neither removes the directory nor survives a restart -- and
+# starting containerd against that shadow root is itself the data-loss hazard.
+# Armed before the fixture exists: an interrupted run would otherwise leave the
+# node's containerd config pointing at a path that does not exist.
+restore_m2_config() {
+    vm "[ -f /etc/containerd/config.toml.m2 ] && mv -f /etc/containerd/config.toml.m2 /etc/containerd/config.toml; true" >/dev/null 2>&1 || true
+}
+trap 'restore_m2_config' EXIT INT TERM
+vm "set -e
+    cp /etc/containerd/config.toml /etc/containerd/config.toml.m2
+    sed -i \"s|^root = .*|root = '/data/absent-root-m2'|\" /etc/containerd/config.toml" >/dev/null 2>&1
+m2_root=$(vm_try "sed -n \"s/^root = '\\(.*\\)'/\\1/p\" /etc/containerd/config.toml | head -1" | tail -1)
+if [ "$m2_root" = "/data/absent-root-m2" ]; then
+    ok "M2 staged an absent relocated root"
+else
+    bad "M2 staging failed (root='$m2_root') -- the mutant proves nothing"
+fi
+
+mut_rc=$(vm_try "cd /opt/docker-offline && ./upgrade-MUTANT.sh --preflight --status-file=$SF </dev/null >/dev/null 2>&1; echo \$?" | tail -1)
+mut_result=$(vm_try "sed -n 's/^result=//p' $SF 2>/dev/null | head -1" | tail -1)
+echo "  mutant preflight: exit $mut_rc, result=$mut_result"
+if [ "$mut_rc" = "0" ] && [ "$mut_result" = "ready" ]; then
+    ok "M2 mutant preflight reports READY on a node the real run refuses"
+else
+    bad "M2 mutant preflight did not report ready (exit $mut_rc, result=$mut_result)"
+fi
+
+echo ""
+echo "=== Following that ready into a real run, as an agent would ==="
+vm "rm -f $SF" >/dev/null 2>&1
+vm_try "cd /opt/docker-offline && ./upgrade-MUTANT.sh --status-file=$SF </dev/null 2>&1" | tail -4
+after_ph=$(vm_try "sed -n 's/^phase=//p' $SF 2>/dev/null | head -1" | tail -1)
+after_reason=$(vm_try "sed -n 's/^refusal_reason=//p' $SF 2>/dev/null | head -1" | tail -1)
+after_pkg=$(vm_try "sed -n 's/^pkg_state=//p' $SF 2>/dev/null | head -1" | tail -1)
+after_ct=$(vm_try "rpm -q containerd.io --queryformat '%{VERSION}'" | tail -1)
+d_state=$(vm_try "systemctl is-active docker || true" | tail -1)
+s_state=$(vm_try "systemctl is-active docker.socket || true" | tail -1)
+c_state=$(vm_try "systemctl is-active containerd || true" | tail -1)
+echo "  after the run: phase=$after_ph reason=$after_reason pkg_state=$after_pkg"
+echo "                 containerd.io=$after_ct docker=$d_state docker.socket=$s_state containerd=$c_state"
+# Assert WHERE it failed, not merely that it failed. A partial phase-5 failure
+# would also leave packages changed and services down, and reporting that as
+# the phase-6 hazard would be a false positive for this whole mutant.
+if [ "$after_ph" = "phase 6 (containerd config)" ] &&
+   [ "$after_reason" = "relocated-root-missing" ] &&
+   [ "$after_pkg" = "installed" ] &&
+   [ "$after_ct" = "$TARGET_CONTAINERD" ] &&
+   [ "$d_state" != "active" ] && [ "$s_state" != "active" ] && [ "$c_state" != "active" ]; then
+    ok "M2 reproduced the hazard: refused in phase 6, packages replaced, services DOWN"
+    echo "       That is the post-transaction, node-down state the hoist exists to"
+    echo "       prevent. Case 2.30c asserts all five packages at baseline and both"
+    echo "       services active, so it FAILS against this mutant."
+else
+    bad "M2 did NOT reproduce the phase-6 hazard exactly"
+    echo "       wanted phase='phase 6 (containerd config)' reason=relocated-root-missing"
+    echo "       pkg_state=installed containerd.io=$TARGET_CONTAINERD docker!=active"
+fi
+vm "mv -f /etc/containerd/config.toml.m2 /etc/containerd/config.toml" >/dev/null 2>&1
 
 #############################################
 echo ""

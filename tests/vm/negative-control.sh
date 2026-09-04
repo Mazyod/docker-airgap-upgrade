@@ -59,12 +59,18 @@ python3 - <<PYEOF
 import pathlib
 p = pathlib.Path("/opt/docker-offline/upgrade-MUTANT.sh")
 s = p.read_text()
+# Anchor inside PHASE 6 specifically. The same `-f` test now also appears in
+# preflight_report, which a plain "first occurrence" replace would hit -- and
+# preflight_report does not run during a normal upgrade, so the mutant would
+# change nothing and this control would report that the hazard is not real.
+# That is exactly what happened once; scope the search instead.
+phase6 = s.index("CURRENT_PHASE=" + chr(34) + "phase 6 (containerd config)" + chr(34))
 anchor = """if [ ! -f "\$CONTAINERD_CONF" ]; then"""
-assert anchor in s, "phase 6 anchor not found -- update this mutant"
+i = s.find(anchor, phase6)
+assert i != -1, "phase 6 anchor not found -- update this mutant"
 # Reinstate the pre-v2.0.0 behaviour: unconditionally regenerate.
-s = s.replace(anchor,
-    """containerd config default > "\$CONTAINERD_CONF"   # MUTANT: pre-v2.0.0 behaviour
-if [ ! -f "\$CONTAINERD_CONF" ]; then""", 1)
+s = s[:i] + """containerd config default > "\$CONTAINERD_CONF"   # MUTANT: pre-v2.0.0 behaviour
+""" + s[i:]
 p.write_text(s)
 print("mutant built")
 PYEOF

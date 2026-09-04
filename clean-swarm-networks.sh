@@ -1,7 +1,7 @@
 #!/bin/bash
 # clean-swarm-networks.sh
 # Reset orphaned Swarm overlay network state on a single node
-VERSION="1.1.0"
+VERSION="1.1.1"
 #
 # WHEN TO RUN THIS
 #
@@ -104,7 +104,7 @@ Options:
   --status-file=PATH   Write a key=value record of this run to PATH. Written
                        once at startup with result=running and again on every
                        exit path, including success and interrupts.
-  --help               Show this help and exit.
+  --help, -h           Show this help and exit.
   --version            Print the script version and exit.
 
 With no options the behaviour is unchanged: the script is interactive and

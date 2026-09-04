@@ -255,9 +255,13 @@ Four properties of the writer are load-bearing and each has a specific failure m
 - **`derive_result` is total and always returns 0.** A nonzero return would abort the EXIT trap
   under `set -e`, replacing 130 or 143 with its own status and writing no final record.
 
-`status_kv`, `status_common`, `write_status_file`, `derive_result` and `usage` are
-byte-identical across the three scripts and are drift-checked in section 1.11. Only
-`status_keys` and `derive_next_action` differ.
+`status_kv`, `status_common`, `write_status_file`, `derive_result`, `unit_state` and
+`unit_is_stopped` are byte-identical across the three scripts and are drift-checked in section
+1.11. `status_keys` and `derive_next_action` differ by design.
+
+`usage` is **not** drift-checked, and deliberately stopped being so once `--preflight` gave
+`upgrade-docker.sh` an interface the other two do not have. Byte-identity never proved the help
+text matched the parser anyway; section 1.14 now checks that instead, in both directions.
 
 **`clean-swarm-networks.sh` writes its record after its trap's service recovery**, not before
 the report. Its trap restarts what it stopped, unlike the other two; writing first would
@@ -284,10 +288,10 @@ Every script except `simulate-upgrade.sh` declares `VERSION="x.y.z"` on ~line 4 
 
 | Script | Version |
 |---|---|
-| `upgrade-docker.sh` | 2.3.1 |
-| `rollback-docker.sh` | 2.2.0 |
+| `upgrade-docker.sh` | 2.4.0 |
+| `rollback-docker.sh` | 2.2.1 |
 | `download-docker-packages.sh` | 2.3.0 |
-| `clean-swarm-networks.sh` | 1.1.0 |
+| `clean-swarm-networks.sh` | 1.1.1 |
 | `recover-dnf.sh` | 1.2.2 |
 
 Commit subjects carry the new version in parens, e.g. `Fix NVIDIA toolkit upgrade failures (v1.2.2)`, with a bullet list body.

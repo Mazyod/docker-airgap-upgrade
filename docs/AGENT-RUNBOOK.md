@@ -176,15 +176,55 @@ A worker is never offered the prompt and always needs this step done from a mana
 
 ## Flags
 
-Three flags exist today, on `upgrade-docker.sh`, `rollback-docker.sh` and
-`clean-swarm-networks.sh`. **None of them answers a prompt.** There is still no way to run
-these scripts without a terminal.
+**No flag answers a prompt.** There is still no way to run an *upgrade*, a rollback or a
+cleanup without a terminal. `--preflight` is the exception and the only one: it never prompts,
+so it runs unattended.
 
-| Flag | Effect |
-|---|---|
-| `--status-file=PATH` | Write a `key=value` record of the run to PATH. Absolute paths only |
-| `--help` | Usage, exit 0. Works as any user and touches nothing |
-| `--version` | The script's version, exit 0 |
+| Flag | Scripts | Effect |
+|---|---|---|
+| `--preflight` | upgrade | Run every check that can be made with the node untouched, report, exit |
+| `--status-file=PATH` | all three | Write a `key=value` record of the run to PATH. Absolute paths only |
+| `--help` | all three | Usage, exit 0. Works as any user and touches nothing |
+| `--version` | all three | The script's version, exit 0 |
+
+### `--preflight`
+
+Run this first, on every node, before the real run. It is read-only: nothing is stopped,
+nothing is installed, no directory is created, and dnf is checked but not repaired.
+
+| Exit | `result` | Meaning |
+|---|---|---|
+| 0 | `ready` | the real run would proceed from here |
+| 1 | `refused` | it would refuse; read `refusal_reason` |
+| 3 | `nothing-to-do` | the node is already fully at the target |
+
+Those are the *controlled* outcomes. They are not an exhaustive exit taxonomy: an unexpected
+failure under `set -e` propagates its own status, and an interrupt still exits 130 or 143. The
+record classifies those as `failed` and `interrupted`.
+
+What it covers: the whole of phase 0, which is the payload digests, the RPM metadata, all five
+package versions, the containerd RPM release, the architecture, the RHEL major, duplicate
+packages, and the `rpm --test` dry run of the exact transaction. Then the containerd 1.x hard
+stop, the installed-version classification, the Swarm state and role, a dnf check, and two
+reads lifted out of phase 6.
+
+**Those two hoisted reads are the point of the flag.** Phase 6 runs *after* the package
+transaction, with docker and containerd stopped. A relocated containerd root whose filesystem
+is not mounted is discovered there today, on a node that is already down. Preflight finds the
+same thing on a node with every service running, where refusing costs nothing. It reports the
+config version for the same reason: whether a rollback would be blocked is worth knowing
+before the upgrade, not after.
+
+Preflight **predicts**; the phases still **enforce**. Phase 6 keeps its own copy of both
+checks, through the same helpers, so the two cannot answer differently. A node can be repaired,
+or broken, between the two runs.
+
+**What it does not give you is a complete list of the prompts the real run will reach.** It
+prints a line where it meets one it can see — the re-run offer, the unverified-baseline
+question, the drain — but two of the six depend on what the run *does* rather than on what the
+node looks like at rest, and preflight never reaches them. Treat those printed lines as
+advisory, not as the full set, and do not conclude from a quiet preflight that the real run
+will not stop and ask.
 
 An unrecognised argument is now a usage error: it exits 1 with a message and writes no status
 file. It used to be ignored silently.
@@ -229,13 +269,13 @@ merely probed.
 | `ended` | ISO 8601 UTC, or `unknown` |
 | `host` | hostname |
 | `rhel` | RHEL major, or `unknown` |
-| `mode` | `interactive` — the only mode that exists today |
-| `result` | `running` \| `completed` \| `nothing-to-do` \| `refused` \| `failed` \| `interrupted` |
+| `mode` | `interactive` \| `preflight` |
+| `result` | `running` \| `ready` \| `completed` \| `nothing-to-do` \| `refused` \| `failed` \| `interrupted` |
 | `exit_code` | integer, or `unknown` in a startup record |
 | `phase` | the phase the script was in |
 | `refusal_reason` | a token, or empty. See the refusal table below |
 | `refusal_detail` | one line of free text, or empty |
-| `next_action` | `none` \| `start-services` \| `investigate` \| `rerun-as-root` \| `restore-config` |
+| `next_action` | `none` \| `proceed` \| `start-services` \| `investigate` \| `rerun-as-root` \| `restore-config` \| `rebuild-bundle` \| `fix-mount` \| `drain-from-manager` |
 | `log` | log file path |
 | `log_started` | `true` \| `false` — false for exits before the log redirection was installed, whose output reached the terminal only |
 | `docker_active` | `active` \| `inactive` \| `failed` \| `activating` \| `deactivating` \| `unknown` |
@@ -316,6 +356,7 @@ answer; read `pkg_state` and `refusal_detail`.
 | `containerd_root_present` | `true` \| `false` \| `unknown` |
 | `rpmnew_present` | `true` \| `false` |
 | `nvidia` | `installed` \| `install-failed` \| `skipped-corrupt` \| `payload-missing` \| `toolkit-absent` \| `not-attempted` |
+| `node_class` | `at-target` \| `partial` \| `baseline` \| `unverified` \| `unknown` |
 | `docker_ce_before` | version \| `absent` \| `unknown` |
 | `docker_ce_after` | version \| `absent` \| `unknown` |
 | `docker_ce_expected` | version \| `unknown` |

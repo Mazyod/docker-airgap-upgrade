@@ -1,7 +1,7 @@
 #!/bin/bash
 # upgrade-docker.sh
 # Run on each AIR-GAPPED server to upgrade Docker 29.1.5 → 29.8.0
-VERSION="2.3.1"
+VERSION="2.4.0"
 #
 # Prerequisites:
 # - Extract docker-upgrade-bundle.tar.gz to /opt/
@@ -18,7 +18,7 @@ VERSION="2.3.1"
 # to avoid SSL certificate issues with corporate satellite servers
 # (e.g., "SSL certificate problem: EE certificate key too weak")
 #
-# SCOPE OF THIS VERSION (2.3.1)
+# SCOPE OF THIS VERSION (2.4.0)
 #
 # This upgrade crosses containerd 2.2.1 -> 2.3.4: a MINOR containerd bump, not
 # the 1.7 -> 2.x MAJOR boundary the 28.5.1 -> 29.1.5 migration crossed. 2.3 is
@@ -120,10 +120,16 @@ $SCRIPT_NAME $VERSION
 Usage: $SCRIPT_NAME [OPTIONS]
 
 Options:
+  --preflight          Run every check that can be made with the node
+                       untouched, report, and exit. Changes nothing: no
+                       service is stopped, no package is installed, no
+                       directory is created. Exits 0 when the real run would
+                       proceed, 1 when it would refuse, 3 when there is
+                       nothing to do.
   --status-file=PATH   Write a key=value record of this run to PATH. Written
                        once at startup with result=running and again on every
                        exit path, including success and interrupts.
-  --help               Show this help and exit.
+  --help, -h           Show this help and exit.
   --version            Print the script version and exit.
 
 With no options the behaviour is unchanged: the script is interactive and
@@ -154,6 +160,7 @@ while [ "$#" -gt 0 ]; do
             fi
             STATUS_FILE="$2"; shift
             ;;
+        --preflight) MODE="preflight" ;;
         --help|-h) usage; exit 0 ;;
         --version) echo "$SCRIPT_NAME $VERSION"; exit 0 ;;
         *)
@@ -354,6 +361,7 @@ status_keys() {
     status_kv containerd_root_present "$present"
     status_kv rpmnew_present "$(if [ -f "${CONTAINERD_CONF:-/etc/containerd/config.toml}.rpmnew" ]; then echo true; else echo false; fi)"
     status_kv nvidia "$NVIDIA_RESULT"
+    status_kv node_class "$NODE_CLASS"
     status_kv docker_ce_before "${CURRENT_DOCKER:-unknown}"
     status_kv docker_ce_after "$AFTER_DOCKER"
     status_kv docker_ce_expected "${EXPECTED_DOCKER_VERSION:-unknown}"
@@ -379,14 +387,29 @@ status_keys() {
 # that call would contradict the invariant the trap exists to honour.
 derive_next_action() {
     case "$RESULT" in
+        ready)
+            NEXT_ACTION="proceed"
+            return 0
+            ;;
         completed|nothing-to-do)
             NEXT_ACTION="none"
             return 0
             ;;
     esac
+    # Reason-specific first: these name a repair, and "investigate" would send
+    # an agent to read a log that already says exactly what to do.
     case "$REFUSAL_REASON" in
-        not-root)  NEXT_ACTION="rerun-as-root"; return 0 ;;
-        bad-usage) NEXT_ACTION="none";          return 0 ;;
+        not-root)               NEXT_ACTION="rerun-as-root";  return 0 ;;
+        bad-usage)              NEXT_ACTION="none";           return 0 ;;
+        payload-invalid)        NEXT_ACTION="rebuild-bundle"; return 0 ;;
+        relocated-root-missing) NEXT_ACTION="fix-mount";      return 0 ;;
+        drain-unconfirmed)      NEXT_ACTION="drain-from-manager"; return 0 ;;
+        # dry-run-failed is NOT rebuild-bundle: rpm refuses for disk space and
+        # host dependency reasons too, and neither is fixed by a new bundle.
+        # tasks-present is NOT drain-from-manager: on the manager path the
+        # drain has already run, and what is needed is to wait and look.
+        dry-run-failed|tasks-present)
+                                NEXT_ACTION="investigate";    return 0 ;;
     esac
     # start-services only when the units are OBSERVED down. SERVICES_STOPPED
     # is set before the first stop command, so a stop that failed partway
@@ -402,6 +425,121 @@ derive_next_action() {
         NEXT_ACTION="investigate"
     fi
     return 0
+}
+
+# Everything --preflight adds, in one place so the read-only claim can be read
+# in one place. It reports what phase 0 and the phase 1 detection already
+# established, plus the two phase-6 reads hoisted here, and exits.
+#
+# READ-ONLY. Nothing in this function or on the path that reaches it may stop a
+# service, install a package, create a directory, repair dnf, or drain a node.
+# tests/static-checks.sh check 1.14.12 greps the block for exactly that.
+#
+# It does NOT report which gates the run would reach. Two of the six cannot be
+# predicted from a node at rest, and advertising a list that silently omits
+# them would be worse than advertising nothing. That arrives with the gates.
+preflight_report() {
+    local rc=0
+
+    echo ""
+    echo -e "${GREEN}==========================================${NC}"
+    echo -e "${GREEN}PREFLIGHT${NC}"
+    echo -e "${GREEN}==========================================${NC}"
+    echo ""
+    echo "  docker-ce:             ${CURRENT_DOCKER:-absent} -> $EXPECTED_DOCKER_VERSION"
+    echo "  containerd.io:         ${CURRENT_CONTAINERD:-absent} -> $EXPECTED_CONTAINERD_VERSION"
+    echo "  containerd.io release: ${CURRENT_CONTAINERD_REL:-absent} -> $EXPECTED_CT_REL_FULL"
+    echo "  buildx:                ${CURRENT_BUILDX:-absent} -> $EXPECTED_BUILDX_VERSION"
+    echo "  compose:               ${CURRENT_COMPOSE:-absent} -> $EXPECTED_COMPOSE_VERSION"
+    echo "  classification:        $NODE_CLASS"
+    echo "  swarm:                 ${SWARM_STATE:-unknown} ($SWARM_ROLE_TOKEN, availability ${NODE_AVAILABILITY:-n/a})"
+    # The check phase 2 runs, without the `dnf clean all` and `rpm --rebuilddb`
+    # repair it follows the check with. A broken dnf is worth knowing about
+    # here; repairing it is a mutation and belongs to the real run.
+    if dnf check >/dev/null 2>&1; then
+        echo "  dnf state:             ok"
+    else
+        echo -e "  dnf state:             ${YELLOW}has issues (the real run would attempt a repair)${NC}"
+    fi
+    echo "  nvidia toolkit:        $(if [ "$NVIDIA_INSTALLED" = true ]; then echo present; else echo absent; fi)"
+    echo ""
+
+    # Hoisted from phase 6. Both are pure reads, and both matter here for the
+    # same reason: phase 6 runs AFTER the rpm transaction with services
+    # stopped, so a problem it finds costs a node that is already down.
+    echo "containerd config: $CONTAINERD_CONF"
+    if [ ! -f "$CONTAINERD_CONF" ]; then
+        echo -e "${YELLOW}  NOTE: absent. Phase 6 would generate a default, and under this${NC}"
+        echo -e "${YELLOW}  containerd that default is a version the rollback containerd${NC}"
+        echo -e "${YELLOW}  cannot load. Put a config in place first if you may roll back.${NC}"
+        # Deliberately left UNSET, so the record reports rollback safety as
+        # `unknown`. Setting it to "" would mean "a file with no version key",
+        # which reads as legacy and therefore rollback-SAFE -- the opposite of
+        # what the warning above just said, and the opposite of what the real
+        # run produces, since phase 6 generates a v4 default here. Preflight
+        # cannot read that default itself: `containerd config default` would be
+        # answered by the 2.2.1 binary still installed, not by the one that
+        # will write the file.
+    else
+        CONFIG_VERSION=$(read_config_version "$CONTAINERD_CONF")
+        if [ -z "$CONFIG_VERSION" ]; then
+            echo "  version: unset (treated as legacy; rollback-safe)"
+        elif [ "${#CONFIG_VERSION}" -gt 4 ]; then
+            echo -e "${YELLOW}  version reads as '$CONFIG_VERSION' -- not a valid config version.${NC}"
+            echo "  The file may be corrupt. Services would fail to start in phase 8."
+        elif [ "$CONFIG_VERSION" -le "$ROLLBACK_SAFE_CONFIG_VERSION" ]; then
+            echo "  version: $CONFIG_VERSION (rollback-safe)"
+        else
+            echo -e "${YELLOW}  version: $CONFIG_VERSION -- the rollback containerd loads at most${NC}"
+            echo -e "${YELLOW}  $ROLLBACK_SAFE_CONFIG_VERSION. A rollback would leave containerd unable to start${NC}"
+            echo -e "${YELLOW}  until this file is reverted. Not a refusal: the upgrade itself${NC}"
+            echo -e "${YELLOW}  is unaffected.${NC}"
+        fi
+    fi
+
+    CONTAINERD_ROOT=$(read_containerd_root "$CONTAINERD_CONF")
+    echo "containerd root: $CONTAINERD_ROOT"
+    if relocated_root_is_missing "$CONTAINERD_ROOT"; then
+        echo ""
+        echo -e "${RED}  ERROR: the relocated containerd root does not exist.${NC}"
+        echo "  Its filesystem is almost certainly not mounted. The real run would"
+        echo "  discover this in PHASE 6 -- after the rpm transaction, with docker"
+        echo "  and containerd stopped. Mount it first:"
+        echo "    findmnt --target $(dirname "$CONTAINERD_ROOT")"
+        echo "    lsblk; cat /etc/fstab"
+        REFUSAL_REASON="relocated-root-missing"
+        REFUSAL_DETAIL="$CONTAINERD_ROOT does not exist; its filesystem is probably not mounted"
+        rc=1
+    elif [ "$CONTAINERD_ROOT" != "/var/lib/containerd" ]; then
+        echo "  relocated and present:"
+        findmnt --target "$CONTAINERD_ROOT" 2>/dev/null | sed 's/^/    /' || true
+    fi
+
+    echo ""
+    # Already-at-target WINS over anything found above, and the ordering is the
+    # whole point. The real run's default answer to "re-run anyway?" is no, and
+    # that branch exits before phase 6 -- so a finding that only a re-run would
+    # hit must not be reported as a refusal the default path would produce.
+    # It is still printed above; it is just not what the caller is told to act on.
+    if [ "$PREFLIGHT_NOTHING_TO_DO" = true ]; then
+        RESULT="nothing-to-do"
+        REFUSAL_REASON=""
+        REFUSAL_DETAIL=""
+        echo -e "${GREEN}Nothing to do: this node is already fully at the target.${NC}"
+        if [ "$rc" -ne 0 ]; then
+            echo -e "${YELLOW}A finding above would block a re-run, but the default answer${NC}"
+            echo -e "${YELLOW}to the re-run prompt is no, so the real run would exit first.${NC}"
+        fi
+        rc=3
+    elif [ "$rc" -eq 0 ]; then
+        RESULT="ready"
+        echo -e "${GREEN}Ready: the real run would proceed from here.${NC}"
+        echo "Nothing on this node was changed."
+    else
+        echo -e "${RED}Not ready. Nothing on this node was changed.${NC}"
+    fi
+    echo "=========================================="
+    return "$rc"
 }
 
 # Captured at a point where rpm is known to have exited. Doing this inside the
@@ -450,6 +588,16 @@ SWARM_ROLE_TOKEN="unknown"
 NODE_AVAILABILITY_AFTER="unknown"
 DRAIN_PERFORMED=false
 NVIDIA_RESULT="not-attempted"
+PREFLIGHT_NOTHING_TO_DO=false
+# The installed-version classification, computed ONCE in phase 0 and switched
+# on by the branches below. Slice 4's gate predictor consumes the same variable
+# rather than re-deriving the conditions, which is how the predictor and the
+# branches are kept from disagreeing.
+#   at-target  all five packages, and the containerd release, already match
+#   partial    some match and some do not
+#   baseline   on the tested starting versions
+#   unverified anything else
+NODE_CLASS="unknown"
 AFTER_DOCKER="unknown"
 AFTER_DOCKER_CLI="unknown"
 AFTER_CONTAINERD="unknown"
@@ -488,6 +636,16 @@ on_exit() {
     case "$REFUSAL_REASON" in
         not-root|bad-usage) exit "$rc" ;;
     esac
+
+    # --preflight touches nothing, so the state report below -- services,
+    # packages, backup directory, rollback advice -- describes a node this run
+    # never went near, and every phase-0 refusal has already printed the one
+    # line that explains itself. On exit 3 the report is worse than redundant:
+    # it prints "UPGRADE FAILED" directly underneath preflight's own green
+    # "Nothing to do", so the same output says both.
+    if [ "$MODE" = "preflight" ]; then
+        exit "$rc"
+    fi
 
     echo ""
     echo -e "${RED}==========================================${NC}"
@@ -676,6 +834,54 @@ containerd_release_matches() {
     [ -n "$rel" ] && [ -n "$want" ] && [ -n "$major" ] || return 1
 
     [ "$rel" = "${want}.el${major}" ]
+}
+
+CONTAINERD_CONF="/etc/containerd/config.toml"
+
+# The highest config version the ROLLBACK containerd (2.2.1) can load. A config
+# at or below this is safe to leave in place for an emergency rollback.
+ROLLBACK_SAFE_CONFIG_VERSION=3
+
+# Read the top-level `version` key. The awk stops at the first [section] header
+# so only top-level keys count, matching the `root` parser below.
+read_config_version() {
+    # Tolerate an optionally quoted value. containerd wants an integer here, so
+    # `version = "4"` is not a config it would accept anyway -- but reading it
+    # as 4 makes this guard FIRE, whereas failing to match would silently read
+    # as "no version key" and wave the file through. Err toward firing.
+    awk '/^[[:space:]]*\[/ { exit } { print }' "$1" 2>/dev/null \
+        | sed -n "s/^[[:space:]]*version[[:space:]]*=[[:space:]]*['\"]\{0,1\}\([0-9][0-9]*\)['\"]\{0,1\}.*/\1/p" \
+        | head -1
+}
+
+# Read the configured containerd root. TOP-LEVEL keys only -- the awk stops at
+# the first [section] header -- and the sed tolerates leading whitespace and
+# any of the three quoting styles. Both halves matter, and both were bugs once:
+# without the awk a `root` inside a [plugins."..."] section is returned as if
+# it were containerd's own, and without the leading-whitespace tolerance an
+# INDENTED top-level root parses as empty and silently falls back to the
+# default, which defeats the relocated-root check below.
+#
+# Extracted from phase 6 so preflight and phase 6 cannot disagree about what
+# the configured root is. Read-only.
+read_containerd_root() {
+    local root
+    root=$(awk '/^[[:space:]]*\[/ { exit } { print }' "$1" 2>/dev/null \
+        | sed -n "s/^[[:space:]]*root[[:space:]]*=[[:space:]]*['\"]\{0,1\}\([^'\"]*\)['\"]\{0,1\}.*/\1/p" \
+        | head -1)
+    printf '%s\n' "${root:-/var/lib/containerd}"
+}
+
+# Is the configured root a RELOCATED one that has gone missing? A pure
+# filesystem read: it creates nothing and repairs nothing.
+#
+# The default root simply not existing yet is unremarkable -- phase 6 creates
+# it. A relocated root that is absent almost always means its filesystem is not
+# mounted, and creating it would start containerd against an empty root and
+# make every image and snapshot look lost.
+relocated_root_is_missing() {
+    local root="$1"
+    [ "$root" != "/var/lib/containerd" ] && [ ! -d "$root" ]
 }
 
 prompt_yes_no() {
@@ -1090,26 +1296,43 @@ esac
 # without the release test it would be told there was nothing to do and keep a
 # runtime nobody chose. A release mismatch falls through to the partial-upgrade
 # branch below, which is correct -- that node does need this run.
+# Classify ONCE. The branches below switch on NODE_CLASS rather than
+# re-evaluating these expressions, so a future gate predictor reading the same
+# variable cannot disagree with the branch that actually runs.
 if [ "$CURRENT_DOCKER" = "$EXPECTED_DOCKER_VERSION" ] &&
    [ "$CURRENT_DOCKER_CLI" = "$EXPECTED_DOCKER_VERSION" ] &&
    [ "$CURRENT_CONTAINERD" = "$EXPECTED_CONTAINERD_VERSION" ] &&
    containerd_release_matches "$CURRENT_CONTAINERD_REL" "$EXPECTED_CONTAINERD_RELEASE" "$RHEL_VER" &&
    [ "$CURRENT_BUILDX" = "$EXPECTED_BUILDX_VERSION" ] &&
    [ "$CURRENT_COMPOSE" = "$EXPECTED_COMPOSE_VERSION" ]; then
+    NODE_CLASS="at-target"
+elif [ "$CURRENT_DOCKER" = "$EXPECTED_DOCKER_VERSION" ] ||
+     [ "$CURRENT_CONTAINERD" = "$EXPECTED_CONTAINERD_VERSION" ]; then
+    NODE_CLASS="partial"
+elif [ "$CURRENT_DOCKER" != "$SUPPORTED_FROM_DOCKER" ] ||
+     [ "$CURRENT_CONTAINERD" != "$SUPPORTED_FROM_CONTAINERD" ]; then
+    NODE_CLASS="unverified"
+else
+    NODE_CLASS="baseline"
+fi
+
+if [ "$NODE_CLASS" = "at-target" ]; then
     echo ""
     echo -e "${YELLOW}NOTE: this node is already fully at the target versions:${NC}"
     echo "  docker-ce $CURRENT_DOCKER, docker-ce-cli $CURRENT_DOCKER_CLI,"
     echo "  containerd.io $CURRENT_CONTAINERD-$CURRENT_CONTAINERD_REL, buildx $CURRENT_BUILDX,"
     echo "  compose $CURRENT_COMPOSE"
-    if ! prompt_yes_no "Re-run the upgrade anyway? [y/N]" "n"; then
+    PREFLIGHT_NOTHING_TO_DO=true
+    if [ "$MODE" = "preflight" ]; then
+        echo "Preflight: the real run would offer to re-run and default to no."
+    elif ! prompt_yes_no "Re-run the upgrade anyway? [y/N]" "n"; then
         # Exit 0 here has always meant "nothing done", which is indistinguishable
         # from "upgrade completed" by status alone. The record separates them.
         RESULT="nothing-to-do"
         echo "Nothing to do. Exiting without changes."
         exit 0
     fi
-elif [ "$CURRENT_DOCKER" = "$EXPECTED_DOCKER_VERSION" ] ||
-     [ "$CURRENT_CONTAINERD" = "$EXPECTED_CONTAINERD_VERSION" ]; then
+elif [ "$NODE_CLASS" = "partial" ]; then
     echo ""
     echo -e "${YELLOW}NOTE: some packages are already at the target and some are${NC}"
     echo -e "${YELLOW}not - this looks like a partial upgrade.${NC}"
@@ -1123,8 +1346,7 @@ else
     # Confirm the node is on the baseline this upgrade was designed and tested
     # against. Not a hard failure -- an intermediate 29.x is probably fine --
     # but it must not pass silently.
-    if [ "$CURRENT_DOCKER" != "$SUPPORTED_FROM_DOCKER" ] ||
-       [ "$CURRENT_CONTAINERD" != "$SUPPORTED_FROM_CONTAINERD" ]; then
+    if [ "$NODE_CLASS" = "unverified" ]; then
         echo ""
         echo -e "${YELLOW}=========================================="
         echo "WARNING: UNEXPECTED STARTING VERSION"
@@ -1133,7 +1355,9 @@ else
         echo "  tested upgrade path: $SUPPORTED_FROM_DOCKER / containerd.io $SUPPORTED_FROM_CONTAINERD"
         echo "  this node has:       ${CURRENT_DOCKER:-absent} / containerd.io ${CURRENT_CONTAINERD:-absent}"
         echo ""
-        if ! prompt_yes_no "Continue from this unverified starting version? [y/N]" "n"; then
+        if [ "$MODE" = "preflight" ]; then
+            echo "Preflight: the real run would ask whether to continue from here."
+        elif ! prompt_yes_no "Continue from this unverified starting version? [y/N]" "n"; then
             REFUSAL_REASON="unverified-baseline"
             REFUSAL_DETAIL="declined to upgrade from ${CURRENT_DOCKER:-absent} / containerd.io ${CURRENT_CONTAINERD:-absent}"
             echo "Aborting. Nothing has been changed."
@@ -1187,7 +1411,12 @@ if [ "$SWARM_STATE" = "active" ]; then
         echo "Current availability: unknown (worker nodes cannot self-inspect)"
     fi
 
-    if [ "$NODE_AVAILABILITY" = "active" ] || [ "$NODE_AVAILABILITY" = "unknown" ]; then
+    if [ "$MODE" = "preflight" ]; then
+        # Preflight stops before this branch: everything below it either
+        # prompts or drains, and preflight does neither. WHICH gates the real
+        # run would reach is not reported -- see preflight_report.
+        echo "Preflight: this node would be asked about draining."
+    elif [ "$NODE_AVAILABILITY" = "active" ] || [ "$NODE_AVAILABILITY" = "unknown" ]; then
         if [ "$IS_MANAGER" = true ]; then
             # Manager can drain itself
             echo ""
@@ -1273,6 +1502,26 @@ if [ "$SWARM_STATE" = "active" ]; then
 else
     SWARM_ROLE_TOKEN="none"
     echo "This node is NOT part of a Docker Swarm."
+fi
+
+#############################################
+# Preflight exit
+#############################################
+# Everything above this line is read-only: phase 0 validates the payload and
+# dry-runs the transaction with `rpm -Uvh --test`, and phase 1 only queries
+# Swarm state. Everything BELOW it mutates -- phase 2 repairs dnf, phase 3
+# writes a backup, phase 4 stops services.
+#
+# The exit sits here rather than earlier so preflight covers the whole of
+# phase 0, which is where almost everything checkable lives.
+if [ "$MODE" = "preflight" ]; then
+    CURRENT_PHASE="preflight"
+    if preflight_report; then
+        PREFLIGHT_RC=0
+    else
+        PREFLIGHT_RC=$?
+    fi
+    exit "$PREFLIGHT_RC"
 fi
 
 #############################################
@@ -1437,24 +1686,6 @@ CURRENT_PHASE="phase 6 (containerd config)"
 # `ctr version` and the overlayfs snapshotter, and neither responds if the
 # config is malformed.
 
-CONTAINERD_CONF="/etc/containerd/config.toml"
-
-# The highest config version the ROLLBACK containerd (2.2.1) can load. A config
-# at or below this is safe to leave in place for an emergency rollback.
-ROLLBACK_SAFE_CONFIG_VERSION=3
-
-# Read the top-level `version` key. The awk stops at the first [section] header
-# so only top-level keys count, matching the `root` parser below.
-read_config_version() {
-    # Tolerate an optionally quoted value. containerd wants an integer here, so
-    # `version = "4"` is not a config it would accept anyway -- but reading it
-    # as 4 makes this guard FIRE, whereas failing to match would silently read
-    # as "no version key" and wave the file through. Err toward firing.
-    awk '/^[[:space:]]*\[/ { exit } { print }' "$1" 2>/dev/null \
-        | sed -n "s/^[[:space:]]*version[[:space:]]*=[[:space:]]*['\"]\{0,1\}\([0-9][0-9]*\)['\"]\{0,1\}.*/\1/p" \
-        | head -1
-}
-
 if [ ! -f "$CONTAINERD_CONF" ]; then
     # containerd.io ships this file, so reaching here means it was deliberately
     # removed. Generating a default is the only option, but under 2.3.4 that
@@ -1529,30 +1760,15 @@ if [ -f "${CONTAINERD_CONF}.rpmnew" ]; then
 fi
 
 # Read the configured root, for reporting, for the missing-mount check below,
-# and to ensure the directory exists.
-#
-# The awk stops at the first `[section]` header so only TOP-LEVEL keys are
-# considered. Both halves of that matter:
-#
-#   - Without it, a config whose only `root` key lives inside a
-#     [plugins."..."] section would yield that plugin's path as if it were
-#     containerd's root.
-#   - The sed tolerates leading whitespace, because an INDENTED top-level
-#     `root` previously parsed as empty and silently fell back to
-#     /var/lib/containerd -- which would defeat the relocated-root mount check
-#     below, since that only fires for a non-default root.
-#
-# Generated configs single-quote paths; hand-edited ones may double-quote or
-# leave bare, so accept all three, and ignore any trailing inline comment.
-CONTAINERD_ROOT=$(awk '/^[[:space:]]*\[/ { exit } { print }' "$CONTAINERD_CONF" 2>/dev/null \
-    | sed -n "s/^[[:space:]]*root[[:space:]]*=[[:space:]]*['\"]\{0,1\}\([^'\"]*\)['\"]\{0,1\}.*/\1/p" \
-    | head -1)
-CONTAINERD_ROOT=${CONTAINERD_ROOT:-/var/lib/containerd}
+# and to ensure the directory exists. The extraction and the missing-relocated
+# predicate both live in helpers now, so --preflight predicts EXACTLY what this
+# phase enforces. Preflight predicts; this phase still enforces.
+CONTAINERD_ROOT=$(read_containerd_root "$CONTAINERD_CONF")
 
 echo "containerd root directory: $CONTAINERD_ROOT"
 
 if [ ! -d "$CONTAINERD_ROOT" ]; then
-    if [ "$CONTAINERD_ROOT" = "/var/lib/containerd" ]; then
+    if ! relocated_root_is_missing "$CONTAINERD_ROOT"; then
         # The default root simply not existing yet is unremarkable.
         echo -e "${YELLOW}NOTE: $CONTAINERD_ROOT does not exist - creating it.${NC}"
         mkdir -p "$CONTAINERD_ROOT"

@@ -478,7 +478,15 @@ else
         bad "2.6b the run did not complete"
         printf '%s\n' "$out" | tail -20 | sed 's/^/       /'
     fi
-    if printf '%s' "$out" | grep -q "containerd.io release $TARGET_CONTAINERD_RELEASE.el9"; then
+    # Scan ONLY from the phase 9 banner onward. Phase 0 prints a byte-identical
+    # "containerd.io release 2.el9" line about the PAYLOAD, so a whole-output
+    # grep passes even when the run exits at the already-at-target gate and
+    # never reaches phase 9 -- which is precisely what the 2.6b mutant does.
+    # Measured: under that mutant this line was green while every assertion
+    # around it went red. A green line that survives the mutation proves
+    # nothing, so it is anchored to the phase it claims to be about.
+    phase9=$(printf '%s\n' "$out" | sed -n '/=== Phase 9: Verification ===/,$p')
+    if printf '%s' "$phase9" | grep -q "containerd.io release $TARGET_CONTAINERD_RELEASE.el9"; then
         ok "2.6b phase 9 reported the installed containerd.io release"
     else
         bad "2.6b phase 9 did not report the installed containerd.io release"
@@ -763,6 +771,282 @@ if [ "$r" != "completed" ]; then
 else
     bad "2.29j decline recorded as result=completed -- exit 0 is still ambiguous"
 fi
+
+
+#############################################
+head_ "2.30  Agent mode: --preflight"
+#############################################
+# Slice 3. Every case here asserts STATE, not the exit code: a preflight that
+# mutated the node and then reported the right answer would pass an exit-code
+# check, and mutating nothing is the entire promise of the flag.
+./reset-baseline.sh >/dev/null 2>&1
+restore_pkgs
+vm "rm -f $SF" >/dev/null 2>&1
+
+# Three cases below deliberately point the containerd config at a path that
+# does not exist. An interrupted suite would leave it there, which is a broken
+# node. Restore whatever backup exists on any exit, including a signal.
+restore_pf_config() {
+    vm "for b in /etc/containerd/config.toml.pf30c /etc/containerd/config.toml.d2 /etc/containerd/config.toml.pf /etc/containerd/config.toml.pf30f; do
+            [ -f \"\$b\" ] && mv -f \"\$b\" /etc/containerd/config.toml
+        done; true" >/dev/null 2>&1 || true
+}
+trap 'restore_pf_config' EXIT INT TERM
+
+# --- 2.30a: preflight on a healthy node reports ready and changes nothing ---
+capture_strict_state a30a
+# The log is appended to, so count the phase markers before and after. A
+# preflight that reached phase 4 would add one, and no state assertion on
+# packages or services would necessarily catch it.
+p4_before=$(vm_try "grep -c '=== Phase 4: Stop Services ===' /var/log/docker-upgrade.log 2>/dev/null || echo 0" | tail -1)
+rc=$(vm_try "cd /opt/docker-offline && ./upgrade-docker.sh --preflight --status-file=$SF </dev/null >/dev/null 2>&1; echo \$?" | tail -1)
+if [ "$rc" = "0" ]; then
+    ok "2.30a preflight on a healthy node exits 0"
+else
+    bad "2.30a preflight exited '$rc', want 0"
+    vm_try "cd /opt/docker-offline && ./upgrade-docker.sh --preflight </dev/null 2>&1" | tail -15 | sed 's/^/       /'
+fi
+assert_status_key "2.30a" "$SF" mode preflight
+assert_status_key "2.30a" "$SF" result ready
+assert_status_key "2.30a" "$SF" containerd_root "$RELOCATED_ROOT"
+assert_status_key "2.30a" "$SF" containerd_root_relocated true
+assert_status_key "2.30a" "$SF" containerd_root_present true
+assert_status_key "2.30a" "$SF" pkg_state untouched
+assert_status_key "2.30a" "$SF" services_stopped false
+assert_status_key "2.30a" "$SF" next_action proceed
+assert_status_key "2.30a" "$SF" log_started true
+assert_status_key "2.30a" "$SF" node_class baseline
+# Phase 1 detection must actually have run. Without these, moving the preflight
+# exit above phase 1 would leave every other assertion here green.
+assert_status_key "2.30a" "$SF" swarm_active false
+assert_status_key "2.30a" "$SF" swarm_role none
+assert_status_complete "2.30a" "$SF"
+assert_untouched_strict "2.30a" baseline a30a
+p4_after=$(vm_try "grep -c '=== Phase 4: Stop Services ===' /var/log/docker-upgrade.log 2>/dev/null || echo 0" | tail -1)
+if [ "$p4_before" = "$p4_after" ]; then
+    ok "2.30a preflight never reached phase 4 (markers $p4_after)"
+else
+    bad "2.30a phase 4 marker count changed ($p4_before -> $p4_after) -- preflight stopped services"
+fi
+# It must also leave no backup and no generated config behind.
+if vm_try "test -e /root/docker-backup-preflight; echo \$?" | tail -1 | grep -qx 1; then
+    ok "2.30a preflight created no backup directory of its own"
+else
+    bad "2.30a preflight created a backup directory"
+fi
+
+# --- 2.30b: preflight refuses every phase-0 corruption, node untouched ---
+# The same corruptions the interactive cases 2.6 through 2.12 use. One of them
+# would not prove preflight runs the whole of phase 0, which is most of what
+# the flag is for.
+for corruption in wrong-bundle duplicates corrupt-rpm wrong-release empty-dir stale-plugins missing-plugins; do
+    restore_pkgs
+    case "$corruption" in
+        wrong-bundle)   vm "rm -f $PKG_DIR/*.rpm && cp /opt/docker-offline/rollback-rhel9/*.rpm $PKG_DIR/" >/dev/null 2>&1 ;;
+        duplicates)     vm "cp /opt/docker-offline/rollback-rhel9/docker-ce-*.rpm $PKG_DIR/" >/dev/null 2>&1 ;;
+        corrupt-rpm)    vm "truncate -s -1M $PKG_DIR/containerd.io-$TARGET_CONTAINERD-$TARGET_CONTAINERD_RELEASE.el9.x86_64.rpm" >/dev/null 2>&1 ;;
+        wrong-release)  vm "rm -f $PKG_DIR/containerd.io-*.rpm
+                            cp /opt/docker-offline/rhel8/containerd.io-*.rpm $PKG_DIR/" >/dev/null 2>&1 ;;
+        empty-dir)      vm "rm -f $PKG_DIR/*.rpm" >/dev/null 2>&1 ;;
+        stale-plugins)  # rollback-rhel9 ships no plugins, so copying from it
+                        # would stage MISSING plugins and duplicate the next
+                        # case. Fetch the previous round's builds, as 2.11 does.
+                        vm "rm -f $PKG_DIR/docker-buildx-plugin-*.rpm $PKG_DIR/docker-compose-plugin-*.rpm
+                            dnf download -q --destdir=$PKG_DIR docker-buildx-plugin-$BASELINE_BUILDX docker-compose-plugin-$BASELINE_COMPOSE" >/dev/null 2>&1
+                        staged_plugins=$(vm_try "ls $PKG_DIR/docker-buildx-plugin-*.rpm 2>/dev/null | wc -l" | tail -1)
+                        if [ "${staged_plugins:-0}" -lt 1 ]; then
+                            bad "2.30b could not stage stale plugins -- that iteration is vacuous"
+                        fi ;;
+        missing-plugins) vm "rm -f $PKG_DIR/docker-buildx-plugin-*.rpm $PKG_DIR/docker-compose-plugin-*.rpm" >/dev/null 2>&1 ;;
+    esac
+    vm "rm -f $SF" >/dev/null 2>&1
+    capture_strict_state "a30b_$corruption"
+    rc=$(vm_try "cd /opt/docker-offline && ./upgrade-docker.sh --preflight --status-file=$SF </dev/null >/dev/null 2>&1; echo \$?" | tail -1)
+    if [ "$rc" = "1" ]; then
+        ok "2.30b preflight refuses: $corruption"
+    else
+        bad "2.30b preflight exited '$rc' on $corruption, want 1"
+    fi
+    assert_status_key "2.30b $corruption" "$SF" result refused
+    assert_status_key "2.30b $corruption" "$SF" refusal_reason payload-invalid
+    assert_status_key "2.30b $corruption" "$SF" next_action rebuild-bundle
+    assert_untouched_strict "2.30b $corruption" baseline "a30b_$corruption"
+done
+restore_pkgs
+
+# --- 2.30b2: a bare preflight writes no status file ---
+capture_strict_state a30b2
+vm "rm -f /tmp/should-not-exist.kv" >/dev/null 2>&1
+rc=$(vm_try "cd /opt/docker-offline && ./upgrade-docker.sh --preflight </dev/null >/dev/null 2>&1; echo \$?" | tail -1)
+if [ "$rc" = "0" ]; then
+    ok "2.30b2 bare preflight exits 0"
+else
+    bad "2.30b2 bare preflight exited '$rc', want 0"
+fi
+if vm_try "test -e /tmp/should-not-exist.kv; echo \$?" | tail -1 | grep -qx 1; then
+    ok "2.30b2 bare preflight wrote no status file"
+else
+    bad "2.30b2 bare preflight wrote a status file"
+fi
+assert_untouched_strict "2.30b2" baseline a30b2
+
+# --- 2.30c: THE HOIST. A relocated root that does not exist. ---
+# Today the real run discovers this in phase 6, after the rpm transaction and
+# with services stopped. Preflight must find it with everything still up.
+#
+# Staged by pointing the config at an absent path, NOT by unmounting /data.
+# Unmounting cannot stage it here: the harness creates a shadow /data/containerd
+# before it mounts, so the directory survives the unmount, and containerd has
+# RequiresMountsFor=/data/containerd, so restarting it remounts. Either way the
+# root would read as present and this case would pass for a fixture reason.
+# Worse, if the remount ever failed, starting containerd against the shadow
+# root is itself the data-loss hazard this test exists to prevent.
+capture_strict_state a30c
+orig_sha=$(vm_try "sha256sum /etc/containerd/config.toml | cut -d' ' -f1" | tail -1)
+vm "set -e
+    rm -f $SF
+    cp /etc/containerd/config.toml /etc/containerd/config.toml.pf30c
+    sed -i \"s|^root = .*|root = '/data/absent-root-30c'|\" /etc/containerd/config.toml" >/dev/null 2>&1
+staged=$(vm_try "sed -n \"s/^root = '\\(.*\\)'/\\1/p\" /etc/containerd/config.toml | head -1" | tail -1)
+absent=$(vm_try "test -d /data/absent-root-30c; echo \$?" | tail -1)
+if [ "$staged" = "/data/absent-root-30c" ] && [ "$absent" = "1" ]; then
+    ok "2.30c staged a relocated root that does not exist"
+else
+    bad "2.30c staging failed (root='$staged', absent-rc='$absent') -- the case is vacuous"
+fi
+rc=$(vm_try "cd /opt/docker-offline && ./upgrade-docker.sh --preflight --status-file=$SF </dev/null >/dev/null 2>&1; echo \$?" | tail -1)
+if [ "$rc" = "1" ]; then
+    ok "2.30c preflight refuses a relocated root that does not exist"
+else
+    bad "2.30c preflight exited '$rc', want 1"
+fi
+assert_status_key "2.30c" "$SF" result refused
+assert_status_key "2.30c" "$SF" refusal_reason relocated-root-missing
+assert_status_key "2.30c" "$SF" next_action fix-mount
+assert_status_key "2.30c" "$SF" containerd_root /data/absent-root-30c
+assert_status_key "2.30c" "$SF" containerd_root_present false
+assert_status_key "2.30c" "$SF" pkg_state untouched
+# STATE: the whole point is that this refusal is FREE. All five packages
+# untouched and both services still running, which is exactly what phase 6
+# cannot offer -- by then the transaction has run and the node is down.
+assert_pkg_profile "2.30c" baseline
+assert_vm_eq "2.30c docker still active" "systemctl is-active docker" "active"
+assert_vm_eq "2.30c containerd still active" "systemctl is-active containerd" "active"
+# And it must NOT have created the directory it refused over. Creating it is
+# the hazard: containerd would start against an empty root and every image and
+# snapshot would look lost.
+if vm_try "test -d /data/absent-root-30c; echo \$?" | tail -1 | grep -qx 1; then
+    ok "2.30c preflight did NOT create the missing root"
+else
+    bad "2.30c preflight created /data/absent-root-30c -- that is the hazard itself"
+fi
+vm "mv -f /etc/containerd/config.toml.pf30c /etc/containerd/config.toml" >/dev/null 2>&1
+# Only NOW is the config comparable again: it was deliberately different for
+# the run above, so comparing it mid-case would fail on the fixture, not the
+# product.
+assert_vm_eq "2.30c config restored to the original" \
+    "sha256sum /etc/containerd/config.toml | cut -d' ' -f1" "$orig_sha"
+assert_strict_state_unchanged "2.30c after restore" a30c
+
+# --- 2.30d: preflight on an already-upgraded node reports nothing-to-do ---
+vm "rm -f $SF" >/dev/null 2>&1
+run_upgrade >/dev/null
+capture_strict_state a30d
+rc=$(vm_try "cd /opt/docker-offline && ./upgrade-docker.sh --preflight --status-file=$SF </dev/null >/dev/null 2>&1; echo \$?" | tail -1)
+if [ "$rc" = "3" ]; then
+    ok "2.30d preflight on an at-target node exits 3"
+else
+    bad "2.30d preflight exited '$rc', want 3"
+fi
+assert_status_key "2.30d" "$SF" result nothing-to-do
+assert_status_key "2.30d" "$SF" next_action none
+# The EXIT trap must not print its failure report for a read-only run. On exit
+# 3 it would put a red "UPGRADE FAILED" directly under preflight's own green
+# "Nothing to do", so the same output says both -- and the report describes
+# services, packages and rollback options for a node preflight never touched.
+pf_out=$(vm_try "cd /opt/docker-offline && ./upgrade-docker.sh --preflight </dev/null 2>&1")
+if printf '%s' "$pf_out" | grep -q "UPGRADE FAILED"; then
+    bad "2.30d preflight printed the UPGRADE FAILED report for a run that changed nothing"
+else
+    ok "2.30d preflight did not print the failure report"
+fi
+assert_status_key "2.30d" "$SF" node_class at-target
+assert_untouched_strict "2.30d" target a30d
+
+# --- 2.30d2: at-target AND a missing relocated root reports nothing-to-do ---
+# The real run's default answer to "re-run anyway?" is no, and that branch
+# exits before phase 6 -- so a finding only a re-run would hit must not be
+# reported as a refusal the default path would produce.
+vm "set -e
+    rm -f $SF
+    cp /etc/containerd/config.toml /etc/containerd/config.toml.d2
+    sed -i \"s|^root = .*|root = '/data/absent-root-30d2'|\" /etc/containerd/config.toml" >/dev/null 2>&1
+d2_root=$(vm_try "sed -n \"s/^root = '\\(.*\\)'/\\1/p\" /etc/containerd/config.toml | head -1" | tail -1)
+if [ "$d2_root" = "/data/absent-root-30d2" ]; then
+    ok "2.30d2 staged an absent relocated root"
+else
+    bad "2.30d2 staging failed (root='$d2_root') -- the precedence test is vacuous"
+fi
+rc=$(vm_try "cd /opt/docker-offline && ./upgrade-docker.sh --preflight --status-file=$SF </dev/null >/dev/null 2>&1; echo \$?" | tail -1)
+if [ "$rc" = "3" ]; then
+    ok "2.30d2 at-target plus a missing root still exits 3"
+else
+    bad "2.30d2 exited '$rc', want 3 -- a re-run-only finding was reported as a refusal"
+fi
+assert_status_key "2.30d2" "$SF" result nothing-to-do
+assert_status_key "2.30d2" "$SF" refusal_reason ""
+# The finding must still be REPORTED, just not acted on: an at-target node
+# whose root is missing is a real fact, it simply is not what the default path
+# would refuse over.
+assert_status_key "2.30d2" "$SF" containerd_root_present false
+vm "mv -f /etc/containerd/config.toml.d2 /etc/containerd/config.toml" >/dev/null 2>&1
+
+# --- 2.30e: preflight is read-only even with a v4 config on disk ---
+# It must REPORT the rollback implication, not refuse over it: the upgrade
+# itself is unaffected by a v4 config, only a later rollback is.
+vm "rm -f $SF && cp /etc/containerd/config.toml /etc/containerd/config.toml.pf && containerd config default > /etc/containerd/config.toml" >/dev/null 2>&1
+v4sha=$(vm_try "sha256sum /etc/containerd/config.toml | cut -d' ' -f1" | tail -1)
+rc=$(vm_try "cd /opt/docker-offline && ./upgrade-docker.sh --preflight --status-file=$SF </dev/null >/dev/null 2>&1; echo \$?" | tail -1)
+if [ "$rc" = "3" ] || [ "$rc" = "0" ]; then
+    ok "2.30e a v4 config does not make preflight refuse (exit $rc)"
+else
+    bad "2.30e preflight exited '$rc' on a v4 config; the upgrade is unaffected by it"
+fi
+assert_vm_eq "2.30e preflight did not rewrite the config" \
+    "sha256sum /etc/containerd/config.toml | cut -d' ' -f1" "$v4sha"
+assert_status_key "2.30e" "$SF" containerd_config_rollback_safe false
+vm "mv -f /etc/containerd/config.toml.pf /etc/containerd/config.toml" >/dev/null 2>&1
+
+# --- 2.30f: an ABSENT config is reported as unknown, never as rollback-safe ---
+# The absent-config branch is the one place preflight cannot predict the
+# rollback implication: phase 6 will GENERATE a default, and under the target
+# containerd that default is v4. Preflight cannot read it -- the binary that
+# would answer `containerd config default` today is the OLD one -- so the only
+# honest answer is `unknown`. Reporting `true` here would be a lie in the
+# dangerous direction, telling an agent a rollback is safe on the one node
+# where the upgrade is about to write a config that blocks it.
+vm "rm -f $SF && cp /etc/containerd/config.toml /etc/containerd/config.toml.pf30f && rm -f /etc/containerd/config.toml" >/dev/null 2>&1
+gone=$(vm_try "test -e /etc/containerd/config.toml; echo \$?" | tail -1)
+if [ "$gone" = "1" ]; then
+    ok "2.30f staged an absent containerd config"
+else
+    bad "2.30f staging failed -- the config is still present, the case is vacuous"
+fi
+rc=$(vm_try "cd /opt/docker-offline && ./upgrade-docker.sh --preflight --status-file=$SF </dev/null >/dev/null 2>&1; echo \$?" | tail -1)
+if [ "$rc" = "3" ] || [ "$rc" = "0" ]; then
+    ok "2.30f an absent config does not make preflight refuse (exit $rc)"
+else
+    bad "2.30f preflight exited '$rc' on an absent config, want 0 or 3"
+fi
+assert_status_key "2.30f" "$SF" containerd_config_rollback_safe unknown
+# READ-ONLY: phase 6's branch here does `mkdir -p /etc/containerd` and writes
+# the file. Preflight must do neither.
+if vm_try "test -e /etc/containerd/config.toml; echo \$?" | tail -1 | grep -qx 1; then
+    ok "2.30f preflight did not generate a config"
+else
+    bad "2.30f preflight generated /etc/containerd/config.toml -- it must not write one"
+fi
+vm "mv -f /etc/containerd/config.toml.pf30f /etc/containerd/config.toml" >/dev/null 2>&1
 
 vm "rm -f $SF" >/dev/null 2>&1
 ./reset-baseline.sh >/dev/null 2>&1

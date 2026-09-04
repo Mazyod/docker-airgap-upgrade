@@ -7,35 +7,27 @@
 
 | Tier | Status | Evidence |
 |---|---|---|
-| Tier 1 static | **PASSED 206/206** | `tests/static-checks.sh --online` — includes all 16 RPM URLs |
-| Tier 2 VM | **RE-RUN OWED** | last measured 56/56 at commit `8d4dcf4`; the assertion set has changed since — see below |
-| Tier 2 config-version boundary | **PASSED 30/30** | `tests/vm/config-version-check.sh` — cases 2.23–2.28, at `8d4dcf4` |
-| Tier 2 negative control | **PASSED 3/3** | `tests/vm/negative-control.sh` — mutant loses the relocated root, at `8d4dcf4` |
+| Tier 1 static | **PASSED 216/216** | `tests/static-checks.sh --online` — includes all 16 RPM URLs |
+| Tier 2 VM | **PASSED 67/67** | `tests/vm/tier2-run.sh` (the `all` phases) at commit `093a927` |
+| Tier 2 agent mode | **PASSED 312/312** | `tests/vm/tier2-run.sh agent` — cases 2.29 and 2.30, at `093a927` |
+| Tier 2 config-version boundary | **PASSED 30/30** | `tests/vm/config-version-check.sh` — cases 2.23–2.28, at `093a927` |
+| Tier 2 negative control | **PASSED 3/3** | `tests/vm/negative-control.sh` — mutant loses the relocated root, at `093a927` |
+| Tier 2 agent negative control | **PASSED 3/3 mutants** | `tests/vm/agent-mode-negative-control.sh` — M1a, M1b and M2 each make their case fail, at `093a927` |
 | Tier 1b stubbed | not built | optional; Tier 2 covers most of its intent |
 | Tier 3 Swarm | **NOT RUN** | needs a real multi-node cluster |
 
-The Tier 2 numbers were produced against a bundle rebuilt from the checkout at
-`8d4dcf4` — not from an earlier build. That bundle is
-`sha256:496868cbfb7836a1536a8b25c758e302828e85f80a8b042023ca694ea4c21924`, 334 MB,
-carrying `containerd.io-2.3.4-2` for el8 and el9 and no `-1` anywhere.
+Every Tier 2 figure above was produced in one campaign against a bundle rebuilt from
+the checkout at `093a927`, on Rocky Linux 9 through the Docker backend, with the guest
+recreated from scratch (`bootstrap-vm.sh --recreate`, whose own precondition check
+passed 8/8) and the baseline reset between suites.
 
-**Why `tier2-run.sh` is marked re-run owed.** Its assertion set changed twice after
-that run and the suite has not been executed since.
+The `agent` phase is **not part of `all`** — it runs only as `tests/vm/tier2-run.sh
+agent`, resets the baseline before it starts, and therefore carries its own figure.
+The two numbers are not additive and neither is a superset of the other.
 
-From the review fixes: case 2.6b was added, case 2.3 gained a
-`%{VERSION}-%{RELEASE}` assertion and a `runc` assertion, and 2.6a lost a
-`%{VERSION}`-only assertion that could not fail independently of the
-`%{VERSION}-%{RELEASE}` one beside it.
-
-From the agent-mode slices: a whole `agent` phase (case 2.29) and
-`tests/vm/agent-mode-negative-control.sh`. That phase is **not part of `all`** — it
-runs only as `tests/vm/tier2-run.sh agent` — so it needs its own invocation and its
-own recorded figure, and it resets the baseline before it starts.
-
-Do not quote 56/56 for the current tree; run the suite and record what it prints.
-`config-version-check.sh` and `negative-control.sh` were not touched, but they run
-against the same guest and their results are recorded here at the commit that
-produced them.
+Two mutations were executed by hand alongside the automated suites, and both are
+recorded below: the 2.6b already-at-target mutation, and the trap mutation covering
+the preflight report suppression.
 
 The runc swap was verified directly rather than inferred. `/usr/bin/runc` as shipped
 by each build, read from the RPM headers on the test node:
@@ -57,7 +49,7 @@ both exit non-zero.
 | # | Test | From | Pass criteria |
 |---|---|---|---|
 | 2.6a ✅ | **Payload gate.** Bundle carries `containerd.io-2.3.4-1` | S1, `rhel9/` containerd RPM swapped for the `-1` build | `upgrade-docker.sh` exits non-zero **in phase 0**, naming the containerd release and the runc difference; **and** `rpm -q containerd.io` still reports the S1 baseline `2.2.1-1.el9`; **and** `docker`, `docker.socket` and `containerd` are all still `active`; **and** the canary data under the relocated root is intact. **Automated in `tier2-run.sh`, 11 assertions, passing.** |
-| 2.6b ⏳ | **Already-at-target gate.** Node is on every target version but the wrong containerd build | S1 upgraded to the target, then `containerd.io` alone downgraded to the real upstream `-1` build with `rpm -Uvh --oldpackage` | The script must **not** report "already fully at the target" and exit 0. It takes the partial-upgrade branch, runs the transaction, and phase 9 reports `containerd.io release 2.el9`; **and** `rpm -q containerd.io` reports `2.3.4-2.el9` and `runc --version` is 1.5.1 afterwards; **and** docker and containerd are active with the canary data intact. **Automated in `tier2-run.sh`, 11 assertions, NOT YET EXECUTED.** |
+| 2.6b ✅ | **Already-at-target gate.** Node is on every target version but the wrong containerd build | S1 upgraded to the target, then `containerd.io` alone downgraded to the real upstream `-1` build with `rpm -Uvh --oldpackage` | The script must **not** report "already fully at the target" and exit 0. It takes the partial-upgrade branch, runs the transaction, and phase 9 reports `containerd.io release 2.el9`; **and** `rpm -q containerd.io` reports `2.3.4-2.el9` and `runc --version` is 1.5.1 afterwards; **and** docker and containerd are active with the canary data intact. **Automated in `tier2-run.sh`, 11 assertions, passing.** |
 
 The `-1` build is a real upstream RPM, downloaded in the guest with `dnf download`,
 so 2.6a uses a genuinely wrong bundle rather than a hand-edited one — a doctored file
@@ -134,6 +126,29 @@ Mutation-test 2.6b by restoring the version-only gate — delete the
 `containerd_release_matches "$CURRENT_CONTAINERD_REL" ...` line from the
 already-at-target condition. The script must then exit 0 saying there is nothing to
 do, and 2.6b must fail.
+
+**Executed at `093a927`.** The mutant took the already-at-target branch and the case
+went red on state, not merely on the exit code:
+
+```
+FAIL 2.6b the gate called a node on 2.3.4-1.el9 already-at-target
+FAIL 2.6b the run did not complete
+FAIL 2.6b: containerd.io is now 2.3.4-2.el9 (got '2.3.4-1.el9', want '2.3.4-2.el9')
+FAIL 2.6b: runc is now 1.5.1, not 1.4.3 (got '1.4.3', want '1.5.1')
+PASS 2.6b: docker active after the corrective run
+PASS 2.6b: containerd active after the corrective run
+```
+
+The node was left on `containerd.io 2.3.4-1.el9` running runc 1.4.3, which is the
+runtime nobody chose. The service assertions stayed green in both worlds, exactly as
+the "assert state, not the exit code" rule predicts.
+
+**That mutation also found a vacuous assertion in 2.6b itself.** `2.6b phase 9
+reported the installed containerd.io release` was green under the mutant, on a run
+that exited at the gate and never reached phase 9. Phase 0 prints a byte-identical
+`containerd.io release 2.el9` line about the *payload*, and the check grepped the
+whole transcript. It now scans only from the `=== Phase 9: Verification ===` banner
+onward, and goes red under the same mutant.
 
 Tier 1 covers what it can, and more than usual. `tests/static-checks.sh` section 1.4c
 extracts both functions from `upgrade-docker.sh` with awk and **executes** them: the

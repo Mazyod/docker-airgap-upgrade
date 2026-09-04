@@ -1,7 +1,7 @@
 #!/bin/bash
 # rollback-docker.sh
 # Emergency rollback: Docker 29.8.0 → 29.1.5
-VERSION="2.2.0"
+VERSION="2.2.1"
 #
 # Use this script if:
 # - Services fail to start after upgrade
@@ -103,7 +103,7 @@ Options:
   --status-file=PATH   Write a key=value record of this run to PATH. Written
                        once at startup with result=running and again on every
                        exit path, including success and interrupts.
-  --help               Show this help and exit.
+  --help, -h           Show this help and exit.
   --version            Print the script version and exit.
 
 With no options the behaviour is unchanged: the script is interactive and

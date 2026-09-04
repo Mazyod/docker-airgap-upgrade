@@ -494,6 +494,7 @@ the documented list.
 | `containerd_root_present` | `true` \| `false` |
 | `rpmnew_present` | `true` \| `false` |
 | `nvidia` | `installed` \| `absent` \| `skipped-corrupt` \| `not-attempted` |
+| `node_class` | `at-target` \| `partial` \| `baseline` \| `unverified` \| `unknown` — the installed-version classification, computed once and consumed by both the real branches and the gate predictor |
 | `docker_ce_before` / `docker_ce_after` / `docker_ce_expected` | version, or `absent` |
 | `containerd_io_before` / `_after` / `_expected` | version, or `absent` |
 | `containerd_io_release_before` / `_after` / `_expected` | RPM `%{RELEASE}`, or `absent` |

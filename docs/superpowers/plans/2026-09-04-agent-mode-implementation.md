@@ -353,15 +353,15 @@ remove it.
 |---|---|---|
 | 2.30 | `--preflight` from S1, with `--status-file` | exit 0, `result=ready`, `mode=preflight`, `log_started=true`. **State:** docker-ce and containerd.io still at baseline, both services `active`, `/etc/containerd/config.toml` sha unchanged, canary container running and `/data/canary.txt` intact, no new `/root/docker-backup-*` directory, and the count of `=== Phase 4: Stop Services ===` lines in `/var/log/docker-upgrade.log` unchanged from before the run |
 | 2.31 | `--preflight` against each of the 2.6–2.12 corruptions | run with `--status-file`. exit 1, `result=refused`, `refusal_reason=payload-invalid`, `assert_untouched_strict "2.31" baseline <snapshot>` for each |
-| 2.32 | `--preflight` with the relocated root unmounted | `umount /data`; with `--status-file`: exit 1, `result=refused`, `refusal_reason=relocated-root-missing`, `containerd_root_present=false`. **State:** packages at baseline, both services `active`, `/data` still not a mountpoint and **not** populated by the script. Remount and reset. |
+| 2.32 | `--preflight` with an absent relocated root | stage it by rewriting the config's top-level `root` to a path that does not exist, with services left running. **Not** by unmounting: the harness creates a shadow `/data/containerd` before it mounts and gives containerd `RequiresMountsFor`, so an unmount neither removes the directory nor survives a restart. With `--status-file`: exit 1, `result=refused`, `refusal_reason=relocated-root-missing`, `containerd_root_present=false`. **State:** packages at baseline, both services `active`, `/data` still not a mountpoint and **not** populated by the script. Remount and reset. |
 | 2.33 | `--preflight` already at target | after a real upgrade, with `--status-file`: exit 3, `result=nothing-to-do`. **State:** `assert_untouched_strict "2.33" target <snapshot>` |
-| 2.33a | Bare preflight writes no file | `--preflight` with no `--status-file`: exit 0, prose report on stdout, no file created anywhere, `assert_untouched_strict "2.33a" baseline <snapshot>` |
+| 2.33a | Bare preflight writes no status file | `--preflight` with no `--status-file`: exit 0, prose report on stdout, **no status file**. It does append to the upgrade log, which is its only trace. `assert_untouched_strict "2.33a" baseline <snapshot>` |
 
 2.32 is the case that justifies the hoist. Today the same condition aborts at phase 6 with
 packages already replaced and services stopped.
 
 **Mutation M2** in `agent-mode-negative-control.sh`: delete the hoisted relocated-root check
-from the preflight block, with `/data` unmounted.
+from the preflight block, staging the absent root by config rewrite as in 2.32.
 
 Confirming only that the mutant reports `result=ready` is **not enough** — 2.32's untouched-
 state assertions still pass against it, because a preflight that reports the wrong answer

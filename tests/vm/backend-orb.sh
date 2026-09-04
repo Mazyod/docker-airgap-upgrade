@@ -3,12 +3,22 @@
 # tests/vm/backend-orb.sh
 # OrbStack backend for the VM test harness. Sourced by lib.sh; do not run it.
 #
-# This is the original harness backend, moved here verbatim so that adding a
-# second backend could not change it. It drives an OrbStack Linux machine on
-# macOS: `orbctl run -m <machine> sudo bash -c '<cmd>'` is the whole transport,
-# and OrbStack mounts the Mac's filesystem into the machine at the SAME
-# absolute path, which is why every file-transfer site in the harness is a
-# plain `cp` rather than a push.
+# It drives an OrbStack Linux machine on macOS: `orbctl run -m <machine> sudo
+# bash -c '<cmd>'` is the whole transport, and OrbStack mounts the Mac's
+# filesystem into the machine at the SAME absolute path, which is why every
+# file-transfer site in the harness is a plain `cp` rather than a push.
+#
+# WHAT IS AND IS NOT ORIGINAL CODE. The TRANSPORT -- need_backend, vm_exists,
+# vm, vm_try and the `orbctl create` in vm_create -- was moved here verbatim
+# from the pre-backend harness. The LIFECYCLE operations were not: vm_delete's
+# absence verification, vm_wake and vm_restart are all new. Before the split,
+# `orbctl delete -f` was a bare unverified call in bootstrap-vm.sh and
+# teardown-vm.sh, and neither wake nor restart existed at all.
+#
+# That distinction matters because docs/TEST-PLAN.md records Tier 2 as executed
+# on the DOCKER backend only. Everything new in this file is therefore
+# unexecuted code, reviewed but never run. Treat a change here as untested
+# until someone runs the harness on a Mac.
 #
 # Requires: macOS + OrbStack (brew install orbstack).
 
@@ -40,14 +50,20 @@ vm_delete() {
 
     # Prove absence from a SUCCESSFUL listing. vm_exists returning false covers
     # both "the machine is gone" and "orbctl could not be reached", and reading
-    # the second as confirmed deletion is fail-open. Capture output and status
-    # separately -- `$(cmd || true)` cannot see the status at all.
-    local listing status
-    listing=$(orbctl list 2>/dev/null)
-    status=$?
-    if [ "$status" -ne 0 ]; then
-        echo "ERROR: 'orbctl list' failed (exit $status); cannot verify that" >&2
-        echo "       '$VM_NAME' was deleted. Refusing to report success." >&2
+    # the second as confirmed deletion is fail-open. `$(cmd || true)` cannot see
+    # the status at all, so the listing is taken in a CONDITION.
+    #
+    # It has to be a condition rather than `listing=$(...)` followed by reading
+    # `$?`: bootstrap-vm.sh calls vm_delete as a bare statement under
+    # `set -euo pipefail`, so errexit fires on the failing assignment and the
+    # script dies right there -- silently, after "Deleting existing VM", with
+    # the diagnostic below never reaching anyone. Fail-closed but mute is not
+    # good enough when the operator has to decide whether a 3 GB loop image
+    # survived.
+    local listing
+    if ! listing=$(orbctl list 2>/dev/null); then
+        echo "ERROR: 'orbctl list' failed; cannot verify that '$VM_NAME' was" >&2
+        echo "       deleted. Refusing to report success." >&2
         return 1
     fi
     if printf '%s\n' "$listing" | awk '{print $1}' | grep -qx "$VM_NAME"; then

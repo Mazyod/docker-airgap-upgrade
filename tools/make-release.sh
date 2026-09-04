@@ -30,12 +30,15 @@ die() { echo "${RED}ERROR${NC}: $*" >&2; exit 1; }
 step() { printf '\n%s==>%s %s\n' "$GREEN" "$NC" "$1"; }
 
 # harness_sha256_of (tests/vm/lib.sh) prefers sha256sum and falls back to
-# `shasum -a 256`, because stock macOS has no sha256sum. Wrap it so a host with
-# neither dies here rather than silently comparing an empty digest.
-sha256_of() {
-    harness_sha256_of "$1" \
-        || die "neither sha256sum nor shasum is available -- cannot verify the artifact"
-}
+# `shasum -a 256`, because stock macOS has no sha256sum.
+#
+# It is called ONLY at its use site below, never through a wrapper. A wrapper
+# that ends in `|| die` reads as fail-closed and is not: every call is inside a
+# command substitution, so `die`'s `exit 1` kills the SUBSHELL and the parent
+# carries on with an empty digest. With the VM-side digest empty too -- a guest
+# whose sha256sum call failed -- "" = "" compared equal, the script printed
+# "verified end to end", and the release notes shipped `sha256sum -c` with no
+# digest in it. Check the status where the value is assigned.
 
 TAG="${1:-}"
 [ -z "$TAG" ] && die "usage: tools/make-release.sh <tag> [--draft] [--reuse-bundle]"
@@ -61,8 +64,16 @@ step "Preflight"
 #############################################
 command -v gh >/dev/null 2>&1 || die "gh CLI not installed (macOS: brew install gh; Linux: see cli.github.com)"
 gh auth status >/dev/null 2>&1 || die "gh is not authenticated (gh auth login)"
-need_backend
-vm_exists || die "VM '$VM_NAME' not found. Run tests/vm/bootstrap-vm.sh first."
+# require_vm, not need_backend + vm_exists. vm_exists only asks whether a guest
+# EXISTS: on the container backend that is `docker container inspect`, which
+# succeeds for a STOPPED container, while every `vm` call below is `docker exec`,
+# which refuses one. A host reboot therefore let this preflight pass and the run
+# die later with "failed to stage scripts into the VM" -- or, under
+# --reuse-bundle, with the flatly wrong "no existing bundle in the VM to reuse".
+# require_vm also wakes the guest, and waking is where the repo bind mount is
+# re-verified by content; the one path that publishes a bundle was the one path
+# that never re-verified the guest is reading this checkout.
+require_vm
 echo "  backend: $HARNESS_BACKEND"
 
 [ -n "$(git status --porcelain)" ] && die "working tree is dirty -- commit or stash first"
@@ -125,8 +136,16 @@ rm -f "$OUT_BUNDLE"
 vm "cat $BUNDLE_VM" > "$OUT_BUNDLE" || die "failed to copy the bundle out"
 [ -s "$OUT_BUNDLE" ] || die "copied bundle is empty"
 
-VM_SHA=$(vm "sha256sum $BUNDLE_VM | cut -d' ' -f1" | tr -d '\r\n')
-HOST_SHA=$(sha256_of "$OUT_BUNDLE")
+# Both digests are checked for status AND for emptiness. An empty digest on
+# both sides compares equal, which is the one way this verification can pass
+# while proving nothing -- and the notes it feeds tell an operator to run
+# `sha256sum -c` against a blank.
+VM_SHA=$(vm "sha256sum $BUNDLE_VM | cut -d' ' -f1" | tr -d '\r\n') \
+    || die "could not read the bundle checksum inside the VM"
+[ -n "$VM_SHA" ] || die "the VM returned an empty bundle checksum"
+HOST_SHA=$(harness_sha256_of "$OUT_BUNDLE") \
+    || die "neither sha256sum nor shasum is available -- cannot verify the artifact"
+[ -n "$HOST_SHA" ] || die "the host checksum of $OUT_BUNDLE came back empty"
 [ "$VM_SHA" = "$HOST_SHA" ] || die "checksum mismatch after copy (VM=$VM_SHA host=$HOST_SHA)"
 echo "  $(du -h "$OUT_BUNDLE" | cut -f1)  sha256 ${HOST_SHA:0:16}...  (verified end to end)"
 
@@ -176,7 +195,7 @@ echo "  $NOTES ($(wc -l < "$NOTES" | tr -d ' ') lines)"
 step "Creating the GitHub release"
 #############################################
 GH_ARGS=(release create "$TAG" "$OUT_BUNDLE"
-         --title "$TAG — Docker $TARGET_DOCKER / containerd.io $TARGET_CONTAINERD"
+         --title "$TAG — Docker $TARGET_DOCKER / containerd.io $TARGET_CONTAINERD-$TARGET_CONTAINERD_RELEASE"
          --notes-file "$NOTES"
          --target "$COMMIT")
 [ "$DRAFT" = true ] && GH_ARGS+=(--draft)

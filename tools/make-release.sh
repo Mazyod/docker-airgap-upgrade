@@ -29,17 +29,12 @@ RED=$'\033[0;31m'; GREEN=$'\033[0;32m'; YELLOW=$'\033[1;33m'; NC=$'\033[0m'
 die() { echo "${RED}ERROR${NC}: $*" >&2; exit 1; }
 step() { printf '\n%s==>%s %s\n' "$GREEN" "$NC" "$1"; }
 
-# SHA-256 of a file, on either host. Stock macOS has `shasum` but no
-# `sha256sum`; most Linux distributions have `sha256sum` but not `shasum`.
-# Print only the digest, so callers do not have to cut it out.
+# harness_sha256_of (tests/vm/lib.sh) prefers sha256sum and falls back to
+# `shasum -a 256`, because stock macOS has no sha256sum. Wrap it so a host with
+# neither dies here rather than silently comparing an empty digest.
 sha256_of() {
-    if command -v sha256sum >/dev/null 2>&1; then
-        sha256sum "$1" | cut -d' ' -f1
-    elif command -v shasum >/dev/null 2>&1; then
-        shasum -a 256 "$1" | cut -d' ' -f1
-    else
-        die "neither sha256sum nor shasum is available -- cannot verify the artifact"
-    fi
+    harness_sha256_of "$1" \
+        || die "neither sha256sum nor shasum is available -- cannot verify the artifact"
 }
 
 TAG="${1:-}"

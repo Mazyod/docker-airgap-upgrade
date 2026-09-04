@@ -64,6 +64,19 @@ bad()  { printf '  %sFAIL%s %s\n' "$RED" "$NC" "$1";   FAIL=$((FAIL + 1)); }
 skip() { printf '  %sSKIP%s %s\n' "$YELLOW" "$NC" "$1"; SKIP=$((SKIP + 1)); }
 head_(){ printf '\n== %s ==\n' "$1"; }
 
+# SHA-256 of a file on the HOST, on either kind of host. Stock macOS has
+# `shasum` but no `sha256sum`; most Linux distributions have the reverse.
+# Prints the bare digest; returns non-zero when neither tool exists.
+harness_sha256_of() {
+    if command -v sha256sum >/dev/null 2>&1; then
+        sha256sum "$1" | cut -d' ' -f1
+    elif command -v shasum >/dev/null 2>&1; then
+        shasum -a 256 "$1" | cut -d' ' -f1
+    else
+        return 1
+    fi
+}
+
 #############################################
 # Backend selection
 #############################################
@@ -116,7 +129,13 @@ require_vm() {
         echo "ERROR: VM '$VM_NAME' does not exist. Run tests/vm/bootstrap-vm.sh first." >&2
         exit 1
     fi
-    vm_wake >/dev/null 2>&1 || true
+    # Do NOT swallow this. A guest that will not come up, or one whose repo
+    # bind mount does not resolve to this checkout, must stop the run here
+    # rather than produce failures further down that look like product bugs.
+    if ! vm_wake; then
+        echo "ERROR: VM '$VM_NAME' exists but is not usable." >&2
+        exit 1
+    fi
 }
 
 #############################################

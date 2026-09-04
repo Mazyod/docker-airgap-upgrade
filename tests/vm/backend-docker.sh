@@ -156,17 +156,43 @@ vm_create() {
 
     _vm_wait_systemd || return 1
 
-    # The endpoint check in need_backend is a heuristic -- a local unix socket
-    # could still front a remote daemon. This is the definitive test: the guest
-    # must be able to READ this checkout at its own absolute path, because every
-    # file-transfer site in the harness is a plain `cp` that depends on it.
-    if ! docker exec "$VM_NAME" test -f "$HARNESS_LIB_DIR/vm-write-manifest.sh"; then
-        echo "ERROR: the repo is not visible inside '$VM_NAME' at $HARNESS_REPO_DIR." >&2
-        echo "       The bind mount did not resolve to this checkout, so the daemon is" >&2
-        echo "       not looking at this filesystem. Every harness file transfer depends" >&2
-        echo "       on that path being identical inside and outside the guest." >&2
+    _vm_verify_repo_mount
+}
+
+# The endpoint check in need_backend is a heuristic: a local unix socket can
+# still front a daemon on another filesystem -- Docker Desktop and any socket
+# forwarder do exactly that -- and such a daemon may well have SOMETHING at
+# $HARNESS_REPO_DIR. A stale checkout there would satisfy a mere existence test
+# and then silently run the wrong scripts.
+#
+# So compare content. Every file-transfer site in the harness is a plain `cp`
+# from a path that must be identical inside and outside the guest; this proves
+# the guest is reading THIS checkout.
+_vm_verify_repo_mount() {
+    local sentinel="$HARNESS_LIB_DIR/vm-write-manifest.sh"
+    local want got
+    if ! want=$(harness_sha256_of "$sentinel"); then
+        echo "ERROR: neither sha256sum nor shasum is available on this host, so the" >&2
+        echo "       repo bind mount cannot be verified." >&2
         return 1
     fi
+    got=$(docker exec "$VM_NAME" sha256sum "$sentinel" 2>/dev/null | cut -d' ' -f1)
+    if [ -z "$got" ]; then
+        echo "ERROR: the repo is not visible inside '$VM_NAME' at $HARNESS_REPO_DIR." >&2
+        echo "       The bind mount did not resolve, so the daemon is not looking at" >&2
+        echo "       this filesystem. Every harness file transfer depends on that path" >&2
+        echo "       being identical inside and outside the guest." >&2
+        return 1
+    fi
+    if [ "$want" != "$got" ]; then
+        echo "ERROR: '$VM_NAME' sees a DIFFERENT copy of the repo at $HARNESS_REPO_DIR." >&2
+        echo "       host  $sentinel -> $want" >&2
+        echo "       guest $sentinel -> $got" >&2
+        echo "       The daemon is bind-mounting some other checkout -- likely a remote" >&2
+        echo "       or forwarded daemon. The harness would run the wrong scripts." >&2
+        return 1
+    fi
+    return 0
 }
 
 # REPORT any host loop device still backed by this harness's data image.
@@ -255,7 +281,11 @@ vm_delete() {
 
 vm_wake() {
     _vm_running || docker start "$VM_NAME" >/dev/null 2>&1 || true
-    _vm_wait_systemd
+    _vm_wait_systemd || return 1
+    # Re-check on every wake, not only at create: the mount is re-established
+    # each time the container starts, and the daemon it resolves against may
+    # have changed since.
+    _vm_verify_repo_mount
 }
 
 # Restart the guest. Used only by preflight-host.sh, to prove that the

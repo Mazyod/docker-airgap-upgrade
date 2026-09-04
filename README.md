@@ -188,17 +188,24 @@ containerd bump they are inert or harmful. All three remain in git history at
 | Script | Version | Purpose | Run On |
 |---|---|---|---|
 | `download-docker-packages.sh` | 2.3.0 | Download all packages, build the bundle | Online RHEL server |
-| `upgrade-docker.sh` | 2.4.0 | Perform the upgrade | Air-gapped servers |
+| `upgrade-docker.sh` | 2.5.0 | Perform the upgrade | Air-gapped servers |
 | `rollback-docker.sh` | 2.2.1 | Roll back to 29.1.5 | Failed upgrade recovery |
-| `clean-swarm-networks.sh` | 1.1.1 | Reset orphaned overlay network state | Node that can't rejoin overlays |
+| `clean-swarm-networks.sh` | 1.2.0 | Reset orphaned overlay network state | Node that can't rejoin overlays |
 | `recover-dnf.sh` | 1.2.2 | Fix dependency issues | Servers with broken dnf |
 | `simulate-upgrade.sh` | — | Test the upgrade path in a VM | RHEL test VM |
 
 Script versions drift on purpose — only scripts that actually changed get bumped.
 
 The three stateful scripts accept `--status-file=PATH`, `--help` and `--version`, and refuse
-to run as a non-root user. `upgrade-docker.sh` also accepts `--preflight`. No flag answers a
-prompt.
+to run as a non-root user. `upgrade-docker.sh` also accepts `--preflight`.
+
+`upgrade-docker.sh` and `clean-swarm-networks.sh` additionally accept `--non-interactive` and
+one flag per question — `--drain-self`, `--assume-drained`, `--confirm-stop` and so on, each
+with a `--no-` form. Every flag states one fact the caller is accountable for; none performs
+the thing it asserts. `--non-interactive` is a strictness switch, not a consent switch: it
+grants nothing, and an unanswered question becomes a refusal that names the missing flag rather
+than a default. It requires `--status-file`, because without the record an exit 1 cannot be
+told from a failure. `rollback-docker.sh` still needs a terminal.
 
 `--preflight` runs every check that can be made with the node untouched and then exits,
 changing nothing: no service stopped, no package installed, no directory created. It exits 0
@@ -208,7 +215,7 @@ transaction with both services stopped. A relocated containerd root whose filesy
 mounted is found there on a node that is already down; preflight finds it on a node where
 everything is still running and refusing costs nothing.
 
-**Running these from an agent rather than by hand?** Read `docs/AGENT-RUNBOOK.md`, which covers the prompts, the ambiguous exit codes and the failure decision table in one place. Note that the upgrade, rollback and network-cleanup *runs* are interactive today and refuse a closed stdin, so an agent needs a real terminal for those. `--preflight` never prompts and does run unattended. (`recover-dnf.sh` is the other exception: it skips its Option A and exits 0.)
+**Running these from an agent rather than by hand?** Read `docs/AGENT-RUNBOOK.md`, which covers the gates and their flags, the status file, the exit codes and the decision table in one place. `upgrade-docker.sh` and `clean-swarm-networks.sh` run unattended with `--non-interactive` plus the gate flags; `rollback-docker.sh` still refuses a closed stdin and needs a real terminal. (`recover-dnf.sh` is the other exception, in the opposite direction: it skips its Option A and exits 0.)
 
 ## Usage
 
@@ -368,17 +375,16 @@ would silently orphan every image and snapshot on the node.
 
 | Tier | Status for 29.8.0 | How |
 |---|---|---|
-| Static | **216/216** | `./tests/static-checks.sh --online` |
+| Static | **233/233** | `./tests/static-checks.sh --online` |
 | VM (real execution) | **67/67** | `./tests/vm/bootstrap-vm.sh && ./tests/vm/build-bundle.sh && ./tests/vm/tier2-run.sh` |
-| VM agent mode | **312/312** | `./tests/vm/tier2-run.sh agent` |
+| VM agent mode | **486/486** | `./tests/vm/tier2-run.sh agent` |
 | VM config-version boundary | **30/30** | `./tests/vm/config-version-check.sh` |
 | Negative control | **3/3** | `./tests/vm/negative-control.sh` |
-| Agent negative control | **3/3 mutants** | `./tests/vm/agent-mode-negative-control.sh` |
-| Swarm | **not run** | needs a multi-node cluster — see `docs/TEST-PLAN.md` Tier 3 |
+| Agent negative control | **4/4 mutants** | `./tests/vm/agent-mode-negative-control.sh` |
+| Multi-node Swarm | **not run** | needs a multi-node cluster — see `docs/TEST-PLAN.md` Tier 3 |
 
 The VM rows were measured on Rocky Linux 9 via the Docker backend, against a bundle
-rebuilt from the checkout at commit `093a927`, with the guest recreated from scratch
-and the baseline reset between suites. The `agent` phase is a separate invocation
+rebuilt from the checkout at commit `9c56f16`, with the baseline reset between suites. The `agent` phase is a separate invocation
 (`tier2-run.sh agent`) and carries its own figure; the two are not additive. See
 `docs/TEST-PLAN.md`.
 
@@ -393,10 +399,15 @@ Docker — with containerd's root relocated to a separate XFS filesystem holding
 images, containers and volume data. It covers the phase-0 rejections, the real
 upgrade, config preservation, idempotent re-run, and rollback.
 
-**Swarm behaviour is entirely untested** — drain, reactivation, overlay
-reconvergence, mixed-version operation and `clean-swarm-networks.sh`. Tier 3 in
-`docs/TEST-PLAN.md` is mandatory before a production rollout, and specifically 3.3/3.4
-are what authorize rolling node by node.
+**Swarm coverage is now partial, and the boundary matters.** The agent-mode phase builds a
+single-node Swarm with `docker swarm init`, so a **manager draining and reactivating itself**
+is exercised for real, as are the cleanup script's gates. Everything else about Swarm is still
+untested: **worker** behaviour of any kind (a single node is always its own manager, and
+demoting the last manager is refused), multi-node operation, overlay reconvergence, mixed
+versions, and the destructive half of `clean-swarm-networks.sh`.
+
+Tier 3 in `docs/TEST-PLAN.md` is still mandatory before a production rollout, and
+specifically 3.3/3.4 are what authorize rolling node by node.
 
 ## Notes
 

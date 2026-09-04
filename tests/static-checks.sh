@@ -728,7 +728,11 @@ cmp_fn() {
 
 cmp_fn verify_unit_stopped upgrade-docker.sh rollback-docker.sh clean-swarm-networks.sh
 cmp_fn start_services      rollback-docker.sh clean-swarm-networks.sh
-cmp_fn prompt_yes_no       upgrade-docker.sh clean-swarm-networks.sh
+# All THREE now, not two. rollback-docker.sh keeps prompt_yes_no as its only
+# prompt path (it has no gate()), and the EOF refusal is what makes
+# --non-interactive a strictness switch rather than a way to auto-answer -- so a
+# copy that lost it in ANY of the three is the same hazard.
+cmp_fn prompt_yes_no       upgrade-docker.sh rollback-docker.sh clean-swarm-networks.sh
 cmp_fn read_config_version upgrade-docker.sh rollback-docker.sh
 # The run-record machinery is duplicated across the three stateful scripts and
 # MUST NOT drift. A copy that loses the STATUS_OK accumulator or the terminator
@@ -740,6 +744,17 @@ cmp_fn write_status_file  upgrade-docker.sh rollback-docker.sh clean-swarm-netwo
 cmp_fn derive_result      upgrade-docker.sh rollback-docker.sh clean-swarm-networks.sh
 cmp_fn unit_state         upgrade-docker.sh rollback-docker.sh clean-swarm-networks.sh
 cmp_fn unit_is_stopped    upgrade-docker.sh rollback-docker.sh clean-swarm-networks.sh
+# gate() is the only new code on the prompt path. A copy that lost its
+# --non-interactive branch would fall through to prompt_yes_no and be answered
+# by whatever stdin happened to carry -- from ONE script only, which is exactly
+# the divergence nobody notices. rollback-docker.sh has no gate(): its single
+# prompt becomes a value flag, so the wrapper would be dead code there.
+cmp_fn gate               upgrade-docker.sh clean-swarm-networks.sh
+# set_gate refuses a contradictory pair rather than letting the last flag win.
+# A copy that lost the refusal would take --drain-self --no-drain-self as "no"
+# in one script and "no" in the other for a different reason -- and nobody
+# would notice until an appended default silently overrode a real answer.
+cmp_fn set_gate           upgrade-docker.sh clean-swarm-networks.sh
 
 #############################################
 head_ "1.12  Every helper called is also defined"
@@ -760,7 +775,7 @@ for s in "${SCRIPTS[@]}"; do
               containerd_release_matches check_containerd_release \
               status_kv status_common status_keys write_status_file \
               derive_result derive_next_action capture_after_versions usage \
-              unit_state unit_is_stopped; do
+              unit_state unit_is_stopped gate set_gate predict_gates; do
         # Does the script reference it anywhere other than its own definition?
         refs=$(grep -vE '^\s*#' "$s" | grep -cE "(^|[^[:alnum:]_])${fn}( |$|\")" || true)
         defs=$(grep -cE "^${fn}\(\) \{" "$s" || true)
@@ -1162,14 +1177,138 @@ else
     bad "negative-control.sh does not scope its mutation to phase 6"
 fi
 
-# Preflight must not advertise gate keys it cannot compute. Two of the six
-# gates depend on what the run DOES, not on what a node at rest looks like, and
-# a list that silently omits them is worse than no list.
-if grep -qE '^[[:space:]]*status_kv gates_' upgrade-docker.sh; then
-    bad "upgrade-docker.sh emits gate keys; preflight cannot predict them yet"
+# Preflight must advertise BOTH gate lists. Two of the six gates depend on what
+# the run DOES rather than on what a node at rest looks like, so a single list
+# would silently omit them -- worse than no list at all.
+gk_missing=""
+for k in gates_required gates_conditional gates_answered gates_unanswered; do
+    grep -qE "^[[:space:]]*status_kv $k " upgrade-docker.sh || gk_missing="$gk_missing $k"
+done
+if [ -z "$gk_missing" ]; then
+    ok "upgrade-docker.sh emits both predicted gate lists"
 else
-    ok "upgrade-docker.sh emits no gate keys"
+    bad "upgrade-docker.sh does not emit:$gk_missing"
 fi
+
+# The EOF refusal is what makes --non-interactive a strictness switch rather
+# than a way to auto-answer. If prompt_yes_no ever stopped refusing a closed
+# stdin, a wrapper piping /dev/null would answer every gate the flags left
+# unanswered -- including the three that default to yes.
+for s in upgrade-docker.sh rollback-docker.sh clean-swarm-networks.sh; do
+    # Scoped to prompt_yes_no's own body. Searching the whole file would be
+    # satisfied by the string sitting in a comment, or in dead code, while the
+    # read that is supposed to refuse had been relaxed.
+    pyn=$(awk '/^prompt_yes_no\(\) \{/,/^\}/' "$s")
+    if printf '%s\n' "$pyn" | grep -q 'stdin closed - cannot read an answer' &&
+       printf '%s\n' "$pyn" | grep -q 'if ! read -r -p'; then
+        ok "$s still refuses a closed stdin inside prompt_yes_no"
+    else
+        bad "$s no longer refuses a closed stdin inside prompt_yes_no"
+    fi
+done
+
+# Gate/flag parity, in BOTH directions, plus predictor coverage.
+#
+# The predictor half is a NAME check and its limit is worth stating: it catches
+# a gate that was added and never predicted, which is the stated drift hazard.
+# It does NOT catch one branch of a multi-branch prediction being wrong -- a
+# name added in two places survives losing one of them. Tier 2 cases 2.36a
+# through 2.36j are the pair for that; 2.36c fails against exactly that mutant.
+#
+#   - every name passed to `gate` has a --NAME and a --no-NAME parser arm
+#   - every gate name the parser records is actually passed to `gate`
+#   - every gate name appears in that script's predict_gates
+#
+# The third is the drift guard the preflight predictor needs: add a gate and
+# forget the predictor, and preflight reports a clean bill while the real run
+# refuses.
+for s in upgrade-docker.sh clean-swarm-networks.sh; do
+    # `gate $name` inside the definition does not match: the pattern requires a
+    # literal lowercase name, not an expansion.
+    called=$(grep -vE '^[[:space:]]*#' "$s" \
+        | grep -oE '(^|[^_[:alnum:]])gate [a-z][a-z-]*' \
+        | awk '{print $NF}' | LC_ALL=C sort -u)
+    # SCOPED to the argument loop. A dead `--name)` arm anywhere else in the
+    # file would otherwise satisfy the existence checks below.
+    argloop=$(awk '/^while \[ "\$#" -gt 0 \]; do/,/^done$/' "$s")
+    recorded=$(printf '%s\n' "$argloop" | grep -oE 'set_gate [a-z][a-z-]* [yn]' \
+        | awk '{print $2}' | LC_ALL=C sort -u)
+    # Comments stripped, AND the canonical-order list dropped: every gate name
+    # appears in that string, so leaving it in would let the branch that
+    # actually computes a gate be deleted while this check stayed green.
+    pred=$(awk '/^predict_gates\(\) \{/,/^\}/' "$s" \
+        | grep -vE '^[[:space:]]*#' | grep -v 'local ALL=')
+    gp_bad=""
+    if [ -z "$called" ]; then
+        bad "$s passes no gate names to gate()"
+        continue
+    fi
+    for g in $called; do
+        # Both polarities, and both must route through set_gate, which is what
+        # refuses a contradictory pair.
+        printf '%s\n' "$argloop" | grep -qE "^[[:space:]]*--${g}\)[[:space:]]+set_gate ${g} y ;;" \
+            || gp_bad="$gp_bad no--$g"
+        printf '%s\n' "$argloop" | grep -qE "^[[:space:]]*--no-${g}\)[[:space:]]+set_gate ${g} n ;;" \
+            || gp_bad="$gp_bad no--no-$g"
+        # In an ASSIGNMENT to one of the two lists, not merely present. Every
+        # name also appears in a GATE_ANSWERS lookup inside the predictor, so a
+        # bare presence test stays green with the branch that adds the gate
+        # deleted.
+        # No trailing quote: one assignment can add two names at once, as the
+        # cleanup predictor's "assume-drained,confirm-stop" does.
+        printf '%s\n' "$pred" | grep -qE "(req|cond)=\"[^\"]*${g}" \
+            || gp_bad="$gp_bad unpredicted:$g"
+    done
+    # $called is newline-separated; the membership test below compares on
+    # SPACES, so flatten it first. Without this every flag reads as unused.
+    called_flat=$(printf '%s\n' "$called" | tr '\n' ' ')
+    for g in $recorded; do
+        case " $called_flat " in
+            *" $g "*) ;;
+            *) gp_bad="$gp_bad unused-flag:$g" ;;
+        esac
+    done
+    if [ -z "$gp_bad" ]; then
+        ok "$s gate/flag parity holds both ways ($(printf '%s\n' "$called" | grep -c .) gates)"
+    else
+        bad "$s gate/flag parity broken:$gp_bad"
+    fi
+done
+
+# Every `gate` call site must be a CONDITION. gate returns 1 for "no", exactly
+# like prompt_yes_no, and a bare `gate ...` under `set -e` kills the script on
+# a perfectly ordinary no. The same rule already applies to prompt_yes_no and
+# to config_is_loadable.
+for s in upgrade-docker.sh clean-swarm-networks.sh; do
+    bare=$(grep -nE '(^|[^_[:alnum:]])gate [a-z][a-z-]*' "$s" \
+        | grep -vE '^[0-9]+:[[:space:]]*#' \
+        | grep -vE '^[0-9]+:[[:space:]]*(if|elif)[[:space:]]+(! )?gate[[:space:]]' || true)
+    if [ -z "$bare" ]; then
+        ok "$s calls gate only from a condition"
+    else
+        bad "$s has a bare gate call, which set -e turns into an abort"
+        printf '%s\n' "$bare" | sed 's/^/       /'
+    fi
+done
+
+# prompt_yes_no must not be called directly any more in the two scripts that
+# have gate(). A surviving direct call is a prompt no flag can pre-answer and
+# no --non-interactive run can refuse: it just reads stdin.
+for s in upgrade-docker.sh clean-swarm-networks.sh; do
+    # Excluded by LOCATION -- the line range of gate() -- not by matching the
+    # wrapper's own text, which a second direct call could reuse verbatim.
+    g_from=$(grep -n '^gate() {' "$s" | head -1 | cut -d: -f1)
+    g_to=$(awk -v f="${g_from:-0}" 'NR > f && /^\}/ { print NR; exit }' "$s")
+    direct=$(grep -nE '(^|[^_[:alnum:]])prompt_yes_no ' "$s" \
+        | grep -vE '^[0-9]+:[[:space:]]*#' \
+        | awk -F: -v a="${g_from:-0}" -v b="${g_to:-0}" '$1 < a || $1 > b' || true)
+    if [ -z "$direct" ]; then
+        ok "$s reaches prompt_yes_no only through gate()"
+    else
+        bad "$s calls prompt_yes_no directly, bypassing the gate flags"
+        printf '%s\n' "$direct" | sed 's/^/       /'
+    fi
+done
 
 # The preflight exit must sit AFTER phase 0 and BEFORE phase 2. Earlier and it
 # skips the payload validation that is the bulk of what it exists to run;

@@ -23,6 +23,10 @@ normal rollback is unaffected. But if anyone runs
 node can no longer be rolled back until the config is reverted — `rollback-docker.sh`
 phase 0c detects this and stops before touching anything. Don't run that command.
 
+> **Driving this from an agent rather than by hand?** `docs/AGENT-RUNBOOK.md` is the
+> operating guide: the gate flags, `--preflight`, the `--status-file` record and the
+> decision table, in one document. This file stays the human procedure and the timings.
+
 ---
 
 ## Before you start

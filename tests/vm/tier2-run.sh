@@ -20,7 +20,7 @@
 #   tests/vm/tier2-run.sh reject     # rejection tests only
 #   tests/vm/tier2-run.sh upgrade    # upgrade + assertions only
 #   tests/vm/tier2-run.sh rollback   # rollback only
-#   tests/vm/tier2-run.sh agent      # agent-mode cases only (2.29a-2.29h)
+#   tests/vm/tier2-run.sh agent      # agent-mode cases only (2.29-2.38)
 #
 # The `agent` phase is separate on purpose. The reject/upgrade/rollback phases
 # are the interactive-path regression gate and their assertion count must not
@@ -791,7 +791,12 @@ restore_pf_config() {
             [ -f \"\$b\" ] && mv -f \"\$b\" /etc/containerd/config.toml
         done; true" >/dev/null 2>&1 || true
 }
-trap 'restore_pf_config' EXIT INT TERM
+# INT and TERM route through the EXIT trap rather than doing the cleanup and
+# letting bash resume the suite -- a signal that only ran a handler would leave
+# the next case running against a half-restored guest.
+trap 'restore_pf_config' EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
 # --- 2.30a: preflight on a healthy node reports ready and changes nothing ---
 capture_strict_state a30a
@@ -1047,6 +1052,400 @@ else
     bad "2.30f preflight generated /etc/containerd/config.toml -- it must not write one"
 fi
 vm "mv -f /etc/containerd/config.toml.pf30f /etc/containerd/config.toml" >/dev/null 2>&1
+
+
+#############################################
+head_ "2.31-2.38  Agent mode: gates, flags and --non-interactive"
+#############################################
+# Slice 4. Every case here asserts STATE, not the exit code. A gate that failed
+# open would also exit non-zero -- just later, and after the node was drained
+# and upgraded -- so a status check alone proves nothing about a guard whose
+# job is to refuse.
+#
+# The guest becomes a single-node Swarm MANAGER, which is what arms the drain,
+# task-count and reactivation gates. It cannot become a worker: demoting the
+# only manager is refused. The worker gate and the worker predictor state stay
+# untested here, and this suite says so rather than pretending otherwise.
+./reset-baseline.sh >/dev/null 2>&1
+restore_pkgs
+vm "rm -f $SF" >/dev/null 2>&1
+
+# Armed BEFORE the Swarm exists. An interrupted suite must not leave the guest
+# in a Swarm for the next one, and it must still restore the 2.30 config. INT
+# and TERM route through EXIT so a signal cannot run the handler and then let
+# bash carry on into the next case.
+trap 'restore_pf_config; swarm_leave' EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
+if swarm_init; then
+    ok "2.31 fixture: guest is a single-node Swarm manager"
+else
+    bad "2.31 fixture: could not create the Swarm -- every gate case below is vacuous"
+fi
+assert_node_availability "2.31 fixture" active
+
+# --- 2.31: an unanswered gate fails closed, node untouched ---
+capture_strict_state a31
+rc=$(vm_try "cd /opt/docker-offline && ./upgrade-docker.sh --non-interactive --status-file=$SF </dev/null >/dev/null 2>&1; echo \$?" | tail -1)
+if [ "$rc" = "1" ]; then
+    ok "2.31 unanswered gate exits 1"
+else
+    bad "2.31 unanswered gate exited '$rc', want 1"
+fi
+assert_status_key "2.31" "$SF" result refused
+assert_status_key "2.31" "$SF" refusal_reason gate-unanswered:drain-self
+assert_status_key "2.31" "$SF" next_action supply-flag
+assert_status_key "2.31" "$SF" pkg_state untouched
+assert_status_key "2.31" "$SF" mode non-interactive
+assert_status_complete "2.31" "$SF"
+gu=$(status_key "$SF" gates_unanswered)
+case ",$gu," in
+    *,drain-self,*) ok "2.31 gates_unanswered names drain-self ($gu)" ;;
+    *) bad "2.31 gates_unanswered is '$gu' and does not name drain-self" ;;
+esac
+# The refusal must name the flag, or an agent cannot act on it.
+out=$(vm_try "cd /opt/docker-offline && ./upgrade-docker.sh --non-interactive --status-file=$SF </dev/null 2>&1")
+if printf '%s' "$out" | grep -q -- "--drain-self or --no-drain-self"; then
+    ok "2.31 the refusal names both flags"
+else
+    bad "2.31 the refusal does not name the flags"
+fi
+# STATE: this is the assertion that matters. A fall-through that drained and
+# upgraded the node would also exit non-zero, eventually.
+assert_untouched_strict "2.31" baseline a31
+assert_node_availability "2.31" active
+
+# --- 2.32: --non-interactive never reads stdin ---
+# Identical to 2.31 but with a live `yes y` stream attached. A gate() that fell
+# through to prompt_yes_no gets answered by it and the upgrade proceeds, so
+# ONLY the state assertions catch that. Mutant M3 proves they do.
+vm "rm -f $SF" >/dev/null 2>&1
+capture_strict_state a32
+rc=$(vm_try "cd /opt/docker-offline && yes y | ./upgrade-docker.sh --non-interactive --status-file=$SF >/dev/null 2>&1; echo \$?" | tail -1)
+if [ "$rc" = "1" ]; then
+    ok "2.32 refuses even with a yes stream on stdin (exit 1)"
+else
+    bad "2.32 exited '$rc' with a yes stream attached, want 1"
+fi
+assert_status_key "2.32" "$SF" result refused
+assert_status_key "2.32" "$SF" refusal_reason gate-unanswered:drain-self
+assert_status_key "2.32" "$SF" pkg_state untouched
+assert_status_key "2.32" "$SF" drain_performed false
+# gate() must not have reached prompt_yes_no at all. If it had, the EOF guard
+# would never fire and the stream would have answered -- so the tell is the
+# node, not the log.
+assert_untouched_strict "2.32" baseline a32
+assert_node_availability "2.32" active
+
+# --- 2.33: --non-interactive without --status-file is refused at parse time ---
+vm "rm -f $SF" >/dev/null 2>&1
+capture_strict_state a33
+rc=$(vm_try "cd /opt/docker-offline && ./upgrade-docker.sh --non-interactive --drain-self </dev/null >/dev/null 2>&1; echo \$?" | tail -1)
+if [ "$rc" = "1" ]; then
+    ok "2.33 --non-interactive without --status-file exits 1"
+else
+    bad "2.33 exited '$rc' without a status file, want 1"
+fi
+out=$(vm_try "cd /opt/docker-offline && ./upgrade-docker.sh --non-interactive --drain-self </dev/null 2>&1")
+if printf '%s' "$out" | grep -q -- "--non-interactive requires --status-file"; then
+    ok "2.33 the refusal names the missing flag"
+else
+    bad "2.33 the refusal does not name --status-file"
+fi
+if vm_try "test -e $SF; echo \$?" | tail -1 | grep -qx 1; then
+    ok "2.33 nothing was written to the previous status path"
+else
+    bad "2.33 a status file appeared for a parse-time refusal"
+fi
+assert_untouched_strict "2.33" baseline a33
+assert_node_availability "2.33" active
+
+# --- 2.37: a conditional gate is REPORTED, not refused ---
+# Before the upgrade, while the node is still a baseline active manager.
+# --status-file is mandatory here: without it the run is refused at parse time
+# and this tests nothing.
+vm "rm -f $SF" >/dev/null 2>&1
+capture_strict_state a37
+rc=$(vm_try "cd /opt/docker-offline && ./upgrade-docker.sh --preflight --non-interactive --status-file=$SF --drain-self --reactivate </dev/null >/dev/null 2>&1; echo \$?" | tail -1)
+if [ "$rc" = "0" ]; then
+    ok "2.37 preflight does not refuse over an unanswered CONDITIONAL gate"
+else
+    bad "2.37 preflight exited '$rc' with proceed-with-tasks unanswered, want 0"
+fi
+assert_status_key "2.37" "$SF" result ready
+assert_status_key "2.37" "$SF" refusal_reason ""
+assert_status_key "2.37" "$SF" next_action proceed
+assert_status_key "2.37" "$SF" gates_conditional proceed-with-tasks
+assert_status_key "2.37" "$SF" gates_unanswered proceed-with-tasks
+assert_status_key "2.37" "$SF" gates_answered "drain-self:y,reactivate:y"
+assert_untouched_strict "2.37" baseline a37
+
+# --- 2.36: the gate predictor, one state at a time ---
+# Bare --preflight, deliberately WITHOUT --non-interactive: both lists are then
+# informational and the run cannot refuse, so each assertion is about the
+# prediction alone.
+predict_case() {
+    local label="$1" want_req="$2" want_cond="$3"; shift 3
+    vm "rm -f $SF" >/dev/null 2>&1
+    vm_try "cd /opt/docker-offline && ./upgrade-docker.sh --preflight --status-file=$SF $* </dev/null >/dev/null 2>&1" >/dev/null
+    assert_status_key "$label" "$SF" gates_required "$want_req"
+    assert_status_key "$label" "$SF" gates_conditional "$want_cond"
+}
+
+predict_case "2.36a active manager, --drain-self"    "drain-self,reactivate" "proceed-with-tasks" --drain-self
+predict_case "2.36b active manager, --no-drain-self" "drain-self"            ""                   --no-drain-self
+predict_case "2.36c active manager, neither"         "drain-self"            "proceed-with-tasks,reactivate"
+
+set_node_availability drain || true
+assert_node_availability "2.36d setup" drain
+predict_case "2.36d already-drained manager"         "reactivate"            ""
+# The combination that exposed a real predictor bug: phase 1 never CONSULTS
+# drain-self on an already-drained manager, so --no-drain-self must not
+# suppress the reactivation phase 10 will certainly reach.
+predict_case "2.36d2 already-drained manager, --no-drain-self" \
+                                                     "reactivate"            "" --no-drain-self
+
+set_node_availability pause || true
+assert_node_availability "2.36e setup" pause
+predict_case "2.36e paused manager"                  ""                      ""
+
+set_node_availability active || true
+assert_node_availability "2.36f setup" active
+
+# The worker state cannot be staged here. A single-node Swarm is always its own
+# manager and demoting the last manager is refused, so there is no way to make
+# ControlAvailable false. Say so rather than leave the gap invisible.
+skip "2.36g worker predictor state -- needs a second node (Tier 3)"
+
+swarm_leave
+predict_case "2.36h non-Swarm host"                  ""                      ""
+if swarm_init; then
+    ok "2.36 fixture: Swarm re-created for the remaining cases"
+else
+    bad "2.36 fixture: could not re-create the Swarm"
+fi
+
+# --- 2.34: a full non-interactive upgrade, end to end ---
+vm "rm -f $SF" >/dev/null 2>&1
+conf_before=$(vm_try "sha256sum /etc/containerd/config.toml | cut -d' ' -f1" | tail -1)
+out=$(vm_try "cd /opt/docker-offline && ./upgrade-docker.sh --non-interactive --status-file=$SF --drain-self --proceed-with-tasks --reactivate </dev/null 2>&1")
+if printf '%s' "$out" | grep -q "UPGRADE COMPLETE"; then
+    ok "2.34 full non-interactive upgrade completed"
+else
+    bad "2.34 full non-interactive upgrade did NOT complete"
+    printf '%s\n' "$out" | tail -25 | sed 's/^/       /'
+fi
+assert_status_complete "2.34" "$SF"
+assert_status_key "2.34" "$SF" result completed
+assert_status_key "2.34" "$SF" exit_code 0
+assert_status_key "2.34" "$SF" mode non-interactive
+assert_status_key "2.34" "$SF" pkg_state installed
+assert_status_key "2.34" "$SF" swarm_active true
+assert_status_key "2.34" "$SF" swarm_role manager
+# Both availability transitions, which is what an orchestrator has to confirm.
+assert_status_key "2.34" "$SF" node_availability_before active
+assert_status_key "2.34" "$SF" node_availability_after active
+assert_status_key "2.34" "$SF" drain_performed true
+# The record says a FLAG was trusted, not that a check was performed.
+assert_status_key "2.34" "$SF" drain_attested_by flag
+assert_status_key "2.34" "$SF" tasks_remaining 0
+# --proceed-with-tasks was on the command line, and the run never needed it:
+# the drain left zero tasks, so that gate is not reached. gates_seen records
+# what was REACHED, which is the point of having it beside gates_answered.
+# A pre-answer for a gate the run does not reach must be harmless.
+gs=$(status_key "$SF" gates_seen)
+if [ "$gs" = "drain-self,reactivate" ]; then
+    ok "2.34 gates_seen records only the gates actually reached ($gs)"
+else
+    bad "2.34 gates_seen is '$gs', want 'drain-self,reactivate'"
+fi
+assert_status_key "2.34" "$SF" gates_answered "drain-self:y,proceed-with-tasks:y,reactivate:y"
+assert_pkg_profile "2.34" target
+assert_vm_eq "2.34 containerd config unchanged by the upgrade" \
+    "sha256sum /etc/containerd/config.toml | cut -d' ' -f1" "$conf_before"
+assert_vm_eq "2.34 canary data intact" \
+    "docker start survivor >/dev/null 2>&1; docker exec survivor cat /data/canary.txt" \
+    "VOLUME-CANARY-DATA"
+assert_vm_eq "2.34 docker active after the run" "systemctl is-active docker" "active"
+assert_vm_eq "2.34 containerd active after the run" "systemctl is-active containerd" "active"
+# The node really is back in service, not merely reported as such.
+assert_node_availability "2.34" active
+
+# --- 2.35: non-interactive already-at-target exits 3 ---
+# Package versions cannot detect this on their own: a forced same-version
+# re-run ends at the same versions. Assert that no new backup directory
+# appeared and that phase 4 never ran.
+vm "rm -f $SF" >/dev/null 2>&1
+capture_strict_state a35
+p4_before=$(vm_try "grep -c '=== Phase 4: Stop Services ===' /var/log/docker-upgrade.log 2>/dev/null || echo 0" | tail -1)
+rc=$(vm_try "cd /opt/docker-offline && ./upgrade-docker.sh --non-interactive --status-file=$SF </dev/null >/dev/null 2>&1; echo \$?" | tail -1)
+if [ "$rc" = "3" ]; then
+    ok "2.35 already-at-target under --non-interactive exits 3"
+else
+    bad "2.35 exited '$rc' on an at-target node, want 3"
+fi
+assert_status_key "2.35" "$SF" result nothing-to-do
+assert_status_key "2.35" "$SF" next_action none
+assert_status_key "2.35" "$SF" node_class at-target
+assert_status_key "2.35" "$SF" refusal_reason ""
+assert_status_key "2.35" "$SF" pkg_state untouched
+gr=$(status_key "$SF" gates_required)
+case ",$gr," in
+    *,rerun-at-target,*) ok "2.35 gates_required names rerun-at-target ($gr)" ;;
+    *) bad "2.35 gates_required is '$gr' and does not name rerun-at-target" ;;
+esac
+p4_after=$(vm_try "grep -c '=== Phase 4: Stop Services ===' /var/log/docker-upgrade.log 2>/dev/null || echo 0" | tail -1)
+if [ "$p4_before" = "$p4_after" ]; then
+    ok "2.35 phase 4 never ran (markers $p4_after)"
+else
+    bad "2.35 phase 4 marker count changed ($p4_before -> $p4_after) -- the run did work"
+fi
+assert_untouched_strict "2.35" target a35
+assert_node_availability "2.35" active
+
+# --- 2.36i: an at-target node reaches NO Swarm gate unless it re-runs ---
+# The default answer to the re-run offer is no, and that branch exits before
+# phase 1. Listing the drain as "certainly reached" for such a node would be
+# false, and would make an agent supply a flag the run never uses.
+#
+# The node is at target here, straight after 2.35.
+predict_case "2.36i at-target, no rerun flag"   "rerun-at-target"                    ""
+predict_case "2.36j at-target, --rerun-at-target" \
+    "rerun-at-target,drain-self" "proceed-with-tasks,reactivate" --rerun-at-target
+
+# --- 2.33a: contradictory flags are refused, not resolved by order ---
+# Each flag states one fact. Letting the last one win is how a wrapper that
+# appends a default silently overrides a deliberate answer.
+vm "rm -f $SF" >/dev/null 2>&1
+capture_strict_state a33a
+rc=$(vm_try "cd /opt/docker-offline && ./upgrade-docker.sh --drain-self --no-drain-self --status-file=$SF </dev/null >/dev/null 2>&1; echo \$?" | tail -1)
+if [ "$rc" = "1" ]; then
+    ok "2.33a --drain-self --no-drain-self exits 1"
+else
+    bad "2.33a contradictory flags exited '$rc', want 1"
+fi
+out=$(vm_try "cd /opt/docker-offline && ./upgrade-docker.sh --drain-self --no-drain-self --status-file=$SF </dev/null 2>&1")
+if printf '%s' "$out" | grep -q "were both given"; then
+    ok "2.33a the refusal names the contradiction"
+else
+    bad "2.33a the refusal does not explain the contradiction"
+fi
+assert_untouched_strict "2.33a" target a33a
+
+# --- the cleanup script's own gates ---
+swarm_leave
+./reset-baseline.sh >/dev/null 2>&1
+restore_pkgs
+
+# --- 2.38: --confirm-delete alone is refused, in every mode ---
+# The inventory is enumerated only AFTER the services stop, so a pre-declared
+# yes would authorise deleting a list nothing had seen. Assert TEMPORALLY that
+# the services were never stopped: finding them active afterwards would also
+# hold after a stop, a delete and a restart.
+vm "rm -f $SF" >/dev/null 2>&1
+vm "mkdir -p /var/run/docker/netns && touch /var/run/docker/netns/gate-canary" >/dev/null 2>&1
+p2_before=$(vm_try "grep -c '=== Phase 2: Stop Services ===' /var/log/docker-network-cleanup.log 2>/dev/null || echo 0" | tail -1)
+rc=$(vm_try "cd /opt/docker-offline && ./clean-swarm-networks.sh --non-interactive --status-file=$SF --confirm-delete </dev/null >/dev/null 2>&1; echo \$?" | tail -1)
+if [ "$rc" = "1" ]; then
+    ok "2.38 --confirm-delete without an inventory hash exits 1"
+else
+    bad "2.38 --confirm-delete exited '$rc', want 1"
+fi
+assert_status_key "2.38" "$SF" result refused
+assert_status_key "2.38" "$SF" refusal_reason inventory-sha-required
+assert_status_key "2.38" "$SF" next_action rerun-dry-run
+assert_status_key "2.38" "$SF" deleted false
+assert_status_complete "2.38" "$SF"
+p2_after=$(vm_try "grep -c '=== Phase 2: Stop Services ===' /var/log/docker-network-cleanup.log 2>/dev/null || echo 0" | tail -1)
+if [ "$p2_before" = "$p2_after" ]; then
+    ok "2.38 services were never stopped (phase 2 markers $p2_after)"
+else
+    bad "2.38 phase 2 marker count changed ($p2_before -> $p2_after) -- it stopped services"
+fi
+if vm_try "test -e /var/run/docker/netns/gate-canary; echo \$?" | tail -1 | grep -qx 0; then
+    ok "2.38 the seeded netns object survived the refusal"
+else
+    bad "2.38 the seeded netns object was DELETED"
+fi
+
+# --- 2.38a: an unanswered cleanup gate refuses before anything stops ---
+vm "rm -f $SF" >/dev/null 2>&1
+rc=$(vm_try "cd /opt/docker-offline && yes y | ./clean-swarm-networks.sh --non-interactive --status-file=$SF >/dev/null 2>&1; echo \$?" | tail -1)
+if [ "$rc" = "1" ]; then
+    ok "2.38a unanswered cleanup gate exits 1 even with a yes stream"
+else
+    bad "2.38a exited '$rc' with a yes stream attached, want 1"
+fi
+assert_status_key "2.38a" "$SF" result refused
+assert_status_key "2.38a" "$SF" refusal_reason gate-unanswered:allow-non-swarm
+assert_status_key "2.38a" "$SF" next_action supply-flag
+assert_status_key "2.38a" "$SF" deleted false
+p2_after=$(vm_try "grep -c '=== Phase 2: Stop Services ===' /var/log/docker-network-cleanup.log 2>/dev/null || echo 0" | tail -1)
+if [ "$p2_before" = "$p2_after" ]; then
+    ok "2.38a services were never stopped (phase 2 markers $p2_after)"
+else
+    bad "2.38a phase 2 marker count changed -- a refused run stopped services"
+fi
+if vm_try "test -e /var/run/docker/netns/gate-canary; echo \$?" | tail -1 | grep -qx 0; then
+    ok "2.38a the seeded netns object survived the refusal"
+else
+    bad "2.38a the seeded netns object was DELETED"
+fi
+
+# --- 2.38b: every cleanup gate answered runs unattended, end to end ---
+# The first three gates by flag, the fourth declined by flag. It stops, it
+# enumerates, it restarts, and it deletes nothing.
+vm "rm -f $SF" >/dev/null 2>&1
+rc=$(vm_try "cd /opt/docker-offline && ./clean-swarm-networks.sh --non-interactive --status-file=$SF --allow-non-swarm --assume-drained --confirm-stop --no-confirm-delete </dev/null >/dev/null 2>&1; echo \$?" | tail -1)
+if [ "$rc" = "0" ]; then
+    ok "2.38b a fully answered cleanup runs without a terminal (exit 0)"
+else
+    bad "2.38b fully answered cleanup exited '$rc', want 0"
+    vm_try "cd /opt/docker-offline && ./clean-swarm-networks.sh --non-interactive --status-file=/tmp/x.kv --allow-non-swarm --assume-drained --confirm-stop --no-confirm-delete </dev/null 2>&1" | tail -15 | sed 's/^/       /'
+fi
+assert_status_key "2.38b" "$SF" deleted false
+assert_status_key "2.38b" "$SF" refusal_reason delete-declined
+assert_status_key "2.38b" "$SF" gates_answered "allow-non-swarm:y,assume-drained:y,confirm-stop:y,confirm-delete:n"
+assert_status_key "2.38b" "$SF" services_stopped false
+assert_status_complete "2.38b" "$SF"
+gs=$(status_key "$SF" gates_seen)
+if [ "$gs" = "allow-non-swarm,assume-drained,confirm-stop,confirm-delete" ]; then
+    ok "2.38b every gate was reached and answered by flag ($gs)"
+else
+    bad "2.38b gates_seen is '$gs', want all four"
+fi
+# It DID stop and restart: this is the case that proves the flags drive the
+# real path, not just the refusals.
+p2_after=$(vm_try "grep -c '=== Phase 2: Stop Services ===' /var/log/docker-network-cleanup.log 2>/dev/null || echo 0" | tail -1)
+if [ "$p2_after" -gt "$p2_before" ]; then
+    ok "2.38b it really did stop services and bring them back ($p2_before -> $p2_after)"
+else
+    bad "2.38b phase 2 never ran, so the declined-delete path was not exercised"
+fi
+assert_vm_eq "2.38b docker active again" "systemctl is-active docker" "active"
+assert_vm_eq "2.38b containerd active again" "systemctl is-active containerd" "active"
+if vm_try "test -e /var/run/docker/netns/gate-canary; echo \$?" | tail -1 | grep -qx 0; then
+    ok "2.38b the declined deletion left the seeded object in place"
+else
+    bad "2.38b the seeded object was deleted despite --no-confirm-delete"
+fi
+vm "rm -f /var/run/docker/netns/gate-canary" >/dev/null 2>&1
+
+# Verify the teardown before disarming the trap. swarm_leave swallows every
+# failure by design, so a silent failure here would hand the next suite a node
+# that is still a Swarm manager.
+swarm_leave
+sw=$(vm_try "docker info --format '{{.Swarm.LocalNodeState}}'" | tr -d '\r' | tail -1)
+if [ "$sw" = "inactive" ]; then
+    ok "2.38 teardown: the guest left the Swarm"
+    # Disarmed ONLY on success. `bad` increments a counter and returns, and
+    # swarm_leave swallows every failure, so clearing the trap unconditionally
+    # would hand the next suite a node that is still a Swarm manager.
+    trap - EXIT INT TERM
+else
+    bad "2.38 teardown: guest is still '$sw' -- leaving the EXIT trap armed to retry"
+fi
 
 vm "rm -f $SF" >/dev/null 2>&1
 ./reset-baseline.sh >/dev/null 2>&1

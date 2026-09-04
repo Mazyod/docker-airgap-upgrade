@@ -31,7 +31,13 @@ tests/vm/agent-mode-negative-control.sh  # prove the agent-mode guard tests can 
 tests/vm/reset-baseline.sh    # back to S1 between destructive runs
 ```
 
-The S1 baseline deliberately puts containerd's root on a **separate XFS filesystem at `/data/containerd`** with real images, containers and volume data on it. That is the configuration the pre-v2.0.0 phase 6 destroyed, and it is the only way to test it. See `tests/vm/README.md` for what this proves and — importantly — what it does not (no Swarm, not real RHEL, no GPU, not bare metal).
+The S1 baseline deliberately puts containerd's root on a **separate XFS filesystem at `/data/containerd`** with real images, containers and volume data on it. That is the configuration the pre-v2.0.0 phase 6 destroyed, and it is the only way to test it. See `tests/vm/README.md` for what this proves and — importantly — what it does not (single-node Swarm only, not real RHEL, no GPU, not bare metal).
+
+Since the agent-mode slices, the harness builds a **single-node Swarm manager** with
+`docker swarm init` for the gate cases, so a manager draining and reactivating itself is
+exercised for real. **Worker behaviour remains entirely untested** — a single node is always
+its own manager and demoting the last manager is refused — as do multi-node operation, overlay
+reconvergence and mixed versions. Do not let "Swarm is tested now" grow beyond that sentence.
 
 **The harness has two backends and runs on either host:** macOS with OrbStack, or Linux with a **local, rootful, x86_64** Docker daemon (a privileged Rocky 9 systemd container — no sudo, no KVM). `need_backend` checks those three daemon properties rather than assuming them: the repo reaches the guest as a bind mount of a host path, the baseline needs a real loop device and a nested dockerd, and the bundle is el9 x86_64. `tests/vm/lib.sh` picks one automatically from `HARNESS_BACKEND=auto|orb|docker` and sources `backend-orb.sh` or `backend-docker.sh`.
 
@@ -279,6 +285,60 @@ still reported; and the root check precedes the tee because a non-root run canno
 and the process substitution then swallows every line the script prints — measured, that
 produced no output at all.
 
+### `gate()` — the only wrapper around a prompt
+
+`upgrade-docker.sh` and `clean-swarm-networks.sh` reach `prompt_yes_no` **only** through
+`gate()`. `rollback-docker.sh` has no `gate()`: its single prompt becomes a value flag, so the
+wrapper would be dead code there.
+
+`prompt_yes_no` itself is **unchanged, byte for byte**, EOF refusal included. That is what
+makes `--non-interactive` a strictness switch rather than a way to auto-answer: it bypasses the
+read instead of relaxing it, so a wrapper piping `/dev/null` or `yes y` still cannot answer
+anything.
+
+Five properties are load-bearing:
+
+- **`gate` is byte-identical across the two scripts that have it**, drift-checked in section
+  1.11, so it may not reference anything script-specific. The only globals it touches are
+  `GATE_ANSWERS`, `NON_INTERACTIVE`, `GATES_SEEN` and `REFUSAL_REASON`.
+- **Every call site is an `if` or `if !` condition.** `gate` returns 1 for "no", exactly like
+  `prompt_yes_no`, and a bare `gate ...` under `set -e` turns an ordinary no into an abort.
+  Section 1.14 enforces the call-site shape, and enforces that `prompt_yes_no` is not called
+  directly any more.
+- **Under `--non-interactive`, `prompt_yes_no` is never reached.** Not reached and
+  auto-answered — never reached. No static check can prove this; Tier 2 case 2.32 runs the
+  refusal with a live `yes y` stream attached and asserts the node is untouched.
+- **A pre-declared answer wins in BOTH modes.** `--drain-self` skips that prompt on an
+  interactive run too. The flag states a fact; the mode only decides what happens to facts
+  nobody stated.
+- **`declare -A GATE_ANSWERS` precedes the parser.** Assigning `GATE_ANSWERS[x]` first creates
+  an indexed array that cannot be converted afterwards.
+
+`--non-interactive` **requires `--status-file`**, refused at parse time. Exit 1 conflates a
+refusal with a failure, and this interface then tells the caller to read `refusal_reason` and
+`next_action` — fields that do not exist without the file.
+
+Two exit-code changes, and only under `--non-interactive` or `--preflight`: the
+already-at-target decline exits **3** instead of 0. Interactively every code is exactly what it
+was, which is what keeps the existing harness counts intact.
+
+**`predict_gates()` is pure and total.** It runs from `preflight_report` and from inside the
+EXIT trap via `status_keys`, so it may not touch the node and may not return nonzero. It
+consumes `NODE_CLASS`, `SWARM_ACTIVE`, `IS_MANAGER` and `NODE_AVAILABILITY` — the same
+variables the real branches switch on, never a re-derivation — which is what keeps the
+predictor and the branches from disagreeing. Section 1.14 additionally requires every name
+passed to `gate` to appear in it.
+
+`gates_required` versus `gates_conditional` is not decoration. Two of the six upgrade gates
+depend on what the run *does*, so preflight refuses only over the required list. Advertising
+one list that silently omitted them would be worse than advertising none.
+
+**`--confirm-delete` is refused without an inventory hash in every mode**, not only under
+`--non-interactive`. A pre-declared answer wins in both modes, so the flag alone would skip the
+post-enumeration confirmation with nothing having seen the inventory — the exact bypass the
+enumerate-after-the-stop ordering exists to prevent. The hash flag arrives with the cleanup dry
+run; until then the refusal is unconditional.
+
 Design and plan: `docs/superpowers/specs/2026-09-04-agent-mode-design.md` and
 `docs/superpowers/plans/2026-09-04-agent-mode-implementation.md`.
 
@@ -288,10 +348,10 @@ Every script except `simulate-upgrade.sh` declares `VERSION="x.y.z"` on ~line 4 
 
 | Script | Version |
 |---|---|
-| `upgrade-docker.sh` | 2.4.0 |
+| `upgrade-docker.sh` | 2.5.0 |
 | `rollback-docker.sh` | 2.2.1 |
 | `download-docker-packages.sh` | 2.3.0 |
-| `clean-swarm-networks.sh` | 1.1.1 |
+| `clean-swarm-networks.sh` | 1.2.0 |
 | `recover-dnf.sh` | 1.2.2 |
 
 Commit subjects carry the new version in parens, e.g. `Fix NVIDIA toolkit upgrade failures (v1.2.2)`, with a bullet list body.

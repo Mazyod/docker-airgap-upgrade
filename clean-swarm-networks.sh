@@ -1,7 +1,7 @@
 #!/bin/bash
 # clean-swarm-networks.sh
 # Reset orphaned Swarm overlay network state on a single node
-VERSION="1.1.1"
+VERSION="1.2.0"
 #
 # WHEN TO RUN THIS
 #
@@ -54,10 +54,10 @@ LOG_FILE="/var/log/docker-network-cleanup.log"
 #############################################
 # Agent-mode run record
 #############################################
-# --status-file=PATH writes a flat key=value record of this run. Nothing else
-# about the script changes: with no arguments the behaviour is exactly what it
-# was, and there is still no way to answer a prompt from a flag. That arrives
-# in a later change.
+# --status-file=PATH writes a flat key=value record of this run, and the gate
+# flags below pre-declare an answer to each question the run can ask. With NO
+# arguments the behaviour is exactly what it was: interactive, and every prompt
+# still refuses a closed stdin.
 #
 # Everything here runs BEFORE `exec > >(tee ...)` further down, and the order
 # is load-bearing:
@@ -86,13 +86,47 @@ ENDED="unknown"
 STARTED="unknown"
 RUN_ID="unknown"
 
-# Slice 4 populates these; declared here because the parser will own them, and
-# assigning GATE_ANSWERS[x] before `declare -A` would create an indexed array
-# that cannot be converted afterwards.
-# shellcheck disable=SC2034  # reserved for the gate flags; see the agent-mode plan
+# Gate state, owned by the parser. `declare -A` MUST precede any assignment to
+# GATE_ANSWERS[x]: assigning first creates an INDEXED array that cannot be
+# converted to an associative one afterwards.
+#
+# NON_INTERACTIVE is a STRICTNESS switch, not a consent switch. It grants
+# nothing. It decides only what happens to a gate nobody answered: prompt, or
+# refuse.
 NON_INTERACTIVE=false
-# shellcheck disable=SC2034  # reserved for the gate flags; see the agent-mode plan
 declare -A GATE_ANSWERS=()
+# Every gate this run reached, comma-separated, appended by gate().
+GATES_SEEN=""
+
+# Record one gate answer from the command line.
+#
+# CONTRADICTIONS ARE REFUSED, not resolved by order. Each flag states one fact
+# the caller is accountable for, so `--drain-self --no-drain-self` is not a
+# preference to reconcile -- it is two incompatible claims, and letting the
+# last one silently win is how a wrapper that appends a default ends up
+# overriding a deliberate answer.
+#
+# Byte-identical across the scripts that have gate(); tests/static-checks.sh
+# enforces it.
+set_gate() {
+    local name="$1" val="$2"
+    # Two `local`s, not one: an assignment in the same `local` has not taken
+    # effect yet, so $name would be empty and every contradiction would slip
+    # through as "no previous answer".
+    local prev="${GATE_ANSWERS[$name]:-}"
+    if [ -n "$prev" ] && [ "$prev" != "$val" ]; then
+        echo "ERROR: --$name and --no-$name were both given." >&2
+        echo "Each flag states one fact; they cannot both be true." >&2
+        exit 1
+    fi
+    GATE_ANSWERS[$name]="$val"
+}
+
+# The inventory hash a caller expects the enumeration to produce.
+# --expect-inventory-sha arrives with --dry-run in a later change; the variable
+# exists now because --confirm-delete is refused without it in EVERY mode, and
+# that refusal has to have something to read.
+EXPECT_INVENTORY_SHA=""
 
 usage() {
     cat <<USAGE
@@ -104,8 +138,27 @@ Options:
   --status-file=PATH   Write a key=value record of this run to PATH. Written
                        once at startup with result=running and again on every
                        exit path, including success and interrupts.
+  --non-interactive    Refuse, rather than prompt, when one of the questions
+                       below has no answer. Never reads stdin.
+                       Requires --status-file.
   --help, -h           Show this help and exit.
   --version            Print the script version and exit.
+
+Gate flags. Each states ONE fact you are accountable for, and an answer given
+here is used in BOTH modes. --no-NAME states the opposite of --NAME.
+
+  --allow-non-swarm, --no-allow-non-swarm
+                       Run this on a host that is not in a Swarm anyway.
+  --assume-drained, --no-assume-drained
+                       A manager has already drained this node. An
+                       attestation, not an instruction: it drains nothing.
+  --confirm-stop, --no-confirm-stop
+                       Stop docker and containerd now.
+  --confirm-delete, --no-confirm-delete
+                       Delete the enumerated inventory. --confirm-delete is
+                       NOT accepted on its own in any mode: the inventory is
+                       enumerated only after the stop, so a pre-declared yes
+                       would authorise deleting a list nothing has seen.
 
 With no options the behaviour is unchanged: the script is interactive and
 every prompt refuses a closed stdin. See docs/AGENT-RUNBOOK.md.
@@ -135,6 +188,19 @@ while [ "$#" -gt 0 ]; do
             fi
             STATUS_FILE="$2"; shift
             ;;
+        --non-interactive) NON_INTERACTIVE=true ;;
+        # One arm per gate, spelled out rather than generated from a list. A
+        # generated arm would accept --no-anything and silently record an
+        # answer for a gate that does not exist; static check 1.14.1 compares
+        # these literals against the `gate` call sites in both directions.
+        --allow-non-swarm)              set_gate allow-non-swarm y ;;
+        --no-allow-non-swarm)           set_gate allow-non-swarm n ;;
+        --assume-drained)               set_gate assume-drained y ;;
+        --no-assume-drained)            set_gate assume-drained n ;;
+        --confirm-stop)                 set_gate confirm-stop y ;;
+        --no-confirm-stop)              set_gate confirm-stop n ;;
+        --confirm-delete)               set_gate confirm-delete y ;;
+        --no-confirm-delete)            set_gate confirm-delete n ;;
         --help|-h) usage; exit 0 ;;
         --version) echo "$SCRIPT_NAME $VERSION"; exit 0 ;;
         *)
@@ -145,6 +211,21 @@ while [ "$#" -gt 0 ]; do
     esac
     shift
 done
+
+if [ "$NON_INTERACTIVE" = true ]; then
+    MODE="non-interactive"
+fi
+
+# Exit 1 conflates refusal with failure, and 130 and 143 say nothing about
+# phase or service state. This interface calls the status file authoritative
+# and then tells an exit-1 caller to read refusal_reason and next_action;
+# without the file those fields do not exist. Refuse the combination here
+# rather than shipping an interface that can be used uselessly.
+if [ "$NON_INTERACTIVE" = true ] && [ -z "$STATUS_FILE" ]; then
+    echo "ERROR: --non-interactive requires --status-file=PATH." >&2
+    echo "Without it a refusal is indistinguishable from a failure." >&2
+    exit 1
+fi
 
 if [ -n "$STATUS_FILE" ]; then
     if [ "${STATUS_FILE#/}" = "$STATUS_FILE" ]; then
@@ -295,6 +376,60 @@ derive_result() {
     return 0
 }
 
+# Which gates a run of this shape reaches, split into two lists.
+#
+# PURE and TOTAL. It assigns reporting globals, reads only what phase 1
+# detection already established, and always returns 0. It is called from
+# status_keys, which runs inside the EXIT trap, so it must not touch the node
+# and must not be able to abort a trap.
+predict_gates() {
+    local req="" cond="" unans="" answered="" g
+    local ALL="allow-non-swarm assume-drained confirm-stop confirm-delete"
+
+    for g in $ALL; do
+        if [ -n "${GATE_ANSWERS[$g]:-}" ]; then
+            answered="${answered:+$answered,}$g:${GATE_ANSWERS[$g]}"
+        fi
+    done
+    GATES_ANSWERED="$answered"
+
+    if [ "${SWARM_STATE:-unknown}" = "unknown" ]; then
+        # Phase 1 has not looked yet. `unknown` beats an empty list, which
+        # would read as the definite claim that this run reaches no gates.
+        GATES_REQUIRED="unknown"
+        GATES_CONDITIONAL="unknown"
+        GATES_UNANSWERED="unknown"
+        return 0
+    fi
+
+    # Fires only on a host that does not report an active Swarm membership.
+    if [ "$SWARM_STATE" != "active" ]; then
+        req="allow-non-swarm"
+    fi
+    # These two are unconditional, which is why this script cannot be run
+    # without either a terminal or both flags.
+    req="${req:+$req,}assume-drained,confirm-stop"
+    # Reached only when the enumeration finds something. An empty inventory
+    # takes the "nothing to clean" exit and never asks.
+    cond="confirm-delete"
+
+    GATES_REQUIRED="$req"
+    GATES_CONDITIONAL="$cond"
+
+    for g in $ALL; do
+        case ",$req,$cond," in
+            *",$g,"*) ;;
+            *) continue ;;
+        esac
+        if [ -n "${GATE_ANSWERS[$g]:-}" ]; then
+            continue
+        fi
+        unans="${unans:+$unans,}$g"
+    done
+    GATES_UNANSWERED="$unans"
+    return 0
+}
+
 # Script-specific half of the run record. status_kv, status_common,
 # write_status_file and derive_result above are byte-identical across the three
 # stateful scripts and are drift-checked by tests/static-checks.sh.
@@ -312,6 +447,15 @@ status_keys() {
     status_kv failed_items "$FAILED_ITEMS"
     status_kv recovery_attempted "$RECOVERY_ATTEMPTED"
     status_kv recovery_succeeded "$RECOVERY_SUCCEEDED"
+    # Recomputed here rather than cached, so a record written at any exit path
+    # describes the run that actually happened. predict_gates only assigns
+    # reporting globals; it touches nothing on the node.
+    predict_gates
+    status_kv gates_required "$GATES_REQUIRED"
+    status_kv gates_conditional "$GATES_CONDITIONAL"
+    status_kv gates_answered "$GATES_ANSWERED"
+    status_kv gates_unanswered "$GATES_UNANSWERED"
+    status_kv gates_seen "$GATES_SEEN"
 }
 
 # shellcheck disable=SC2329  # invoked from on_exit, which the EXIT trap runs
@@ -329,6 +473,12 @@ derive_next_action() {
     case "$REFUSAL_REASON" in
         not-root)  NEXT_ACTION="rerun-as-root"; return 0 ;;
         bad-usage) NEXT_ACTION="none";          return 0 ;;
+        # Verify the fact, THEN supply the flag. Never supply it to clear the
+        # error -- that is the one way this interface can be used to lie.
+        gate-unanswered:*)      NEXT_ACTION="supply-flag";   return 0 ;;
+        # The only sha-free path to deletion is answering the live prompt AFTER
+        # enumeration, which means running the dry run first.
+        inventory-sha-required) NEXT_ACTION="rerun-dry-run"; return 0 ;;
     esac
     # As in the other two: only when the units are observed down.
     if [ "$SERVICES_STOPPED" = true ] &&
@@ -358,6 +508,15 @@ FAILED_ITEMS="unknown"
 RECOVERY_ATTEMPTED=false
 RECOVERY_SUCCEEDED="n/a"
 CURRENT_PHASE="startup"
+# Read by predict_gates from inside the EXIT trap, so it must exist before the
+# startup record is written. Phase 1 replaces it with what docker reports.
+SWARM_STATE="unknown"
+# Assigned by predict_gates on every status write. Initialised here because the
+# startup record is written before phase 1 has looked at anything.
+GATES_REQUIRED="unknown"
+GATES_CONDITIONAL="unknown"
+GATES_UNANSWERED="unknown"
+GATES_ANSWERED=""
 
 # SERVICES_STOPPED is armed BEFORE the first stop and cleared only after both
 # services are verified back up. Any exit in between -- error, Ctrl-C, SIGTERM
@@ -483,6 +642,51 @@ prompt_yes_no() {
             *) echo "Please answer yes or no." ;;
         esac
     done
+}
+# Ask one gate: a yes/no question whose answer may have been pre-declared on
+# the command line. Returns 0 for yes and 1 for no, exactly like
+# prompt_yes_no -- and, exactly like prompt_yes_no, EVERY call site must sit in
+# an `if` or `if !` condition. Under `set -e` a bare `gate ...` that returns 1
+# kills the script. The same errexit suspension is what makes the nested
+# prompt_yes_no call safe here.
+#
+# A pre-declared answer wins in BOTH modes: --drain-self skips that prompt on
+# an interactive run too. The flag states a fact; the mode only decides what
+# happens to facts nobody stated.
+#
+# Under --non-interactive, prompt_yes_no is NEVER REACHED. Not reached and
+# auto-answered -- never reached. A wrapper piping /dev/null or `yes y` still
+# cannot answer anything, because there is nothing to answer.
+#
+# Byte-identical across upgrade-docker.sh and clean-swarm-networks.sh
+# (tests/static-checks.sh enforces it), so it may not reference anything
+# script-specific: the only globals it touches are GATE_ANSWERS,
+# NON_INTERACTIVE, GATES_SEEN and REFUSAL_REASON.
+gate() {
+    local name="$1" prompt="$2" default="$3"
+    local ans="${GATE_ANSWERS[$name]:-}"
+    # Every gate this run actually REACHED, in order. The predicted lists say
+    # what a run of this shape would reach; this says what it did.
+    GATES_SEEN="${GATES_SEEN:+$GATES_SEEN,}$name"
+    case "$ans" in
+        y) echo "gate $name: yes (--$name)"; return 0 ;;
+        n) echo "gate $name: no (--no-$name)"; return 1 ;;
+    esac
+    if [ "$NON_INTERACTIVE" != true ]; then
+        # Explicit branches rather than a bare call plus `return`. Both forms
+        # work, because `set -e` is suspended for the dynamic extent of a
+        # function called in a condition -- but relying on that is relying on
+        # a subtlety a later refactor can silently break.
+        if prompt_yes_no "$prompt" "$default"; then return 0; else return 1; fi
+    fi
+    # An unstated fact fails closed. Never resolved by a default, and never by
+    # reading stdin.
+    REFUSAL_REASON="gate-unanswered:$name"
+    echo "" >&2
+    echo "ERROR: --non-interactive was given and gate '$name' was not answered." >&2
+    echo "  question: $prompt" >&2
+    echo "  pass --$name or --no-$name" >&2
+    exit 1
 }
 
 # Confirm a unit is CONCLUSIVELY stopped.
@@ -626,6 +830,36 @@ start_services() {
 
 
 #############################################
+# Flag consistency
+#############################################
+# --confirm-delete on its own is refused in EVERY mode, not only under
+# --non-interactive.
+#
+# A pre-declared answer wins in both modes, so the flag alone on an otherwise
+# interactive run would skip the post-enumeration confirmation with nobody and
+# nothing ever having seen the inventory -- and the inventory is enumerated
+# AFTER the stop precisely so the confirmation describes what gets deleted.
+# That is the bypass this whole interface exists to prevent.
+#
+# The only sha-free path to deletion is answering the live prompt after
+# enumeration, which is what a human does today. --expect-inventory-sha, and
+# the --dry-run that produces a sha to pass, arrive in a later change; until
+# then this refusal is unconditional whenever --confirm-delete is given.
+#
+# It sits HERE, before phase 1 and long before phase 2 stops anything, so a
+# refusal costs a node nothing.
+if [ "${GATE_ANSWERS[confirm-delete]:-}" = "y" ] && [ -z "$EXPECT_INVENTORY_SHA" ]; then
+    REFUSAL_REASON="inventory-sha-required"
+    REFUSAL_DETAIL="--confirm-delete requires --expect-inventory-sha from a preceding dry run"
+    echo ""
+    echo -e "${RED}ERROR: --confirm-delete was given without --expect-inventory-sha.${NC}"
+    echo "The inventory is enumerated only after docker and containerd stop, so a"
+    echo "pre-declared yes would authorise deleting a list nothing has seen."
+    echo "Nothing has been changed."
+    exit 1
+fi
+
+#############################################
 # Phase 1: Detect State & Confirm Intent
 #############################################
 echo ""
@@ -641,7 +875,7 @@ if [ "$SWARM_STATE" != "active" ]; then
     echo "This script only makes sense on a Swarm node. On a standalone Docker"
     echo "host it deletes bridge network state for no benefit."
     echo ""
-    if ! prompt_yes_no "Continue anyway? [y/N]" "n"; then
+    if ! gate allow-non-swarm "Continue anyway? [y/N]" "n"; then
         REFUSAL_REASON="non-swarm-declined"
         REFUSAL_DETAIL="declined to clean a host that is not in a Swarm"
         echo "Aborted. No changes made."
@@ -657,7 +891,7 @@ echo "From a manager node:"
 echo ""
 echo -e "  ${YELLOW}docker node update --availability drain $(hostname)${NC}"
 echo ""
-if ! prompt_yes_no "Has this node been drained? [y/N]" "n"; then
+if ! gate assume-drained "Has this node been drained? [y/N]" "n"; then
     REFUSAL_REASON="drain-unconfirmed"
     REFUSAL_DETAIL="drain was not attested"
     echo "Aborted. Drain the node from a manager, then re-run."
@@ -680,7 +914,7 @@ echo ""
 echo "Services will now be stopped so the exact set of state to delete can be"
 echo "enumerated. You get a final confirmation before anything is deleted."
 echo ""
-if ! prompt_yes_no "Stop docker and containerd now? [y/N]" "n"; then
+if ! gate confirm-stop "Stop docker and containerd now? [y/N]" "n"; then
     REFUSAL_REASON="stop-declined"
     REFUSAL_DETAIL="declined to stop docker and containerd"
     echo "Aborted. No changes made."
@@ -811,7 +1045,7 @@ echo -e "${YELLOW}$TOTAL item(s) listed above will be DELETED.${NC}"
 echo -e "${YELLOW}Swarm recreates them on reconnect. Containers, images and${NC}"
 echo -e "${YELLOW}volumes are not affected.${NC}"
 echo ""
-if ! prompt_yes_no "Delete the state listed above? [y/N]" "n"; then
+if ! gate confirm-delete "Delete the state listed above? [y/N]" "n"; then
     REFUSAL_REASON="delete-declined"
     REFUSAL_DETAIL="declined to delete the enumerated inventory"
     echo "Aborted. Nothing deleted - restarting services."

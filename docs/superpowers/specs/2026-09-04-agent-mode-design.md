@@ -649,6 +649,15 @@ would reach — and it splits them, because two of them cannot be predicted exac
 | `proceed-with-tasks` | **conditional** | fires only after a drain that leaves tasks or cannot count them. Dropped entirely when `--no-drain-self` was given, and on a worker, where no drain runs |
 | `reactivate` | **conditional**, promotable | fires only if the node ends up in `drain`. Promoted to required when `--drain-self` was given, or when preflight observes availability already `drain`. Dropped when `--no-drain-self` was given, and dropped for availability `pause`, which phase 10 does not reactivate |
 
+**Correction recorded during slice 4.** The `reactivate` row above says `--no-drain-self`
+drops the gate. That is true only where the drain gate is *reachable*. Phase 1 consults
+`drain-self` only when availability is neither `drain` nor `pause`, so on a manager already in
+`drain` the flag is never read and phase 10 still reaches `reactivate`. The implemented
+predictor drops `reactivate` for `--no-drain-self` only when the drain gate is reachable, and
+makes it required unconditionally for availability `drain`. The same review also found that
+phase 1's availability test failed open on an empty or unrecognised value; it now skips the
+drain only for a conclusive `drain` or `pause`.
+
 **The `rerun-at-target` exception.** The general rule is that preflight refuses on an
 unanswered required gate. This one does not: its unanswered state resolves safely by
 implication to "no", which does nothing at all, so preflight reports exit 3,

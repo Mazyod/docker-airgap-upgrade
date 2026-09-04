@@ -545,6 +545,90 @@ assert_untouched_strict() {
     assert_strict_state_unchanged "$label" "$name"
 }
 
+# --- the single-node Swarm fixture --------------------------------------
+#
+# `docker swarm init` turns the guest into a MANAGER, which is what arms the
+# drain, task-count and reactivation gates. That makes a slice of Swarm
+# behaviour testable in Tier 2 for the first time.
+#
+# It does NOT touch the Tier 3 multi-node gap and must not be described as if
+# it does. A single node is always its own manager: there is no way to make it
+# a WORKER, because demoting the only manager is refused, so the worker gate
+# and the worker predictor state remain untested here.
+#
+# reset-baseline.sh does not leave the Swarm -- the state lives under the
+# docker data root and survives a daemon restart -- so every caller must leave
+# it explicitly, including from a trap.
+swarm_init() {
+    local addr
+    # A container guest has several global addresses (eth0 plus every bridge),
+    # so `docker swarm init` cannot choose one on its own and errors out. Take
+    # the address of the default route's interface.
+    addr=$(vm_try "ip -o -4 addr show scope global \$(ip -o -4 route show default | awk '{print \$5; exit}') | awk '{print \$4}' | cut -d/ -f1 | head -1" | tr -d '\r' | tail -1)
+    if [ -z "$addr" ]; then
+        echo "  ${RED}ERROR${NC}: could not determine an advertise address in the guest." >&2
+        return 1
+    fi
+    if ! vm "docker swarm init --advertise-addr $addr" >/dev/null 2>&1; then
+        echo "  ${RED}ERROR${NC}: docker swarm init failed in the guest." >&2
+        vm_try "docker swarm init --advertise-addr $addr 2>&1" | sed 's/^/       /' >&2
+        return 1
+    fi
+    # Do not assume it worked. A case that silently ran on a non-Swarm host
+    # would refuse at a different gate and pass for the wrong reason.
+    local st role
+    st=$(vm_try "docker info --format '{{.Swarm.LocalNodeState}}'" | tr -d '\r' | tail -1)
+    role=$(vm_try "docker info --format '{{.Swarm.ControlAvailable}}'" | tr -d '\r' | tail -1)
+    if [ "$st" != "active" ] || [ "$role" != "true" ]; then
+        echo "  ${RED}ERROR${NC}: guest is not a Swarm manager (state '$st', control '$role')." >&2
+        return 1
+    fi
+    return 0
+}
+
+swarm_leave() {
+    vm_try "docker swarm leave --force" >/dev/null 2>&1 || true
+}
+
+# This node's availability, as a manager sees it. Prints `none` when the node
+# is not in a Swarm, so a caller comparing against `active` fails rather than
+# silently matching an empty string.
+node_availability() {
+    local a
+    a=$(vm_try "docker node inspect self --format '{{.Spec.Availability}}' 2>/dev/null" | tr -d '\r' | tail -1)
+    printf '%s\n' "${a:-none}"
+}
+
+# Set this node's availability, by NODE ID.
+#
+# `docker node update` does NOT accept the literal `self` -- only
+# `docker node inspect` does. It answers "node self not found" and exits 1, and
+# a caller that discarded that status would go on to assert against an
+# unchanged node and blame the product.
+set_node_availability() {
+    local want="$1" id
+    id=$(vm_try "docker info --format '{{.Swarm.NodeID}}'" | tr -d '\r' | tail -1)
+    if [ -z "$id" ]; then
+        bad "cannot set availability to $want: the guest reports no Swarm node ID"
+        return 1
+    fi
+    if ! vm "docker node update --availability $want $id" >/dev/null 2>&1; then
+        bad "cannot set availability to $want on node $id"
+        return 1
+    fi
+    return 0
+}
+
+assert_node_availability() {
+    local label="$1" want="$2" got
+    got=$(node_availability)
+    if [ "$got" = "$want" ]; then
+        ok "$label: node availability $want"
+    else
+        bad "$label: node availability is '$got', want '$want'"
+    fi
+}
+
 # Read one key out of a status file inside the guest. Prints nothing when the
 # file or the key is absent, so a caller comparing against an expected value
 # fails rather than silently matching.

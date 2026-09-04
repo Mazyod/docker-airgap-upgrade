@@ -9,7 +9,7 @@
 # If a mutant does not reproduce its hazard, the paired test proves nothing
 # and this script says so loudly.
 #
-# Mutants in this file (slice 2 of the agent-mode plan):
+# Mutants in this file (slices 2, 3 and 4 of the agent-mode plan):
 #
 #   M1a  status write moved AFTER on_exit's rc==0 short-circuit
 #        -> a successful run leaves the record saying result=running
@@ -23,6 +23,11 @@
 #        -> preflight reports ready for a node the real run refuses in phase 6,
 #           AFTER the rpm transaction and with services stopped
 #        pairs with tier2-run.sh case 2.30c
+#
+#   M3   gate() falls through to prompt_yes_no under --non-interactive
+#        -> a `yes y` stream answers every gate; the node is drained and
+#           upgraded by a run that was supposed to refuse
+#        pairs with tier2-run.sh case 2.32
 #
 # This is DESTRUCTIVE: it runs real upgrades against mutant scripts. It resets
 # the baseline before and after every mutant.
@@ -212,7 +217,11 @@ grep -c MUTANT /opt/docker-offline/upgrade-MUTANT.sh'
 restore_m2_config() {
     vm "[ -f /etc/containerd/config.toml.m2 ] && mv -f /etc/containerd/config.toml.m2 /etc/containerd/config.toml; true" >/dev/null 2>&1 || true
 }
-trap 'restore_m2_config' EXIT INT TERM
+# INT and TERM route through EXIT rather than running the handler and letting
+# bash resume a destructive suite.
+trap 'restore_m2_config' EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
 vm "set -e
     cp /etc/containerd/config.toml /etc/containerd/config.toml.m2
     sed -i \"s|^root = .*|root = '/data/absent-root-m2'|\" /etc/containerd/config.toml" >/dev/null 2>&1
@@ -263,6 +272,102 @@ else
     echo "       pkg_state=installed containerd.io=$TARGET_CONTAINERD docker!=active"
 fi
 vm "mv -f /etc/containerd/config.toml.m2 /etc/containerd/config.toml" >/dev/null 2>&1
+
+
+#############################################
+head_ "M3  gate() falls through to prompt_yes_no under --non-interactive"
+#############################################
+# The pair that matters for slice 4. Per CLAUDE.md, a guard test asserting only
+# the exit code proves nothing: a fall-through that drains and upgrades the
+# node and then fails for an unrelated reason also exits non-zero. So this
+# mutant reinstates the fall-through, runs it with a live `yes y` stream
+# exactly as case 2.32 does, and asserts the HAZARD -- the node drained, the
+# packages replaced -- rather than a status.
+#
+# Case 2.32 asserts all five packages at baseline and the node still `active`,
+# so it FAILS against this mutant.
+reset_all
+
+# 2.32 runs on a Swarm manager: that is what arms the drain gate. Without the
+# fixture the mutant reaches no gate at all and reproduces nothing.
+# INT and TERM route through EXIT so a signal cannot run the handler and then
+# let bash carry on with the guest still in a Swarm.
+leave_swarm_m3() { vm_try "docker swarm leave --force" >/dev/null 2>&1 || true; }
+trap 'leave_swarm_m3' EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+if swarm_init; then
+    ok "M3 fixture: guest is a single-node Swarm manager"
+else
+    bad "M3 fixture: could not create the Swarm -- the mutant proves nothing"
+fi
+avail_before=$(node_availability)
+if [ "$avail_before" = "active" ]; then
+    ok "M3 fixture: node availability is active before the mutant runs"
+else
+    bad "M3 fixture: availability is '$avail_before', want active"
+fi
+
+vm 'set -e
+cp /opt/docker-offline/upgrade-docker.sh /opt/docker-offline/upgrade-MUTANT.sh
+cat > /tmp/m3.py <<"PYEOF"
+import pathlib
+p = pathlib.Path("/opt/docker-offline/upgrade-MUTANT.sh")
+s = p.read_text()
+
+# The mutation is ONE thing: whether --non-interactive stops control reaching
+# prompt_yes_no. Everything else about gate() is untouched, so the mutant
+# differs from the real script in exactly that respect.
+q = chr(39)
+real = ("""    if [ "$NON_INTERACTIVE" != true ]; then""" + chr(10) +
+        """        # Explicit branches rather than a bare call plus `return`. Both forms""")
+assert real in s, "gate() interactive branch not found -- update this mutant"
+mutant = ("""    if true; then   # MUTANT: --non-interactive no longer bypasses the prompt""" +
+          chr(10) +
+          """        # Explicit branches rather than a bare call plus `return`. Both forms""")
+s = s.replace(real, mutant, 1)
+p.write_text(s)
+print("M3 built")
+PYEOF
+python3 /tmp/m3.py
+chmod +x /opt/docker-offline/upgrade-MUTANT.sh
+grep -c MUTANT /opt/docker-offline/upgrade-MUTANT.sh'
+
+vm "rm -f $SF" >/dev/null 2>&1
+# EXACTLY case 2.32's invocation: --non-interactive, no gate flags, and a live
+# `yes y` on stdin.
+mut_rc=$(vm_try "cd /opt/docker-offline && yes y | ./upgrade-MUTANT.sh --non-interactive --status-file=$SF >/dev/null 2>&1; echo \$?" | tail -1)
+mut_result=$(vm_try "sed -n 's/^result=//p' $SF 2>/dev/null | head -1" | tail -1)
+mut_pkg=$(vm_try "sed -n 's/^pkg_state=//p' $SF 2>/dev/null | head -1" | tail -1)
+mut_drain=$(vm_try "sed -n 's/^drain_performed=//p' $SF 2>/dev/null | head -1" | tail -1)
+after_docker=$(vm_try "rpm -q docker-ce --queryformat '%{VERSION}'" | tail -1)
+after_ct=$(vm_try "rpm -q containerd.io --queryformat '%{VERSION}'" | tail -1)
+echo "  mutant run: exit $mut_rc result=$mut_result pkg_state=$mut_pkg drain_performed=$mut_drain"
+echo "              docker-ce=$after_docker containerd.io=$after_ct"
+
+# The hazard is the NODE, not the status. A mutant that answered the drain gate
+# from the stream and then died would also exit non-zero.
+if [ "$mut_drain" = "true" ] && [ "$mut_pkg" != "untouched" ] &&
+   [ "$after_docker" = "$TARGET_DOCKER" ] && [ "$after_ct" = "$TARGET_CONTAINERD" ]; then
+    ok "M3 reproduced the hazard: the yes stream answered the gates, node drained and upgraded"
+    echo "       Case 2.32 asserts all five packages still at baseline and the node"
+    echo "       still active, so it FAILS against this mutant. An exit-code check"
+    echo "       would not have: this run exits 0."
+else
+    bad "M3 did NOT reproduce the hazard"
+    echo "       wanted drain_performed=true, pkg_state!=untouched,"
+    echo "       docker-ce=$TARGET_DOCKER containerd.io=$TARGET_CONTAINERD"
+fi
+
+leave_swarm_m3
+sw=$(vm_try "docker info --format '{{.Swarm.LocalNodeState}}'" | tr -d '\r' | tail -1)
+if [ "$sw" = "inactive" ]; then
+    ok "M3 left the Swarm"
+    # Disarmed only on success; see tier2-run.sh for why.
+    trap - EXIT INT TERM
+else
+    bad "M3 could not leave the Swarm (state '$sw') -- leaving the EXIT trap armed"
+fi
 
 #############################################
 echo ""

@@ -7,17 +7,17 @@
 
 | Tier | Status | Evidence |
 |---|---|---|
-| Tier 1 static | **PASSED 216/216** | `tests/static-checks.sh --online` — includes all 16 RPM URLs |
-| Tier 2 VM | **PASSED 67/67** | `tests/vm/tier2-run.sh` (the `all` phases) at commit `093a927` |
-| Tier 2 agent mode | **PASSED 312/312** | `tests/vm/tier2-run.sh agent` — cases 2.29 and 2.30, at `093a927` |
-| Tier 2 config-version boundary | **PASSED 30/30** | `tests/vm/config-version-check.sh` — cases 2.23–2.28, at `093a927` |
-| Tier 2 negative control | **PASSED 3/3** | `tests/vm/negative-control.sh` — mutant loses the relocated root, at `093a927` |
-| Tier 2 agent negative control | **PASSED 3/3 mutants** | `tests/vm/agent-mode-negative-control.sh` — M1a, M1b and M2 each make their case fail, at `093a927` |
+| Tier 1 static | **PASSED 233/233** | `tests/static-checks.sh --online` — includes all 16 RPM URLs |
+| Tier 2 VM | **PASSED 67/67** | `tests/vm/tier2-run.sh` (the `all` phases) at commit `9c56f16` |
+| Tier 2 agent mode | **PASSED 486/486, 1 skipped** | `tests/vm/tier2-run.sh agent` — cases 2.29 through 2.38, at `9c56f16`. The skip is the worker predictor state, which needs a second node |
+| Tier 2 config-version boundary | **PASSED 30/30** | `tests/vm/config-version-check.sh` — cases 2.23–2.28, at `9c56f16` |
+| Tier 2 negative control | **PASSED 3/3** | `tests/vm/negative-control.sh` — mutant loses the relocated root, at `9c56f16` |
+| Tier 2 agent negative control | **PASSED 4/4 mutants** | `tests/vm/agent-mode-negative-control.sh` — M1a, M1b, M2 and M3 each make their case fail, at `9c56f16` |
 | Tier 1b stubbed | not built | optional; Tier 2 covers most of its intent |
 | Tier 3 Swarm | **NOT RUN** | needs a real multi-node cluster |
 
 Every Tier 2 figure above was produced in one campaign against a bundle rebuilt from
-the checkout at `093a927`, on Rocky Linux 9 through the Docker backend, with the guest
+the checkout at `9c56f16`, on Rocky Linux 9 through the Docker backend, with the guest
 recreated from scratch (`bootstrap-vm.sh --recreate`, whose own precondition check
 passed 8/8) and the baseline reset between suites.
 
@@ -176,9 +176,11 @@ rollback.
 The config-version guard (`rollback-docker.sh` phase 0c) was **mutation-tested**, not
 merely exercised — see 2.27/2.28 above for what the neutered build does to the node.
 
-**Tier 3 remains mandatory before production.** Nothing about Swarm — drain,
-reactivation, overlay reconvergence, mixed-version operation, or
-`clean-swarm-networks.sh` — has been executed. The claim that a mixed
+**Tier 3 remains mandatory before production.** A single-node Swarm manager draining and
+reactivating itself IS now executed, in the agent-mode phase, along with the cleanup
+script's gates. Nothing else about Swarm is — **worker behaviour of any kind**,
+multi-node operation, overlay reconvergence, mixed-version operation, or the
+destructive half of `clean-swarm-networks.sh`. The claim that a mixed
 29.1.5 / 29.8.0 cluster is safe rests on both being Docker 29.x engines, **not** on a
 measurement. See `tests/vm/README.md` for the full list of what the VM tier does and
 does not prove.

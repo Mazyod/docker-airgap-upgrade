@@ -1,7 +1,7 @@
 #!/bin/bash
 # upgrade-docker.sh
 # Run on each AIR-GAPPED server to upgrade Docker 29.1.5 → 29.8.0
-VERSION="2.4.0"
+VERSION="2.5.0"
 #
 # Prerequisites:
 # - Extract docker-upgrade-bundle.tar.gz to /opt/
@@ -18,7 +18,7 @@ VERSION="2.4.0"
 # to avoid SSL certificate issues with corporate satellite servers
 # (e.g., "SSL certificate problem: EE certificate key too weak")
 #
-# SCOPE OF THIS VERSION (2.4.0)
+# SCOPE OF THIS VERSION (2.5.0)
 #
 # This upgrade crosses containerd 2.2.1 -> 2.3.4: a MINOR containerd bump, not
 # the 1.7 -> 2.x MAJOR boundary the 28.5.1 -> 29.1.5 migration crossed. 2.3 is
@@ -73,10 +73,10 @@ LOG_FILE="/var/log/docker-upgrade.log"
 #############################################
 # Agent-mode run record
 #############################################
-# --status-file=PATH writes a flat key=value record of this run. Nothing else
-# about the script changes: with no arguments the behaviour is exactly what it
-# was, and there is still no way to answer a prompt from a flag. That arrives
-# in a later change.
+# --status-file=PATH writes a flat key=value record of this run, and the gate
+# flags below pre-declare an answer to each question the run can ask. With NO
+# arguments the behaviour is exactly what it was: interactive, and every prompt
+# still refuses a closed stdin.
 #
 # Everything here runs BEFORE `exec > >(tee ...)` further down, and the order
 # is load-bearing:
@@ -105,13 +105,41 @@ ENDED="unknown"
 STARTED="unknown"
 RUN_ID="unknown"
 
-# Slice 4 populates these; declared here because the parser will own them, and
-# assigning GATE_ANSWERS[x] before `declare -A` would create an indexed array
-# that cannot be converted afterwards.
-# shellcheck disable=SC2034  # reserved for the gate flags; see the agent-mode plan
+# Gate state, owned by the parser. `declare -A` MUST precede any assignment to
+# GATE_ANSWERS[x]: assigning first creates an INDEXED array that cannot be
+# converted to an associative one afterwards.
+#
+# NON_INTERACTIVE is a STRICTNESS switch, not a consent switch. It grants
+# nothing. It decides only what happens to a gate nobody answered: prompt, or
+# refuse.
 NON_INTERACTIVE=false
-# shellcheck disable=SC2034  # reserved for the gate flags; see the agent-mode plan
 declare -A GATE_ANSWERS=()
+# Every gate this run reached, comma-separated, appended by gate().
+GATES_SEEN=""
+
+# Record one gate answer from the command line.
+#
+# CONTRADICTIONS ARE REFUSED, not resolved by order. Each flag states one fact
+# the caller is accountable for, so `--drain-self --no-drain-self` is not a
+# preference to reconcile -- it is two incompatible claims, and letting the
+# last one silently win is how a wrapper that appends a default ends up
+# overriding a deliberate answer.
+#
+# Byte-identical across the scripts that have gate(); tests/static-checks.sh
+# enforces it.
+set_gate() {
+    local name="$1" val="$2"
+    # Two `local`s, not one: an assignment in the same `local` has not taken
+    # effect yet, so $name would be empty and every contradiction would slip
+    # through as "no previous answer".
+    local prev="${GATE_ANSWERS[$name]:-}"
+    if [ -n "$prev" ] && [ "$prev" != "$val" ]; then
+        echo "ERROR: --$name and --no-$name were both given." >&2
+        echo "Each flag states one fact; they cannot both be true." >&2
+        exit 1
+    fi
+    GATE_ANSWERS[$name]="$val"
+}
 
 usage() {
     cat <<USAGE
@@ -129,8 +157,28 @@ Options:
   --status-file=PATH   Write a key=value record of this run to PATH. Written
                        once at startup with result=running and again on every
                        exit path, including success and interrupts.
+  --non-interactive    Refuse, rather than prompt, when one of the questions
+                       below has no answer. Never reads stdin.
+                       Requires --status-file.
   --help, -h           Show this help and exit.
   --version            Print the script version and exit.
+
+Gate flags. Each states ONE fact you are accountable for, and an answer given
+here is used in BOTH modes. --no-NAME states the opposite of --NAME.
+
+  --rerun-at-target, --no-rerun-at-target
+                       Re-run even though all five packages already match.
+  --allow-unverified-baseline, --no-allow-unverified-baseline
+                       Accept this untested starting version.
+  --drain-self, --no-drain-self
+                       Drain this manager now.
+  --proceed-with-tasks, --no-proceed-with-tasks
+                       Continue with tasks possibly still on this node.
+  --assume-drained, --no-assume-drained
+                       A manager has already drained this node. An
+                       attestation, not an instruction: it drains nothing.
+  --reactivate, --no-reactivate
+                       Return this manager to active at the end.
 
 With no options the behaviour is unchanged: the script is interactive and
 every prompt refuses a closed stdin. See docs/AGENT-RUNBOOK.md.
@@ -161,6 +209,23 @@ while [ "$#" -gt 0 ]; do
             STATUS_FILE="$2"; shift
             ;;
         --preflight) MODE="preflight" ;;
+        --non-interactive) NON_INTERACTIVE=true ;;
+        # One arm per gate, spelled out rather than generated from a list. A
+        # generated arm would accept --no-anything and silently record an
+        # answer for a gate that does not exist; static check 1.14.1 compares
+        # these literals against the `gate` call sites in both directions.
+        --rerun-at-target)              set_gate rerun-at-target y ;;
+        --no-rerun-at-target)           set_gate rerun-at-target n ;;
+        --allow-unverified-baseline)    set_gate allow-unverified-baseline y ;;
+        --no-allow-unverified-baseline) set_gate allow-unverified-baseline n ;;
+        --drain-self)                   set_gate drain-self y ;;
+        --no-drain-self)                set_gate drain-self n ;;
+        --proceed-with-tasks)           set_gate proceed-with-tasks y ;;
+        --no-proceed-with-tasks)        set_gate proceed-with-tasks n ;;
+        --assume-drained)               set_gate assume-drained y ;;
+        --no-assume-drained)            set_gate assume-drained n ;;
+        --reactivate)                   set_gate reactivate y ;;
+        --no-reactivate)                set_gate reactivate n ;;
         --help|-h) usage; exit 0 ;;
         --version) echo "$SCRIPT_NAME $VERSION"; exit 0 ;;
         *)
@@ -171,6 +236,25 @@ while [ "$#" -gt 0 ]; do
     esac
     shift
 done
+
+# `mode` is one token. --preflight wins over --non-interactive because the run
+# is read-only either way, and the preflight branches key off this value.
+# Resolved AFTER the loop so flag order on the command line cannot matter.
+if [ "$MODE" != "preflight" ] && [ "$NON_INTERACTIVE" = true ]; then
+    MODE="non-interactive"
+fi
+
+# Exit 1 conflates refusal with failure, and 130 and 143 say nothing about
+# phase, service state or package state. This interface calls the status file
+# authoritative and then tells an exit-1 caller to read refusal_reason and
+# next_action; without the file those fields do not exist and the caller is
+# back to grepping coloured prose. Refuse the combination here rather than
+# shipping an interface that can be used uselessly.
+if [ "$NON_INTERACTIVE" = true ] && [ -z "$STATUS_FILE" ]; then
+    echo "ERROR: --non-interactive requires --status-file=PATH." >&2
+    echo "Without it a refusal is indistinguishable from a failure." >&2
+    exit 1
+fi
 
 if [ -n "$STATUS_FILE" ]; then
     if [ "${STATUS_FILE#/}" = "$STATUS_FILE" ]; then
@@ -319,6 +403,138 @@ derive_result() {
     return 0
 }
 
+# Which gates a run of this shape reaches, split into two lists because two of
+# the six cannot be predicted from a node at rest.
+#
+# PURE and TOTAL. It assigns reporting globals, reads only what phase 0 and the
+# phase 1 detection already established, and always returns 0. It is called
+# from preflight_report AND from status_keys, which runs inside the EXIT trap,
+# so it must not touch the node and must not be able to abort a trap.
+#
+# It consumes NODE_CLASS, SWARM_ACTIVE, IS_MANAGER and NODE_AVAILABILITY -- the
+# same variables the real branches switch on, never a re-derivation of their
+# conditions. That is what keeps the predictor and the branches from
+# disagreeing when one of them changes.
+predict_gates() {
+    local req="" cond="" unans="" blocking="" answered="" g
+    local avail="${NODE_AVAILABILITY:-unknown}"
+    local drain_ans="${GATE_ANSWERS[drain-self]:-}"
+
+    # A stable order, so a consumer can compare two records.
+    local ALL="rerun-at-target allow-unverified-baseline drain-self proceed-with-tasks assume-drained reactivate"
+    for g in $ALL; do
+        if [ -n "${GATE_ANSWERS[$g]:-}" ]; then
+            answered="${answered:+$answered,}$g:${GATE_ANSWERS[$g]}"
+        fi
+    done
+    GATES_ANSWERED="$answered"
+
+    if [ "$NODE_CLASS" = "unknown" ]; then
+        # Phase 0 has not classified this node, so nothing below is knowable.
+        # `unknown` beats an empty list, which would read as the definite claim
+        # that this run reaches no gates at all.
+        GATES_REQUIRED="unknown"
+        GATES_CONDITIONAL="unknown"
+        GATES_UNANSWERED="unknown"
+        GATES_BLOCKING=""
+        return 0
+    fi
+
+    # Does the run get PAST phase 0 at all? Everything below is in phase 1 and
+    # phase 10, so a run that exits in phase 0 reaches none of it. Listing
+    # those gates as "certainly reached" would be simply false.
+    local proceeds=true
+    if [ "$NODE_CLASS" = "at-target" ]; then
+        req="${req:+$req,}rerun-at-target"
+        # Unanswered resolves to "nothing to do", so only an explicit yes gets
+        # this node into phase 1.
+        if [ "${GATE_ANSWERS[rerun-at-target]:-}" != "y" ]; then
+            proceeds=false
+        fi
+    fi
+    if [ "$NODE_CLASS" = "unverified" ]; then
+        req="${req:+$req,}allow-unverified-baseline"
+        # Only an explicit NO definitively stops it. Unanswered still reports
+        # the later gates, because the caller may well answer yes and then
+        # needs to know what else to supply.
+        if [ "${GATE_ANSWERS[allow-unverified-baseline]:-}" = "n" ]; then
+            proceeds=false
+        fi
+    fi
+
+    if [ "$proceeds" = true ] && [ "${SWARM_ACTIVE:-false}" = true ]; then
+        if [ "${IS_MANAGER:-false}" = true ]; then
+            # Phase 1 consults drain-self ONLY when availability is active or
+            # unknown. On a manager already `drain` or `pause` it takes the
+            # "already drained/paused" branch and never asks -- which is why
+            # --no-drain-self must not suppress anything on such a node.
+            # The SAME test the branch uses, in the same direction: anything
+            # that is not conclusively drain or pause reaches the drain gate.
+            local drain_reachable=false
+            if [ "$avail" != "drain" ] && [ "$avail" != "pause" ]; then
+                drain_reachable=true
+            fi
+            if [ "$drain_reachable" = true ]; then
+                req="${req:+$req,}drain-self"
+                # Fires only AFTER a drain that leaves tasks behind or cannot
+                # count them, so it is never certain -- and is not reached at
+                # all when the drain was declined up front.
+                if [ "$drain_ans" != "n" ]; then
+                    cond="${cond:+$cond,}proceed-with-tasks"
+                fi
+            fi
+            # Phase 10 offers reactivation only to a manager, and only when it
+            # observes `drain` at that point. It deliberately does not
+            # reactivate a node whose availability is `pause`.
+            if [ "$avail" = "drain" ]; then
+                # Already drained: phase 10 certainly reaches it, whatever the
+                # drain flag says, because phase 1 never consulted that flag.
+                req="${req:+$req,}reactivate"
+            elif [ "$drain_reachable" = true ]; then
+                if [ "$drain_ans" = "y" ]; then
+                    req="${req:+$req,}reactivate"
+                elif [ "$drain_ans" != "n" ]; then
+                    cond="${cond:+$cond,}reactivate"
+                fi
+            fi
+        else
+            # A worker cannot inspect itself, so its availability always reads
+            # `unknown` and this gate always fires on a worker.
+            req="${req:+$req,}assume-drained"
+        fi
+    fi
+
+    GATES_REQUIRED="$req"
+    GATES_CONDITIONAL="$cond"
+
+    # Unanswered is over BOTH lists: a conditional gate with no answer is
+    # reported, not refused, but a caller still needs to see it.
+    #
+    # BLOCKING is the subset preflight refuses over: required, unanswered, and
+    # not rerun-at-target -- whose "no" branch does nothing at all, so leaving
+    # it unanswered resolves safely by implication to "nothing to do".
+    for g in $ALL; do
+        case ",$req,$cond," in
+            *",$g,"*) ;;
+            *) continue ;;
+        esac
+        if [ -n "${GATE_ANSWERS[$g]:-}" ]; then
+            continue
+        fi
+        unans="${unans:+$unans,}$g"
+        case ",$req," in
+            *",$g,"*)
+                if [ "$g" != "rerun-at-target" ]; then
+                    blocking="${blocking:+$blocking,}$g"
+                fi
+                ;;
+        esac
+    done
+    GATES_UNANSWERED="$unans"
+    GATES_BLOCKING="$blocking"
+    return 0
+}
+
 # Script-specific half of the run record. status_kv, status_common,
 # write_status_file and derive_result above are byte-identical across the three
 # stateful scripts and are drift-checked by tests/static-checks.sh; only this
@@ -362,6 +578,16 @@ status_keys() {
     status_kv rpmnew_present "$(if [ -f "${CONTAINERD_CONF:-/etc/containerd/config.toml}.rpmnew" ]; then echo true; else echo false; fi)"
     status_kv nvidia "$NVIDIA_RESULT"
     status_kv node_class "$NODE_CLASS"
+    # Recomputed here rather than cached, so a record written at any exit path
+    # describes the run that actually happened. predict_gates only assigns
+    # reporting globals; it touches nothing on the node.
+    predict_gates
+    status_kv gates_required "$GATES_REQUIRED"
+    status_kv gates_conditional "$GATES_CONDITIONAL"
+    status_kv gates_answered "$GATES_ANSWERED"
+    status_kv gates_unanswered "$GATES_UNANSWERED"
+    status_kv gates_seen "$GATES_SEEN"
+    status_kv drain_attested_by "$DRAIN_ATTESTED_BY"
     status_kv docker_ce_before "${CURRENT_DOCKER:-unknown}"
     status_kv docker_ce_after "$AFTER_DOCKER"
     status_kv docker_ce_expected "${EXPECTED_DOCKER_VERSION:-unknown}"
@@ -404,6 +630,9 @@ derive_next_action() {
         payload-invalid)        NEXT_ACTION="rebuild-bundle"; return 0 ;;
         relocated-root-missing) NEXT_ACTION="fix-mount";      return 0 ;;
         drain-unconfirmed)      NEXT_ACTION="drain-from-manager"; return 0 ;;
+        # Verify the fact, THEN supply the flag. Never supply it to clear the
+        # error -- that is the one way this interface can be used to lie.
+        gate-unanswered:*)      NEXT_ACTION="supply-flag";    return 0 ;;
         # dry-run-failed is NOT rebuild-bundle: rpm refuses for disk space and
         # host dependency reasons too, and neither is fixed by a new bundle.
         # tasks-present is NOT drain-from-manager: on the manager path the
@@ -435,11 +664,14 @@ derive_next_action() {
 # service, install a package, create a directory, repair dnf, or drain a node.
 # tests/static-checks.sh check 1.14.12 greps the block for exactly that.
 #
-# It does NOT report which gates the run would reach. Two of the six cannot be
-# predicted from a node at rest, and advertising a list that silently omits
-# them would be worse than advertising nothing. That arrives with the gates.
+# It DOES report which gates the run would reach, in two lists. Two of the six
+# depend on what the run does rather than on what a node at rest looks like, so
+# advertising a single list that silently omitted them would be worse than
+# advertising nothing. `gates_required` is what preflight refuses over under
+# --non-interactive; `gates_conditional` is reported and never refused over,
+# because the run may never reach it.
 preflight_report() {
-    local rc=0
+    local rc=0 pf_root_missing=false
 
     echo ""
     echo -e "${GREEN}==========================================${NC}"
@@ -462,6 +694,11 @@ preflight_report() {
         echo -e "  dnf state:             ${YELLOW}has issues (the real run would attempt a repair)${NC}"
     fi
     echo "  nvidia toolkit:        $(if [ "$NVIDIA_INSTALLED" = true ]; then echo present; else echo absent; fi)"
+    predict_gates
+    echo "  gates required:        ${GATES_REQUIRED:-<none>}"
+    echo "  gates conditional:     ${GATES_CONDITIONAL:-<none>}"
+    echo "  gates answered:        ${GATES_ANSWERED:-<none>}"
+    echo "  gates unanswered:      ${GATES_UNANSWERED:-<none>}"
     echo ""
 
     # Hoisted from phase 6. Both are pure reads, and both matter here for the
@@ -507,12 +744,79 @@ preflight_report() {
         echo "  and containerd stopped. Mount it first:"
         echo "    findmnt --target $(dirname "$CONTAINERD_ROOT")"
         echo "    lsblk; cat /etc/fstab"
-        REFUSAL_REASON="relocated-root-missing"
-        REFUSAL_DETAIL="$CONTAINERD_ROOT does not exist; its filesystem is probably not mounted"
-        rc=1
+        # Recorded, not claimed. Which finding becomes THE refusal is decided
+        # below, in the order the real run would meet them -- and this one
+        # lives in phase 6, so almost everything outranks it.
+        pf_root_missing=true
     elif [ "$CONTAINERD_ROOT" != "/var/lib/containerd" ]; then
         echo "  relocated and present:"
         findmnt --target "$CONTAINERD_ROOT" 2>/dev/null | sed 's/^/    /' || true
+    fi
+
+    # THE ORDER BELOW IS THE ORDER THE REAL RUN MEETS THESE, and that is the
+    # whole point of the block. Reporting whichever finding this function
+    # happened to evaluate first would name a phase-6 mount problem on a node
+    # the real run refuses in phase 0, and send an agent to fix the wrong
+    # thing. Each arm claims the refusal only if nothing earlier did.
+    #
+    #   phase 0   allow-unverified-baseline, declined in advance
+    #   phase 0/1 a required gate with no answer, first in canonical order --
+    #             which IS phase order
+    #   phase 1   assume-drained, declined in advance (worker only)
+    #   phase 6   the relocated root
+    #
+    # An explicit NO on a gate whose "no" branch ABORTS means the real run
+    # would not proceed, and `ready` says it would. Those two arms apply in
+    # BOTH modes, because a pre-declared answer wins in both. Only two gates
+    # qualify: `drain-self` no proceeds without draining and `reactivate` no
+    # leaves the node drained, neither of which stops the run, and
+    # `proceed-with-tasks` is conditional so a no there cannot be predicted.
+    if [ "$rc" -eq 0 ] && [ "$NODE_CLASS" = "unverified" ] &&
+       [ "${GATE_ANSWERS[allow-unverified-baseline]:-}" = "n" ]; then
+        echo ""
+        echo -e "${YELLOW}  --no-allow-unverified-baseline was given and this node is on an${NC}"
+        echo -e "${YELLOW}  unverified starting version, so the real run would stop in phase 0.${NC}"
+        REFUSAL_REASON="unverified-baseline"
+        REFUSAL_DETAIL="declined in advance to upgrade from ${CURRENT_DOCKER:-absent} / containerd.io ${CURRENT_CONTAINERD:-absent}"
+        rc=1
+    fi
+
+    # An unanswered gate is only a refusal when the caller asked for the strict
+    # mode. Without --non-interactive both lists are informational: the real
+    # run would simply ask.
+    #
+    # A conditional gate is never refused over. The run may never reach it, and
+    # refusing would force a caller to pre-answer a question that may not be
+    # asked. The bounded claim this leaves is stated in docs/AGENT-RUNBOOK.md:
+    # preflight validates every gate that is certain and NAMES the ones that
+    # are not.
+    if [ "$rc" -eq 0 ] && [ "$NON_INTERACTIVE" = true ] && [ -n "$GATES_BLOCKING" ]; then
+        echo ""
+        echo -e "${RED}  ERROR: required gate(s) with no answer: $GATES_BLOCKING${NC}"
+        echo "  The real run would refuse when it reached the first of them."
+        echo "  Verify each fact, then pass the matching --NAME or --no-NAME flag."
+        REFUSAL_REASON="gate-unanswered:${GATES_BLOCKING%%,*}"
+        REFUSAL_DETAIL="required gate(s) unanswered: $GATES_BLOCKING"
+        rc=1
+    fi
+
+    if [ "$rc" -eq 0 ] && [ "${SWARM_ACTIVE:-false}" = true ] && [ "$IS_MANAGER" != true ] &&
+       [ "${GATE_ANSWERS[assume-drained]:-}" = "n" ]; then
+        echo ""
+        echo -e "${YELLOW}  --no-assume-drained was given and this is a worker, so the real${NC}"
+        echo -e "${YELLOW}  run would stop in phase 1, before touching anything.${NC}"
+        REFUSAL_REASON="drain-unconfirmed"
+        REFUSAL_DETAIL="worker drain declined in advance"
+        rc=1
+    fi
+
+    # Last, because phase 6 is where the real run meets it -- after every gate
+    # above. The finding was printed further up either way; this only decides
+    # whether it is the one the caller is told to act on.
+    if [ "$rc" -eq 0 ] && [ "$pf_root_missing" = true ]; then
+        REFUSAL_REASON="relocated-root-missing"
+        REFUSAL_DETAIL="$CONTAINERD_ROOT does not exist; its filesystem is probably not mounted"
+        rc=1
     fi
 
     echo ""
@@ -589,6 +893,17 @@ NODE_AVAILABILITY_AFTER="unknown"
 DRAIN_PERFORMED=false
 NVIDIA_RESULT="not-attempted"
 PREFLIGHT_NOTHING_TO_DO=false
+# How the drain fact reached this run. An audit afterwards can then tell a
+# flag that was TRUSTED from a question a human ANSWERED. Neither makes the
+# fact true; the record only says which one was relied on.
+DRAIN_ATTESTED_BY="not-required"
+# Assigned by predict_gates on every status write. Initialised here because the
+# startup record is written before phase 0 has classified anything.
+GATES_REQUIRED="unknown"
+GATES_CONDITIONAL="unknown"
+GATES_UNANSWERED="unknown"
+GATES_ANSWERED=""
+GATES_BLOCKING=""
 # The installed-version classification, computed ONCE in phase 0 and switched
 # on by the branches below. Slice 4's gate predictor consumes the same variable
 # rather than re-deriving the conditions, which is how the predictor and the
@@ -907,6 +1222,51 @@ prompt_yes_no() {
             *) echo "Please answer yes or no." ;;
         esac
     done
+}
+# Ask one gate: a yes/no question whose answer may have been pre-declared on
+# the command line. Returns 0 for yes and 1 for no, exactly like
+# prompt_yes_no -- and, exactly like prompt_yes_no, EVERY call site must sit in
+# an `if` or `if !` condition. Under `set -e` a bare `gate ...` that returns 1
+# kills the script. The same errexit suspension is what makes the nested
+# prompt_yes_no call safe here.
+#
+# A pre-declared answer wins in BOTH modes: --drain-self skips that prompt on
+# an interactive run too. The flag states a fact; the mode only decides what
+# happens to facts nobody stated.
+#
+# Under --non-interactive, prompt_yes_no is NEVER REACHED. Not reached and
+# auto-answered -- never reached. A wrapper piping /dev/null or `yes y` still
+# cannot answer anything, because there is nothing to answer.
+#
+# Byte-identical across upgrade-docker.sh and clean-swarm-networks.sh
+# (tests/static-checks.sh enforces it), so it may not reference anything
+# script-specific: the only globals it touches are GATE_ANSWERS,
+# NON_INTERACTIVE, GATES_SEEN and REFUSAL_REASON.
+gate() {
+    local name="$1" prompt="$2" default="$3"
+    local ans="${GATE_ANSWERS[$name]:-}"
+    # Every gate this run actually REACHED, in order. The predicted lists say
+    # what a run of this shape would reach; this says what it did.
+    GATES_SEEN="${GATES_SEEN:+$GATES_SEEN,}$name"
+    case "$ans" in
+        y) echo "gate $name: yes (--$name)"; return 0 ;;
+        n) echo "gate $name: no (--no-$name)"; return 1 ;;
+    esac
+    if [ "$NON_INTERACTIVE" != true ]; then
+        # Explicit branches rather than a bare call plus `return`. Both forms
+        # work, because `set -e` is suspended for the dynamic extent of a
+        # function called in a condition -- but relying on that is relying on
+        # a subtlety a later refactor can silently break.
+        if prompt_yes_no "$prompt" "$default"; then return 0; else return 1; fi
+    fi
+    # An unstated fact fails closed. Never resolved by a default, and never by
+    # reading stdin.
+    REFUSAL_REASON="gate-unanswered:$name"
+    echo "" >&2
+    echo "ERROR: --non-interactive was given and gate '$name' was not answered." >&2
+    echo "  question: $prompt" >&2
+    echo "  pass --$name or --no-$name" >&2
+    exit 1
 }
 
 # Confirm a unit is CONCLUSIVELY stopped.
@@ -1324,12 +1684,46 @@ if [ "$NODE_CLASS" = "at-target" ]; then
     echo "  compose $CURRENT_COMPOSE"
     PREFLIGHT_NOTHING_TO_DO=true
     if [ "$MODE" = "preflight" ]; then
-        echo "Preflight: the real run would offer to re-run and default to no."
-    elif ! prompt_yes_no "Re-run the upgrade anyway? [y/N]" "n"; then
+        # A pre-declared answer wins in both modes, so a preflight carrying
+        # --rerun-at-target must report what the REAL run would do -- proceed
+        # -- not the default the prompt would have applied.
+        if [ "${GATE_ANSWERS[rerun-at-target]:-}" = "y" ]; then
+            PREFLIGHT_NOTHING_TO_DO=false
+            echo "Preflight: --rerun-at-target was given, so the real run would proceed."
+        else
+            echo "Preflight: the real run would offer to re-run and default to no."
+        fi
+    elif [ "$NON_INTERACTIVE" = true ] && [ -z "${GATE_ANSWERS[rerun-at-target]:-}" ]; then
+        # The ONE gate whose unanswered state resolves safely by implication.
+        # gate() refuses generically -- it has to, it is byte-identical across
+        # scripts and cannot special-case a name -- so the exception is handled
+        # HERE, before the call, rather than inside it.
+        #
+        # Its "no" branch does nothing at all, so a distinct exit code beats an
+        # abort: the caller learns the node is already done instead of being
+        # told to go and answer a question whose answer changes nothing.
+        RESULT="nothing-to-do"
+        # The run REACHED this gate and resolved it, just not through gate().
+        # Leaving it out would make gates_seen omit the one decision that
+        # determined the outcome.
+        GATES_SEEN="${GATES_SEEN:+$GATES_SEEN,}rerun-at-target"
+        echo "Nothing to do, and --rerun-at-target was not given. Exiting without changes."
+        exit 3
+    elif ! gate rerun-at-target "Re-run the upgrade anyway? [y/N]" "n"; then
         # Exit 0 here has always meant "nothing done", which is indistinguishable
         # from "upgrade completed" by status alone. The record separates them.
         RESULT="nothing-to-do"
         echo "Nothing to do. Exiting without changes."
+        # Exit 3 ONLY when the caller asked for the richer taxonomy. An
+        # interactive decline still exits 0, exactly as it always has, so no
+        # existing wrapper sees a new code.
+        #
+        # This is also the one gate whose unanswered state resolves safely by
+        # implication: its "no" branch does nothing at all, so under
+        # --non-interactive it reports "nothing to do" rather than refusing.
+        if [ "$NON_INTERACTIVE" = true ]; then
+            exit 3
+        fi
         exit 0
     fi
 elif [ "$NODE_CLASS" = "partial" ]; then
@@ -1357,7 +1751,7 @@ else
         echo ""
         if [ "$MODE" = "preflight" ]; then
             echo "Preflight: the real run would ask whether to continue from here."
-        elif ! prompt_yes_no "Continue from this unverified starting version? [y/N]" "n"; then
+        elif ! gate allow-unverified-baseline "Continue from this unverified starting version? [y/N]" "n"; then
             REFUSAL_REASON="unverified-baseline"
             REFUSAL_DETAIL="declined to upgrade from ${CURRENT_DOCKER:-absent} / containerd.io ${CURRENT_CONTAINERD:-absent}"
             echo "Aborting. Nothing has been changed."
@@ -1404,6 +1798,12 @@ if [ "$SWARM_STATE" = "active" ]; then
     # Check current availability (only managers can inspect nodes)
     if [ "$IS_MANAGER" = true ]; then
         NODE_AVAILABILITY=$(docker node inspect "$SWARM_NODE_ID" --format '{{.Spec.Availability}}' 2>/dev/null || echo "unknown")
+        # `|| echo unknown` only covers a FAILING inspect. An inspect that
+        # succeeds and prints nothing -- a renamed field, a future format --
+        # leaves this empty, and an empty value is not a member of this key's
+        # domain. Normalise, so both the branch below and the record see a
+        # value they can reason about.
+        NODE_AVAILABILITY="${NODE_AVAILABILITY:-unknown}"
         echo "Current availability: $NODE_AVAILABILITY"
     else
         # Workers cannot check their own status, assume active
@@ -1413,10 +1813,17 @@ if [ "$SWARM_STATE" = "active" ]; then
 
     if [ "$MODE" = "preflight" ]; then
         # Preflight stops before this branch: everything below it either
-        # prompts or drains, and preflight does neither. WHICH gates the real
-        # run would reach is not reported -- see preflight_report.
+        # prompts or drains, and preflight does neither. Which gates the real
+        # run would reach IS reported, from predict_gates -- see
+        # preflight_report.
         echo "Preflight: this node would be asked about draining."
-    elif [ "$NODE_AVAILABILITY" = "active" ] || [ "$NODE_AVAILABILITY" = "unknown" ]; then
+    # FAIL CLOSED. This used to test for `active` or `unknown`, which meant any
+    # other value -- an empty string from an inspect that succeeded and printed
+    # nothing, a future availability, a malformed line -- fell through to the
+    # "already drained/paused" branch and SKIPPED the drain on a node nobody
+    # had drained. Only a conclusive `drain` or `pause` may skip it. Same rule
+    # as verify_unit_stopped: an unrecognised answer is not a safe answer.
+    elif [ "$NODE_AVAILABILITY" != "drain" ] && [ "$NODE_AVAILABILITY" != "pause" ]; then
         if [ "$IS_MANAGER" = true ]; then
             # Manager can drain itself
             echo ""
@@ -1424,7 +1831,15 @@ if [ "$SWARM_STATE" = "active" ]; then
             echo "It should be drained before upgrading to avoid service disruption."
             echo ""
 
-            if prompt_yes_no "Drain this node now? [Y/n]" "y"; then
+            if gate drain-self "Drain this node now? [Y/n]" "y"; then
+                # Recorded BEFORE the drain, so an audit can tell a flag that
+                # was trusted from a question a human answered. The flag does
+                # not make the fact true; the record says which it was.
+                if [ -n "${GATE_ANSWERS[drain-self]:-}" ]; then
+                    DRAIN_ATTESTED_BY="flag"
+                else
+                    DRAIN_ATTESTED_BY="prompt"
+                fi
                 echo "Draining node..."
                 docker node update --availability drain "$SWARM_NODE_ID"
                 DRAIN_PERFORMED=true
@@ -1450,7 +1865,7 @@ if [ "$SWARM_STATE" = "active" ]; then
                 # through to the success branch -- reporting "all tasks
                 # migrated" precisely when we could not tell.
                 if [ "$TASKS" = "unknown" ]; then
-                    if ! prompt_yes_no "Continue with upgrade anyway? [y/N]" "n"; then
+                    if ! gate proceed-with-tasks "Continue with upgrade anyway? [y/N]" "n"; then
                         REFUSAL_REASON="tasks-present"
                         REFUSAL_DETAIL="task count could not be confirmed after the drain"
                         echo "Aborting. Confirm the drain from a manager and re-run."
@@ -1460,7 +1875,11 @@ if [ "$SWARM_STATE" = "active" ]; then
                     echo "Tasks still on this node: $TASKS"
                     docker node ps "$SWARM_NODE_ID" --filter "desired-state=running" || true
                     echo ""
-                    if ! prompt_yes_no "Continue with upgrade anyway? [y/N]" "n"; then
+                    # The SAME gate as the unknown-count branch above, on
+                    # purpose: one flag covers both. The distinction is not
+                    # lost -- it survives in the record as tasks_remaining=3
+                    # versus tasks_remaining=unknown.
+                    if ! gate proceed-with-tasks "Continue with upgrade anyway? [y/N]" "n"; then
                         REFUSAL_REASON="tasks-present"
                         REFUSAL_DETAIL="$TASKS task(s) still on this node after the drain"
                         echo "Aborting. Please wait for tasks to migrate and re-run."
@@ -1489,15 +1908,22 @@ if [ "$SWARM_STATE" = "active" ]; then
             echo -e "  ${YELLOW}docker node update --availability drain $(hostname)${NC}"
             echo ""
 
-            if ! prompt_yes_no "Has this node been drained from a manager? [y/N]" "n"; then
+            if ! gate assume-drained "Has this node been drained from a manager? [y/N]" "n"; then
                 REFUSAL_REASON="drain-unconfirmed"
                 REFUSAL_DETAIL="worker drain was not attested"
                 echo "Aborting. Please drain this node from a manager and re-run."
                 exit 1
             fi
+            # Accepted. An attestation, not a drain: nothing on this node
+            # verified it, and the record says whether a flag or a human said so.
+            if [ -n "${GATE_ANSWERS[assume-drained]:-}" ]; then
+                DRAIN_ATTESTED_BY="flag"
+            else
+                DRAIN_ATTESTED_BY="prompt"
+            fi
         fi
     else
-        echo "Node is already drained/paused. Proceeding with upgrade."
+        echo "Node is already $NODE_AVAILABILITY. Proceeding with upgrade."
     fi
 else
     SWARM_ROLE_TOKEN="none"
@@ -2092,7 +2518,7 @@ CURRENT_PHASE="phase 10 (swarm reactivation)"
 
         if [ "$CURRENT_AVAILABILITY" = "drain" ]; then
             echo ""
-            if prompt_yes_no "Set this node back to ACTIVE? [Y/n]" "y"; then
+            if gate reactivate "Set this node back to ACTIVE? [Y/n]" "y"; then
                 echo "Activating node..."
                 docker node update --availability active "$SWARM_NODE_ID"
                 NODE_AVAILABILITY_AFTER="active"

@@ -16,20 +16,35 @@ window. An upgrade that proceeds on a false attestation costs whatever was runni
 
 ## What this interface is today, honestly
 
-Three things make this hard to drive, and none of them is fixed yet.
+**You no longer need a terminal for the upgrade or the network cleanup.** Every question
+those two ask is now a named gate with a flag for each answer, and `--non-interactive` turns
+an unanswered gate into a refusal instead of a prompt. `rollback-docker.sh` still needs a
+terminal; its one question becomes a flag in a later change.
 
-**You need a terminal.** In the upgrade, rollback and network-cleanup scripts every prompt
-goes through one helper that treats end-of-file as a refusal, not as a default. It prints
-`ERROR: stdin closed - cannot read an answer.` and exits 1. That is deliberate: a wrapper
-piping `/dev/null` would otherwise silently answer yes to every prompt, including the three
-that default to yes. `recover-dnf.sh` is the exception and behaves differently — see below.
+Under `--non-interactive` the prompt helper is **never reached**. Not reached and
+auto-answered — never reached. A wrapper piping `/dev/null`, or `yes y`, still cannot answer
+anything, because there is nothing to answer.
 
-- `ssh host /opt/docker-offline/upgrade-docker.sh` fails at the first prompt it reaches. Use
-  `ssh -t`. Some runs reach no prompt at all — an expected-baseline upgrade on a non-Swarm
-  host, or a rollback with at most one backup — but you cannot know that in advance, so
-  always allocate a terminal.
+**Every flag states one fact you are accountable for.** Not a preference, a fact.
+`--assume-drained` asserts that a drain happened somewhere else; it performs none. The record
+writes `drain_attested_by=flag`, so an audit afterwards can tell a flag that was trusted from
+a question a human answered.
+
+**Without `--non-interactive` you still need a terminal.** The prompt helper treats
+end-of-file as a refusal, not as a default: it prints
+`ERROR: stdin closed - cannot read an answer.` and exits 1. That is deliberate, and it is what
+makes the strict mode a strictness switch rather than a way to auto-answer.
+
+- `ssh host /opt/docker-offline/upgrade-docker.sh` with no flags fails at the first prompt it
+  reaches. Use `ssh -t`, or pass the gate flags and `--non-interactive`.
 - Piping input works but is dangerous, because you are answering questions you cannot read.
-  Do not do it.
+  Do not do it. Pass the flags instead.
+- `recover-dnf.sh` is the exception to the end-of-file rule and behaves differently — see
+  below.
+
+**A pre-declared answer wins in both modes.** `--drain-self` skips that prompt on an
+interactive run too. The flag states a fact; the mode only decides what happens to facts
+nobody stated.
 
 **An end-of-file refusal is not automatically harmless.** It always exits 1, but what state it
 leaves depends on which prompt it hit. Hitting it at the first two prompts changes nothing.
@@ -43,6 +58,10 @@ check Swarm availability; do not assume.
 **Exit 0 has three meanings** in the upgrade script: the upgrade completed, or the node was
 already at the target and you declined the re-run, or the starting version was unrecognised
 and you declined to continue. All three exit 0 and only the last two leave the node unchanged.
+
+Under `--non-interactive` the middle one gets its own code: an already-at-target node with no
+`--rerun-at-target` exits **3** with `result=nothing-to-do`. Interactively it still exits 0, so
+no existing wrapper sees a new code. Read `result`, not the status, whenever both are available.
 
 Nonzero is worse. Every deliberate refusal uses 1, but a command that fails under `set -e`
 propagates its own status, and an interrupt exits 130 or 143. **The important point is that a
@@ -116,7 +135,7 @@ manager throws that ordering away.
 |---|---|
 | Not in a Swarm | Nothing |
 | **Worker** | Drain it and confirm it is empty. Unavoidable: a worker cannot drain or inspect itself, and the script only asks whether it happened. This does mean a phase-0 refusal leaves the worker drained — restore it and retry later |
-| **Manager, `active` or `unknown`** | **Nothing.** Let phase 0 run first, then answer the drain prompt yes and let the script drain and count tasks for you. This is the ordering the script exists to provide |
+| **Manager, `active` or `unknown`** | **Nothing.** Let phase 0 run first, then pass `--drain-self` (or answer the prompt yes) and let the script drain and count tasks for you. This is the ordering the script exists to provide |
 | **Manager, already `drain`** | Leave it drained and confirm it is empty. The script skips its own drain and task-count block on a node that is not active, so it will not check |
 | **Manager, `pause`** | Confirm it is empty. The script skips its drain block here too. If tasks remain, drain it deliberately and remember to restore `pause` in step four |
 
@@ -134,7 +153,40 @@ on a timer.
 The same applies to any re-run of a manager that an earlier attempt left drained: the script
 will not re-count tasks, so you must.
 
-**Step two — run the upgrade on the node, on a terminal.**
+**Step two — preflight, then run the upgrade.**
+
+Preflight first, on every node, and gate on its result:
+
+```bash
+cd /opt/docker-offline
+./upgrade-docker.sh --preflight --non-interactive --status-file=/run/preflight-$(date +%s).kv
+```
+
+Read `result`. Only `ready` means go. Then run the real upgrade with a **fresh** status-file
+path and exactly the gates preflight named, one flag per fact you have verified:
+
+```bash
+./upgrade-docker.sh --non-interactive --status-file=/run/upgrade-$(date +%s).kv \
+    --drain-self --proceed-with-tasks --reactivate
+```
+
+That example is a manager you recorded as `active`. Substitute your own answers:
+
+| Node | Gate flags |
+|---|---|
+| Not in a Swarm | none |
+| Worker, drained in step one and confirmed empty | `--assume-drained` |
+| Manager recorded `active` | `--drain-self --reactivate`, plus `--proceed-with-tasks` or `--no-proceed-with-tasks` |
+| Manager already `drain` | `--reactivate` if you recorded `active`, otherwise `--no-reactivate`. The run does **not** re-drain or re-count tasks on a node that is already drained, so confirm it is empty yourself first |
+| Manager already `pause` | none. The run skips both the drain and the reactivation on a paused node |
+| Manager you do not want drained | `--no-drain-self` |
+
+**Answer `--proceed-with-tasks` explicitly on any manager.** It is a conditional gate:
+preflight cannot tell you whether the run will reach it, and reaching it with no answer refuses
+the run *after* the drain. `--no-proceed-with-tasks` is the safe answer — it stops rather than
+upgrade a node whose tasks have not migrated.
+
+On a terminal, with no flags at all, it still behaves exactly as it always has:
 
 ```bash
 cd /opt/docker-offline && ./upgrade-docker.sh
@@ -169,23 +221,89 @@ docker node update --availability <the value you recorded> <node-hostname>
 `active` goes back to `active`, `pause` back to `pause`, `drain` back to `drain`. Do not
 default to `active`.
 
-A manager that ends the run drained is offered a reactivation prompt that defaults to **yes**.
-Answer yes only if you recorded `active`. If you recorded `pause` or `drain`, answer **no** —
-it prints the command and leaves the node drained — then set the recorded value yourself.
-A worker is never offered the prompt and always needs this step done from a manager.
+A manager that ends the run drained reaches the `reactivate` gate, which defaults to **yes**.
+Pass `--reactivate` only if you recorded `active`. If you recorded `pause` or `drain`, pass
+`--no-reactivate` — it prints the command and leaves the node drained — then set the recorded
+value yourself. A worker never reaches the gate and always needs this step done from a manager.
+
+The record confirms what happened: `node_availability_before` and `node_availability_after`,
+and `drain_performed` for whether **this run** did the draining.
 
 ## Flags
-
-**No flag answers a prompt.** There is still no way to run an *upgrade*, a rollback or a
-cleanup without a terminal. `--preflight` is the exception and the only one: it never prompts,
-so it runs unattended.
 
 | Flag | Scripts | Effect |
 |---|---|---|
 | `--preflight` | upgrade | Run every check that can be made with the node untouched, report, exit |
+| `--non-interactive` | upgrade, cleanup | Refuse, rather than prompt, on a gate with no answer. **Requires `--status-file`** |
 | `--status-file=PATH` | all three | Write a `key=value` record of the run to PATH. Absolute paths only |
 | `--help` | all three | Usage, exit 0. Works as any user and touches nothing |
 | `--version` | all three | The script's version, exit 0 |
+
+`rollback-docker.sh` has no gate flags and no `--non-interactive` yet. Run it on a terminal.
+
+### `--non-interactive`
+
+It is a **strictness** switch, not a consent switch. It grants nothing. It changes exactly two
+things: an unanswered gate refuses instead of prompting, and the richer exit codes 2 and 3
+become available.
+
+Refusing looks like this — exit 1, and on the node nothing has happened:
+
+```
+ERROR: --non-interactive was given and gate 'drain-self' was not answered.
+  question: Drain this node now? [Y/n]
+  pass --drain-self or --no-drain-self
+```
+
+The record then carries `result=refused`, `refusal_reason=gate-unanswered:drain-self`,
+`next_action=supply-flag`, and `gates_unanswered` names every gate still missing an answer.
+
+**`--NAME` and `--no-NAME` together are refused at parse time**, not resolved by order. Each
+flag states one fact, so a contradictory pair is two incompatible claims rather than a
+preference; letting the last one win is how a wrapper that appends a default silently overrides
+a deliberate answer.
+
+**`--non-interactive` without `--status-file` is refused at parse time**, before anything is
+written anywhere. Exit 1 conflates a refusal with a failure, and 130 and 143 say nothing about
+phase, service state or package state. Without the file the fields this document tells you to
+read do not exist.
+
+### Gate flags — `upgrade-docker.sh`
+
+Every gate takes `--NAME` for yes and `--no-NAME` for no.
+
+| Gate | Fact you are asserting | Unanswered under `--non-interactive` |
+|---|---|---|
+| `rerun-at-target` | run again although all five packages already match | exit **3**, `result=nothing-to-do`, node untouched |
+| `allow-unverified-baseline` | this starting version is acceptable | refuse, exit 1 |
+| `drain-self` | drain this manager now | refuse, exit 1 |
+| `proceed-with-tasks` | continue although tasks may still be here | refuse, exit 1 |
+| `assume-drained` | a manager has already drained this node | refuse, exit 1 |
+| `reactivate` | return this manager to active at the end | refuse, exit 1 |
+
+`rerun-at-target` is the only gate whose unanswered state resolves safely by implication: its
+"no" branch does nothing at all, so a distinct exit code beats a refusal. **Do not pass
+`--rerun-at-target` to make an exit 3 go away.** Pass it only when you are deliberately
+repairing a node — see the phase-6 recovery below, where it is required.
+
+`proceed-with-tasks` deliberately covers both task questions. The distinction is not lost: it
+survives in the record as `tasks_remaining=3` versus `tasks_remaining=unknown`.
+
+### Gate flags — `clean-swarm-networks.sh`
+
+| Gate | Fact you are asserting | Unanswered under `--non-interactive` |
+|---|---|---|
+| `allow-non-swarm` | run this on a host that is not in a Swarm anyway | refuse, exit 1 |
+| `assume-drained` | a manager has already drained this node | refuse, exit 1 |
+| `confirm-stop` | stop docker and containerd now | refuse, exit 1 |
+| `confirm-delete` | delete the enumerated inventory | refuse, exit 1 |
+
+**`--confirm-delete` is refused on its own, in every mode**, with
+`refusal_reason=inventory-sha-required` and the node untouched. The inventory is enumerated
+only *after* the services stop, so a pre-declared yes would authorise deleting a list nothing
+had seen — which is the exact bypass this interface exists to prevent. The flag that supplies
+the hash to check the inventory against arrives with the dry run in a later change. Until then
+the only path to deletion is answering the live question after enumeration, on a terminal.
 
 ### `--preflight`
 
@@ -219,12 +337,31 @@ Preflight **predicts**; the phases still **enforce**. Phase 6 keeps its own copy
 checks, through the same helpers, so the two cannot answer differently. A node can be repaired,
 or broken, between the two runs.
 
-**What it does not give you is a complete list of the prompts the real run will reach.** It
-prints a line where it meets one it can see — the re-run offer, the unverified-baseline
-question, the drain — but two of the six depend on what the run *does* rather than on what the
-node looks like at rest, and preflight never reaches them. Treat those printed lines as
-advisory, not as the full set, and do not conclude from a quiet preflight that the real run
-will not stop and ask.
+**It also reports which gates the real run would reach, in two lists.** `gates_required` names
+the gates the run certainly reaches; `gates_conditional` names the ones whose reachability
+depends on what the run *does*, which preflight cannot see from a node at rest.
+
+- Without `--non-interactive` both lists are informational.
+- With `--non-interactive`, preflight **refuses** on any unanswered gate in `gates_required` —
+  exit 1, `refusal_reason=gate-unanswered:<the first>`, `gates_unanswered` listing all of them.
+  An unanswered gate in `gates_conditional` is **reported, not refused**: the run may never
+  reach it, and refusing would force you to pre-answer a question that may not be asked.
+
+The claim this supports is bounded, and this document will not overstate it: **preflight
+validates every gate that is certain and names the ones that are not.** A run that passes
+preflight can still stop on a conditional gate. That is safe — the node is drained but not
+upgraded, and the record says so — but it is not "validate everything up front".
+
+**So on any Swarm manager, answer `gates_conditional` explicitly.** Pass
+`--proceed-with-tasks` or `--no-proceed-with-tasks`, and `--reactivate` or `--no-reactivate`,
+rather than relying on a quiet preflight.
+
+Two of the six gates are also promoted or dropped by the flags you already passed.
+`--drain-self` promotes `reactivate` from conditional to required, because the run will
+certainly drain and therefore certainly offer to reactivate. `--no-drain-self` drops both
+`proceed-with-tasks` and `reactivate`, because neither is reached when no drain runs — but
+**only on a node the drain question would actually reach**. A manager already in `drain` never
+reaches that question, so its reactivation stays required whatever the drain flag says.
 
 An unrecognised argument is now a usage error: it exits 1 with a message and writes no status
 file. It used to be ignored silently.
@@ -269,13 +406,13 @@ merely probed.
 | `ended` | ISO 8601 UTC, or `unknown` |
 | `host` | hostname |
 | `rhel` | RHEL major, or `unknown` |
-| `mode` | `interactive` \| `preflight` |
+| `mode` | `interactive` \| `non-interactive` \| `preflight` |
 | `result` | `running` \| `ready` \| `completed` \| `nothing-to-do` \| `refused` \| `failed` \| `interrupted` |
 | `exit_code` | integer, or `unknown` in a startup record |
 | `phase` | the phase the script was in |
 | `refusal_reason` | a token, or empty. See the refusal table below |
 | `refusal_detail` | one line of free text, or empty |
-| `next_action` | `none` \| `proceed` \| `start-services` \| `investigate` \| `rerun-as-root` \| `restore-config` \| `rebuild-bundle` \| `fix-mount` \| `drain-from-manager` |
+| `next_action` | `none` \| `proceed` \| `start-services` \| `investigate` \| `supply-flag` \| `rerun-as-root` \| `restore-config` \| `rebuild-bundle` \| `fix-mount` \| `drain-from-manager` \| `rerun-dry-run` |
 | `log` | log file path |
 | `log_started` | `true` \| `false` — false for exits before the log redirection was installed, whose output reached the terminal only |
 | `docker_active` | `active` \| `inactive` \| `failed` \| `activating` \| `deactivating` \| `unknown` |
@@ -304,6 +441,8 @@ services, which is what its recovery logic needs. A stop that failed partway lea
 | `tasks-present` | tasks remained, or could not be counted, after the drain | upgrade |
 | `drain-unconfirmed` | the drain attestation was declined | upgrade, cleanup |
 | `stop-failed` | a unit was not conclusively stopped | all three |
+| `gate-unanswered:<name>` | `--non-interactive` was given and that question had no flag | upgrade, cleanup |
+| `inventory-sha-required` | `--confirm-delete` was given with no inventory hash to check it against | cleanup |
 | `relocated-root-missing` | the configured containerd root does not exist | upgrade |
 | `verification-failed` | installed versions do not match the target | upgrade, rollback |
 | `config-version-blocks-rollback` | the config the rollback would load is one it cannot read | rollback |
@@ -347,6 +486,12 @@ answer; read `pkg_state` and `refusal_detail`.
 | `node_availability_before` | `active` \| `drain` \| `pause` \| `unknown` |
 | `node_availability_after` | same, or `unknown` if the run never reached reactivation |
 | `drain_performed` | `true` \| `false` — whether **this run** drained the node |
+| `drain_attested_by` | `flag` \| `prompt` \| `not-required` — how the drain fact reached this run |
+| `gates_required` | comma-separated names this run certainly reaches, or `unknown` |
+| `gates_conditional` | comma-separated names it may reach, or `unknown` |
+| `gates_answered` | comma-separated `name:y` / `name:n`, or empty |
+| `gates_unanswered` | names in either list with no flag, or `unknown` |
+| `gates_seen` | names this run actually reached, in order, or empty |
 | `tasks_remaining` | integer \| `unknown` \| `n/a` |
 | `containerd_config` | path |
 | `containerd_config_version` | integer \| `unknown` |
@@ -438,6 +583,11 @@ guard decided.
 | `failed_items` | integer, or `unknown` |
 | `recovery_attempted` | `true` \| `false` |
 | `recovery_succeeded` | `true` \| `false` \| `n/a` |
+| `gates_required` | comma-separated names this run certainly reaches, or `unknown` |
+| `gates_conditional` | comma-separated names it may reach, or `unknown` |
+| `gates_answered` | comma-separated `name:y` / `name:n`, or empty |
+| `gates_unanswered` | names in either list with no flag, or `unknown` |
+| `gates_seen` | names this run actually reached, in order, or empty |
 
 <!-- /status-keys -->
 
@@ -451,22 +601,24 @@ A failed recovery is recorded as `result=failed` even when the run was refused, 
 that is down is the fact that matters; `refusal_reason` still says what led there. An interrupt
 keeps `result=interrupted`, so the record never contradicts its own `exit_code`.
 
-## The prompts, and how to answer each
+## The gates, and how to answer each
 
-The bracketed letter is the default, but the default only applies to an empty line of input.
-End-of-file is refused, not defaulted.
+Each question below is a named gate. Pass `--NAME` for yes or `--no-NAME` for no, in either
+mode, or answer it live on a terminal. The bracketed letter is the default, and the default
+only applies to an empty line of typed input: end-of-file is refused, not defaulted, and under
+`--non-interactive` the question is never asked at all.
 
 ### `upgrade-docker.sh`
 
-| When it fires | Question | Default | How to decide |
-|---|---|---|---|
-| All five packages already at target | Re-run the upgrade anyway? | no | **No**, unless you are deliberately repairing a node — see the phase-6 recovery below, where the answer is yes. The no branch changes nothing and exits 0 |
-| Not at target, not a partial upgrade, and docker or containerd differs from the tested starting pair | Continue from this unverified starting version? | no | **No** by default. Report the versions it printed and stop. Yes only if a human has approved that specific starting version. Note this does **not** fire on a partial upgrade: if either core package is already at target the script proceeds without asking |
-| Manager whose availability reads `active` **or** `unknown` | Drain this node now? | **yes** | Yes. `unknown` means the node inspect failed, so treat it as undrained. If you already drained in step one this prompt does not fire at all |
-| Tasks could not be counted after the drain | Continue with upgrade anyway? | no | **No.** Check `docker node ps` from another manager first. "Could not count" is not "none" |
-| Tasks are still on the node after the drain | Continue with upgrade anyway? | no | **No.** Wait for them to migrate, confirm empty from a manager, then re-run |
-| Worker | Has this node been drained from a manager? | no | Yes **only if you performed step one and saw the task list empty**. This is an attestation, not an instruction — answering yes drains nothing |
-| Manager finished the upgrade while drained | Set this node back to ACTIVE? | **yes** | Yes **only if the availability you recorded in step one was `active`**, and only once you have verified the node. Otherwise no: it leaves the node drained and prints the command, and you then set the recorded value |
+| Gate | When it fires | Question | Default | How to decide |
+|---|---|---|---|---|
+| `rerun-at-target` | All five packages already at target | Re-run the upgrade anyway? | no | **No**, unless you are deliberately repairing a node — see the phase-6 recovery below, where the answer is yes. The no branch changes nothing and exits 0 |
+| `allow-unverified-baseline` | Not at target, not a partial upgrade, and docker or containerd differs from the tested starting pair | Continue from this unverified starting version? | no | **No** by default. Report the versions it printed and stop. Yes only if a human has approved that specific starting version. Note this does **not** fire on a partial upgrade: if either core package is already at target the script proceeds without asking |
+| `drain-self` | Manager whose availability reads `active` **or** `unknown` | Drain this node now? | **yes** | Yes. `unknown` means the node inspect failed, so treat it as undrained. If you already drained in step one this prompt does not fire at all |
+| `proceed-with-tasks` | Tasks could not be counted after the drain | Continue with upgrade anyway? | no | **No.** Check `docker node ps` from another manager first. "Could not count" is not "none" |
+| `proceed-with-tasks` | Tasks are still on the node after the drain | Continue with upgrade anyway? | no | **No.** Wait for them to migrate, confirm empty from a manager, then re-run |
+| `assume-drained` | Worker | Has this node been drained from a manager? | no | Yes **only if you performed step one and saw the task list empty**. This is an attestation, not an instruction — answering yes drains nothing |
+| `reactivate` | Manager finished the upgrade while drained | Set this node back to ACTIVE? | **yes** | Yes **only if the availability you recorded in step one was `active`**, and only once you have verified the node. Otherwise no: it leaves the node drained and prints the command, and you then set the recorded value |
 
 ### `rollback-docker.sh`
 
@@ -478,20 +630,48 @@ One prompt, and only when more than one `/root/docker-backup-*` directory exists
 
 ### `clean-swarm-networks.sh`
 
-Four prompts, two of them unconditional — the drain attestation and the stop confirmation.
-Because those two always fire, this script cannot be run without a terminal at all.
+Four gates, two of them unconditional — the drain attestation and the stop confirmation.
 
-| When it fires | Question | Default | Decline does |
-|---|---|---|---|
-| Swarm state is anything but `active` | Continue anyway? | no | exits 0, nothing changed |
-| Always, after the above | Has this node been drained? | no | exits 0, nothing changed |
-| Always, after the above | Stop docker and containerd now? | no | exits 0, nothing changed |
-| Only when the enumerated inventory is non-empty | Delete the state listed above? | no | restarts services, exits 0, nothing deleted |
+| Gate | When it fires | Question | Default | Decline does |
+|---|---|---|---|---|
+| `allow-non-swarm` | Swarm state is anything but `active` | Continue anyway? | no | exits 0, nothing changed |
+| `assume-drained` | Always, after the above | Has this node been drained? | no | exits 0, nothing changed |
+| `confirm-stop` | Always, after the above | Stop docker and containerd now? | no | exits 0, nothing changed |
+| `confirm-delete` | Only when the enumerated inventory is non-empty | Delete the state listed above? | no | restarts services, exits 0, nothing deleted |
+
+`--confirm-delete` on its own is refused in every mode; see the flag section above.
 
 The drain attestation here attests only to the drain. The script never checks task emptiness,
 so confirm it yourself from a manager before running this.
 
 ## Reading the outcome
+
+### The decision table
+
+Read this first, from the status file. The prose below is for a run that had no
+`--status-file`, or for a human reading the log afterwards.
+
+| `result` | `refusal_reason` | `next_action` | Do this |
+|---|---|---|---|
+| _file absent_ | — | — | the run never started; fix the invocation and retry |
+| _last line is not `status_complete=1`_ | — | — | incomplete file; treat it as unknown |
+| `running` | — | — | no complete final record was published — a kill, a power loss, or a trap that could not write. Inspect the node before rerunning |
+| `ready` | — | `proceed` | run the real upgrade, answering every gate in `gates_required` and every gate in `gates_conditional` that applies |
+| `completed` | — | `none` | verify, then restore the availability you recorded |
+| `nothing-to-do` | — | `none` | move to the next node |
+| `refused` | `not-root` | `rerun-as-root` | re-invoke as root |
+| `refused` | `bad-usage` | `none` | fix the invocation. **No status file is written for a usage error**, so any file at that path is from an earlier run — check `run_id` |
+| `refused` | `payload-invalid` | `rebuild-bundle` | stop the rollout; the bundle is wrong on this node |
+| `refused` | `dry-run-failed` | `investigate` | stop; report `refusal_detail` |
+| `refused` | `containerd-1x` | `investigate` | stop; this node needs the major-boundary script |
+| `refused` | `gate-unanswered:<name>` | `supply-flag` | **verify the fact, then supply the flag.** Never supply it to clear the error |
+| `refused` | `relocated-root-missing` | `fix-mount` | mount the filesystem, then preflight again |
+| `refused` | `tasks-present` | `investigate` | the drain already ran; wait and look from a manager |
+| `refused` | `drain-unconfirmed` | `drain-from-manager` | drain it from a manager, confirm it is empty, then retry |
+| `refused` | `config-version-blocks-rollback` | `restore-config` | restore the named backup, then try again |
+| `refused` | `inventory-sha-required` | `rerun-dry-run` | you cannot pre-answer the deletion; run the cleanup on a terminal |
+| `failed` / `interrupted` | — | `start-services` | packages untouched, services down: start containerd, wait, then docker |
+| `failed` / `interrupted` | — | `investigate` | report `pkg_state`, `phase` and the log; do not guess between retry and rollback |
 
 **Success.** The upgrade prints `UPGRADE COMPLETE` and the rollback prints
 `ROLLBACK COMPLETE`. Verify anyway; a banner is not a version check.
@@ -577,10 +757,11 @@ Recovery, in order:
    `findmnt` alone would pass on a mounted parent with the directory still missing.
 3. If the node is in a Swarm, confirm from a manager that it is still drained and still empty.
 4. Re-run the script from the top. It is safe to re-run.
-5. **Answer yes to the "Re-run the upgrade anyway?" prompt.** The phase-5 transaction already
-   succeeded, so all five packages are at the target and the re-run opens with that prompt,
-   which defaults to **no**. Answering no exits 0 without ever reaching phase 6, leaving the
-   node with stopped services and nothing fixed.
+5. **Pass `--rerun-at-target`, or answer yes to the "Re-run the upgrade anyway?" question.**
+   The phase-5 transaction already succeeded, so all five packages are at the target and the
+   re-run opens at that gate, which defaults to **no**. Answering no exits 0 (or 3 under
+   `--non-interactive`) without ever reaching phase 6, leaving the node with stopped services
+   and nothing fixed. This is the one situation in which that flag is correct.
 6. **If the node is in a Swarm, restore the recorded availability from a manager
    afterwards.** Do not wait for the script to do it.
 
@@ -645,10 +826,20 @@ measured.
   it writes a config version the rollback containerd cannot read, arming a trap that springs
   only during an emergency. The upgrade never overwrites an existing config; only its
   missing-file branch generates one, and it warns loudly when it has to.
-- **Never answer the worker drain attestation yes without having drained.** It asserts a fact
-  about the rest of the cluster. It performs nothing.
-- **Never continue past the tasks-remaining prompt to save time.** That prompt exists because
-  the drain did not finish.
+- **Never pass `--assume-drained`, or answer that attestation yes, without having drained.**
+  It asserts a fact about the rest of the cluster. It performs nothing, and the record notes
+  that a flag was trusted rather than a check performed.
+- **Never pass a gate flag to make a refusal go away.** `refusal_reason=gate-unanswered:<name>`
+  is a question, not an obstacle. Verify the fact first; if you cannot, report and stop.
+- **Never pass `--rerun-at-target` to turn an exit 3 into an exit 0.** Exit 3 means the node is
+  already done. The only reason to re-run at target is a deliberate repair, and the phase-6
+  recovery below is the one that needs it.
+- **Never continue past `--proceed-with-tasks` to save time.** That gate exists because the
+  drain did not finish. Under `--non-interactive` prefer `--no-proceed-with-tasks`: it refuses
+  after the drain rather than upgrading a node still running work.
+- **Never pass `--non-interactive` and then read only the exit code.** The mode requires
+  `--status-file` for exactly this reason. Exit 1 covers both a safe refusal and a failure
+  after the node was modified; `result`, `refusal_reason` and `pkg_state` separate them.
 - **Never install or downgrade the engine and the runtime in separate rpm transactions.**
   Resolving them together is what stops a downgraded runtime ending up under a newer engine.
 - **Never substitute the `containerd` package for `containerd.io`.** They are different
@@ -666,7 +857,9 @@ measured.
   `ctr snapshots --snapshotter overlayfs ls` must succeed. systemd reports containerd active
   before its snapshotter is usable, and a sleep is not readiness.
 - **Never re-enumerate the cleanup inventory after the confirmation.** The list you were shown
-  is the list that gets deleted; that is the whole point of enumerating after the stop.
+  is the list that gets deleted; that is the whole point of enumerating after the stop. It is
+  also why `--confirm-delete` alone is refused in every mode: a pre-declared yes would
+  authorise deleting a list nothing had seen.
 - **Never assume a version, or blindly restart services, after `UNKNOWN - the rpm
   transaction`.** Inspect what is installed first.
 - **Never run `clean-swarm-networks.sh` as a routine post-upgrade step.** It is a destructive
@@ -691,8 +884,9 @@ Stop and report. Do not improvise on a disconnected production node.
   sits at the end and older runs sit above it. They contain ANSI escapes.
 - Backups are `/root/docker-backup-<timestamp>/`, named so that lexical order is chronological.
 
-A note on what does not exist yet: there is no `--yes`, no `--non-interactive` and no
-`--preflight`. Only `--status-file`, `--help` and `--version` exist, and none of them answers a
-prompt. If you find yourself wanting the others, that is the correct instinct and the work is
-planned — but do not invent flags. An unrecognised argument is now a usage error, so a
-misspelled flag fails loudly instead of being ignored.
+A note on what does not exist yet. There is no `--yes`, and there never will be: a blanket
+consent flag is exactly what the per-gate flags replace. `rollback-docker.sh` has no
+`--non-interactive` and no gate flags — run it on a terminal. `clean-swarm-networks.sh` has no
+`--dry-run` and no way to supply an inventory hash yet, which is why `--confirm-delete` is
+refused on its own. Do not invent flags: an unrecognised argument is a usage error, so a
+misspelled one fails loudly instead of being ignored.

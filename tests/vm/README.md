@@ -186,9 +186,14 @@ phase 0c would be guarding nothing and should be reconsidered, not kept.
 
 **Does NOT prove:**
 
-- **Swarm anything.** Single node. Drain, reactivation, overlay reconvergence,
-  mixed-version clusters and `clean-swarm-networks.sh` are all untested here — that
-  is Tier 3 and needs a real multi-node cluster.
+- **Swarm beyond one node.** The agent-mode phase does build a real single-node Swarm
+  with `docker swarm init`, so a **manager draining and reactivating itself** is
+  exercised, and so are the cleanup script's gates. Everything else is untested:
+  **worker behaviour of any kind** — a single node is always its own manager, and
+  demoting the last manager is refused, so there is no way to make one here —
+  multi-node operation, overlay reconvergence, mixed-version clusters, and the
+  destructive half of `clean-swarm-networks.sh`. That is Tier 3 and needs a real
+  multi-node cluster.
 - **Real RHEL.** Rocky is a rebuild, not RHEL. Subscription-manager, satellite
   behaviour, and any RHEL-specific packaging differences are out of scope — and the
   satellite SSL problem is the entire reason these scripts use `rpm` over `dnf`.

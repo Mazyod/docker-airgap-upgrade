@@ -47,18 +47,18 @@ if ! vm_restart; then
     exit 1
 fi
 
-fs=$(vm_try "findmnt -n -o FSTYPE --target $RELOCATED_ROOT" | tr -d '\r' | tail -1)
-src=$(vm_try "findmnt -n -o SOURCE --target $RELOCATED_ROOT" | tr -d '\r' | tail -1)
-
-if [ "$fs" = "xfs" ]; then
-    ok "relocated root is back on xfs after restart ($src)"
-else
-    bad "relocated root came back on '${fs:-<none>}' (source '${src:-<none>}'), not xfs"
-    echo "       This is the shadow-root hazard. Check that data.mount is enabled" >&2
-    echo "       and that containerd.service has the RequiresMountsFor drop-in." >&2
-fi
-
-assert_vm_eq "data.mount is active" "systemctl is-active data.mount" "active"
+# The FULL S1 precondition, not a weaker re-probe of two of its five facts.
+#
+# This used to check FSTYPE and `is-active data.mount` by hand, which accepts a
+# hand-made `mount -o loop` of some other image: systemd ADOPTS any mount at
+# /data into data.mount and reports it active. require_relocated_xfs is the one
+# definition of the precondition -- mount point, filesystem, a /dev/loop*
+# source, that the source is backed by THIS harness image, is-active AND
+# is-enabled -- and is-enabled is the half that says the mount would survive the
+# NEXT restart too, which is exactly what this script is about. It names every
+# fact that failed and exits; nothing below it is meaningful without it.
+require_relocated_xfs
+ok "relocated root is back on the separate XFS after restart"
 
 # From here on, containerd being absent or down is a DEFECT, not a skip.
 # bootstrap-vm.sh installs it, enables it and starts it before this script

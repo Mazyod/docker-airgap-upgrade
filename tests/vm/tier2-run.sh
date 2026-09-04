@@ -39,15 +39,57 @@ require_relocated_xfs
 PHASE_ARG="${1:-all}"
 PKG_DIR="/opt/docker-offline/rhel9"
 
-# Restore a pristine package directory from the recorded bundle.
+# A pristine, already-extracted copy of the bundle, kept beside it in the guest.
+#
+# restore_pkgs runs before every rejection case -- eleven times in a full run --
+# and used to re-extract the whole 350 MB tarball each time. `gzip -t` alone on
+# that file measures 1.56 s in the guest, so a run spent ~17 s decompressing
+# before any tar write, to reset a directory of five RPMs.
+#
+# Keyed on the bundle's digest, so a rebuilt bundle is re-extracted rather than
+# silently reset from a stale copy -- the one way a cache like this could make
+# the whole suite test yesterday's artifact.
+PRISTINE="/root/pristine-docker-offline"
+ensure_pristine() {
+    if ! vm "set -e
+want=\$(sha256sum /opt/docker-upgrade-bundle.tar.gz | cut -d' ' -f1)
+have=\$(cat $PRISTINE.sha256 2>/dev/null || echo none)
+if [ \"\$want\" != \"\$have\" ] || [ ! -d $PRISTINE ]; then
+    rm -rf $PRISTINE $PRISTINE.tmp $PRISTINE.sha256
+    mkdir -p $PRISTINE.tmp
+    tar xzf /opt/docker-upgrade-bundle.tar.gz -C $PRISTINE.tmp
+    mv $PRISTINE.tmp/docker-offline $PRISTINE
+    rm -rf $PRISTINE.tmp
+    printf '%s\n' \"\$want\" > $PRISTINE.sha256
+fi" >/dev/null 2>&1; then
+        echo "  ${RED}ERROR${NC}: could not extract a pristine copy of the bundle in the VM." >&2
+        echo "  Every rejection case restores from it; without it they would run" >&2
+        echo "  against whatever the previous case left behind." >&2
+        exit 1
+    fi
+}
+
+# Restore a pristine package directory from that copy.
+#
+# Fails the RUN, not silently. A restore that did not happen leaves the previous
+# case's sabotage in place and the next case passes or fails for that reason
+# instead of its own.
 restore_pkgs() {
-    vm "rm -rf /opt/docker-offline && tar xzf /opt/docker-upgrade-bundle.tar.gz -C /opt/" >/dev/null 2>&1
+    if ! vm "set -e
+rm -rf /opt/docker-offline
+cp -a $PRISTINE /opt/docker-offline" >/dev/null 2>&1; then
+        echo "  ${RED}ERROR${NC}: could not restore /opt/docker-offline from $PRISTINE." >&2
+        exit 1
+    fi
 }
 
 # Run the upgrade with stdin closed. Any prompt is a hard failure by design
 # (prompt_yes_no refuses EOF), which makes an unexpected prompt loud rather
 # than silently auto-answered.
 run_upgrade() { vm_try "cd /opt/docker-offline && ./upgrade-docker.sh </dev/null 2>&1"; }
+
+# One extraction, before any case needs it.
+ensure_pristine
 
 # --- helper: assert the node was NOT touched by a rejected run ---------------
 assert_untouched() {
@@ -146,14 +188,18 @@ if [ "$WRONG_CONTAINERD_RELEASE" = "$TARGET_CONTAINERD_RELEASE" ]; then
     bad "2.6a WRONG_CONTAINERD_RELEASE equals the target release -- no wrong build exists to test"
 fi
 restore_pkgs
-WRONG_CT_RPM="containerd.io-$TARGET_CONTAINERD-$WRONG_CONTAINERD_RELEASE.el9.x86_64.rpm"
 vm "rm -f $PKG_DIR/containerd.io-*.rpm
     dnf download -q --destdir=$PKG_DIR containerd.io-$TARGET_CONTAINERD-$WRONG_CONTAINERD_RELEASE.el9 >/dev/null 2>&1" >/dev/null 2>&1
-staged=$(vm_try "ls $PKG_DIR/containerd.io-*.rpm 2>/dev/null | xargs -r -n1 basename" | tail -1)
-if [ "$staged" = "$WRONG_CT_RPM" ]; then
-    ok "2.6a staged the real upstream $WRONG_CT_RPM"
+# Read the RPM HEADER, not the filename. "Assert on RPM metadata, never on
+# filenames" is the rule the product scripts follow, and it applies to the guard
+# that decides whether this case is vacuous: a file renamed to look right would
+# satisfy a basename comparison.
+staged=$(vm_try "rpm -qp --queryformat '%{NAME} %{VERSION}-%{RELEASE}' $PKG_DIR/containerd.io-*.rpm 2>/dev/null" | tr -d '\r' | tail -1)
+want_staged="containerd.io $TARGET_CONTAINERD-$WRONG_CONTAINERD_RELEASE.el9"
+if [ "$staged" = "$want_staged" ]; then
+    ok "2.6a staged the real upstream $want_staged"
 else
-    bad "2.6a could not stage $WRONG_CT_RPM (got '$staged') -- case is vacuous"
+    bad "2.6a could not stage $want_staged (got '$staged') -- case is vacuous"
 fi
 out=$(run_upgrade)
 # The refusal must name the RELEASE, not just say "wrong version" -- an
@@ -166,7 +212,7 @@ else
 fi
 # It must also say WHY the release matters, or the operator has no way to know
 # the two builds differ at all.
-if printf '%s' "$out" | grep -q "runc 1.4.3"; then
+if printf '%s' "$out" | grep -q "runc $WRONG_RUNC"; then
     ok "2.6a the refusal explains the runc difference"
 else
     bad "2.6a the refusal does not mention the runc difference"
@@ -180,13 +226,13 @@ fi
 assert_untouched "2.6a"
 # assert_untouched covers docker-ce and docker. The containerd half is the
 # whole point of this case, so assert it explicitly rather than by implication.
-assert_vm_eq "2.6a: containerd.io still $BASELINE_CONTAINERD" \
-    "rpm -q containerd.io --queryformat '%{VERSION}'" "$BASELINE_CONTAINERD"
-# VERSION-RELEASE together, not the release alone. The baseline containerd.io
-# 2.2.1 has release "1.el9" and so does the WRONG build 2.3.4-1, so asserting
-# the release by itself passes whether the node was refused or upgraded to the
-# wrong runtime. Mutation testing caught that: it was the one assertion here
-# that stayed green while the guard was disabled.
+#
+# VERSION-RELEASE together, and ONLY that. The baseline containerd.io 2.2.1 has
+# release "1.el9" and so does the WRONG build 2.3.4-1, so asserting the release
+# by itself passes whether the node was refused or upgraded to the wrong
+# runtime -- mutation testing caught that. A separate %{VERSION}-only assertion
+# used to sit here too; it is strictly implied by this one, cannot fail
+# independently, and only inflated the case count.
 assert_vm_eq "2.6a: containerd.io is still $BASELINE_CONTAINERD-1.el9 exactly" \
     "rpm -q containerd.io --queryformat '%{VERSION}-%{RELEASE}'" "$BASELINE_CONTAINERD-1.el9"
 assert_vm_eq "2.6a: containerd still active" "systemctl is-active containerd" "active"
@@ -284,8 +330,18 @@ fi
 
 assert_vm_eq "2.3 docker-ce is $TARGET_DOCKER" \
     "rpm -q docker-ce --queryformat '%{VERSION}'" "$TARGET_DOCKER"
-assert_vm_eq "2.3 containerd.io is $TARGET_CONTAINERD" \
-    "rpm -q containerd.io --queryformat '%{VERSION}'" "$TARGET_CONTAINERD"
+# %{VERSION}-%{RELEASE}, not %{VERSION}. containerd.io 2.3.4 shipped twice, so
+# the version alone is not a build identity -- and this is the only place either
+# tier asserts what rpm actually LEFT ON THE NODE as one. Phase 9's own release
+# check had nothing behind it on either tier: deleting its VERIFY_FAILED left
+# Tier 1 at 133/133 and Tier 2 green.
+assert_vm_eq "2.3 containerd.io is $TARGET_CONTAINERD-$TARGET_CONTAINERD_RELEASE.el9 exactly" \
+    "rpm -q containerd.io --queryformat '%{VERSION}-%{RELEASE}'" \
+    "$TARGET_CONTAINERD-$TARGET_CONTAINERD_RELEASE.el9"
+# The consequence the release guard exists for, asserted directly: the two
+# builds differ in nothing but this binary.
+assert_vm_eq "2.3 runc is $TARGET_RUNC (the build the release guard selects)" \
+    "runc --version 2>/dev/null | head -1 | awk '{print \$3}'" "$TARGET_RUNC"
 assert_vm_eq "2.3 buildx is $TARGET_BUILDX" \
     "rpm -q docker-buildx-plugin --queryformat '%{VERSION}'" "$TARGET_BUILDX"
 assert_vm_eq "2.3 compose is $TARGET_COMPOSE" \
@@ -335,6 +391,79 @@ else
     bad "2.14 re-run did NOT detect already-at-target"
     printf '%s\n' "$out" | tail -8 | sed 's/^/       /'
 fi
+
+#############################################
+head_ "2.6b  Already-at-target gate: every target version, the WRONG containerd build"
+#############################################
+# The other side of the release guard. 2.6a covers phase 0 refusing a wrong
+# PAYLOAD; this covers the gate that decides there is nothing to do at all.
+#
+# That gate ends in `exit 0`, so anything it waves through never reaches phase
+# 9. A node holding containerd.io 2.3.4-1 matches every %{VERSION} in it while
+# running runc 1.4.3, and a version-only gate would tell the operator the node
+# was done and leave a runtime nobody chose.
+#
+# The node is put on the wrong build by DOWNGRADING containerd.io alone with the
+# real upstream -1 RPM -- no mutation of the script under test, and no doctored
+# package. docs/TEST-PLAN.md describes reaching this state by running a -1
+# bundle with the guard disabled; downgrading in place reaches the same state
+# without ever running a mutant.
+if ! vm "set -e
+rm -rf /root/wrongct && mkdir -p /root/wrongct
+dnf download -q --destdir=/root/wrongct containerd.io-$TARGET_CONTAINERD-$WRONG_CONTAINERD_RELEASE.el9 >/dev/null 2>&1
+systemctl stop docker docker.socket >/dev/null 2>&1 || true
+systemctl stop containerd >/dev/null 2>&1 || true
+rpm -Uvh --oldpackage --replacepkgs /root/wrongct/containerd.io-*.rpm >/dev/null 2>&1
+systemctl start containerd
+for i in \$(seq 1 30); do ctr version >/dev/null 2>&1 && break; sleep 2; done
+systemctl start docker
+sleep 3" >/dev/null 2>&1; then
+    bad "2.6b could not stage the wrong containerd build -- case is vacuous"
+fi
+
+# The precondition, asserted rather than assumed. If the downgrade did not take,
+# everything below passes for the wrong reason.
+assert_vm_eq "2.6b setup: node is on the wrong build $TARGET_CONTAINERD-$WRONG_CONTAINERD_RELEASE.el9" \
+    "rpm -q containerd.io --queryformat '%{VERSION}-%{RELEASE}'" \
+    "$TARGET_CONTAINERD-$WRONG_CONTAINERD_RELEASE.el9"
+assert_vm_eq "2.6b setup: docker-ce is still at the target $TARGET_DOCKER" \
+    "rpm -q docker-ce --queryformat '%{VERSION}'" "$TARGET_DOCKER"
+assert_vm_eq "2.6b setup: runc is the wrong build's $WRONG_RUNC" \
+    "runc --version 2>/dev/null | head -1 | awk '{print \$3}'" "$WRONG_RUNC"
+
+restore_pkgs
+out=$(run_upgrade)
+
+if printf '%s' "$out" | grep -q "already fully at the target versions"; then
+    bad "2.6b the gate called a node on $TARGET_CONTAINERD-$WRONG_CONTAINERD_RELEASE.el9 already-at-target"
+    printf '%s\n' "$out" | tail -8 | sed 's/^/       /'
+else
+    ok "2.6b the already-at-target gate does not accept the wrong containerd build"
+fi
+if printf '%s' "$out" | grep -q "UPGRADE COMPLETE"; then
+    ok "2.6b the run completed rather than exiting with nothing to do"
+else
+    bad "2.6b the run did not complete"
+    printf '%s\n' "$out" | tail -20 | sed 's/^/       /'
+fi
+if printf '%s' "$out" | grep -q "containerd.io release $TARGET_CONTAINERD_RELEASE.el9"; then
+    ok "2.6b phase 9 reported the installed containerd.io release"
+else
+    bad "2.6b phase 9 did not report the installed containerd.io release"
+fi
+
+# STATE, not the exit code -- a node the gate waved through and a node that was
+# upgraded can both exit 0. Only these tell them apart.
+assert_vm_eq "2.6b: containerd.io is now $TARGET_CONTAINERD-$TARGET_CONTAINERD_RELEASE.el9" \
+    "rpm -q containerd.io --queryformat '%{VERSION}-%{RELEASE}'" \
+    "$TARGET_CONTAINERD-$TARGET_CONTAINERD_RELEASE.el9"
+assert_vm_eq "2.6b: runc is now $TARGET_RUNC, not $WRONG_RUNC" \
+    "runc --version 2>/dev/null | head -1 | awk '{print \$3}'" "$TARGET_RUNC"
+assert_vm_eq "2.6b: docker active after the corrective run" "systemctl is-active docker" "active"
+assert_vm_eq "2.6b: containerd active after the corrective run" "systemctl is-active containerd" "active"
+assert_vm_eq "2.6b: canary data on the relocated root intact" \
+    "docker start survivor >/dev/null 2>&1; docker exec survivor cat /data/canary.txt" \
+    "VOLUME-CANARY-DATA"
 fi
 
 #############################################

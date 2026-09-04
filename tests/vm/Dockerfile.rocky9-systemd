@@ -59,9 +59,18 @@ RUN (cd /lib/systemd/system/sysinit.target.wants/ \
 #
 # tests/vm/lib.sh's ensure_relocated_mount() rewrites this file from $LOOP_IMG
 # at bootstrap and is authoritative; the copy baked in here keeps the image
-# self-contained and correct from its very first boot. The two paths must
-# agree -- backend-docker.sh sets LOOP_IMG to the What= path below.
-RUN mkdir -p /var/harness /data /etc/systemd/system/local-fs.target.wants \
+# self-contained and correct from its very first boot.
+#
+# The path is a build ARG rather than a third hard-coded copy of the same
+# string. backend-docker.sh owns the value -- it passes --build-arg
+# HARNESS_LOOP_IMG="$LOOP_IMG" and mounts the named volume at that path's
+# directory -- so the unit below, the volume mount point and lib.sh all follow
+# from one definition. The default keeps a plain `docker build` of this file
+# working on its own.
+ARG HARNESS_LOOP_IMG=/var/harness/data.img
+
+RUN mkdir -p "$(dirname "$HARNESS_LOOP_IMG")" /data \
+             /etc/systemd/system/local-fs.target.wants \
              /etc/systemd/system/containerd.service.d
 
 RUN printf '%s\n' \
@@ -70,7 +79,7 @@ RUN printf '%s\n' \
     'Before=containerd.service' \
     '' \
     '[Mount]' \
-    'What=/var/harness/data.img' \
+    "What=$HARNESS_LOOP_IMG" \
     'Where=/data' \
     'Type=xfs' \
     'Options=loop' \

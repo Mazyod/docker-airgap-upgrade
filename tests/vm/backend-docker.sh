@@ -22,8 +22,12 @@ HARNESS_DATA_VOLUME="${HARNESS_DATA_VOLUME:-${VM_NAME}-data}"
 
 # The loop-backed image lives on a named volume, NOT in the container's
 # writable layer: it is 3 GB, and keeping it out of the layer keeps container
-# recreation cheap. Dockerfile.rocky9-systemd's data.mount unit hardcodes this
-# same path -- change both together.
+# recreation cheap.
+#
+# This is the ONE definition of the path. Dockerfile.rocky9-systemd takes it as
+# a build ARG and the named volume is mounted at its directory, so the baked
+# data.mount unit, the volume mount point and lib.sh's ensure_relocated_mount
+# all follow from this line instead of repeating it.
 LOOP_IMG="/var/harness/data.img"
 
 # The guest is not a VM, so three properties of the DAEMON are load-bearing and
@@ -109,23 +113,6 @@ _vm_running() {
     [ "$(docker container inspect -f '{{.State.Running}}' "$VM_NAME" 2>/dev/null)" = "true" ]
 }
 
-# Wait for systemd inside the guest to finish coming up. `is-system-running`
-# exits non-zero for `degraded`, which is a normal state for a container with
-# pruned units, so accept any settled answer rather than only `running`.
-_vm_wait_systemd() {
-    local waited=0 state
-    while [ "$waited" -lt 120 ]; do
-        state=$(docker exec "$VM_NAME" systemctl is-system-running 2>/dev/null || true)
-        case "$state" in
-            running|degraded) return 0 ;;
-        esac
-        sleep 2
-        waited=$((waited + 2))
-    done
-    echo "ERROR: systemd in '$VM_NAME' did not settle (last state: '${state:-none}')." >&2
-    return 1
-}
-
 # Run a command in the guest as root. Output is returned; status is preserved.
 #
 # No -t (avoids \r in captured output) and deliberately no -i: every harness
@@ -140,6 +127,7 @@ vm_try() { docker exec "$VM_NAME" bash -c "$1" 2>&1 || true; }
 vm_create() {
     echo "Building the harness image '$HARNESS_IMAGE'..."
     docker build --platform linux/amd64 -t "$HARNESS_IMAGE" \
+        --build-arg "HARNESS_LOOP_IMG=$LOOP_IMG" \
         -f "$HARNESS_LIB_DIR/Dockerfile.rocky9-systemd" "$HARNESS_LIB_DIR" \
         || { echo "ERROR: docker build failed." >&2; return 1; }
 
@@ -150,11 +138,11 @@ vm_create() {
         --cgroupns=private \
         --tmpfs /run --tmpfs /run/lock \
         -v "$HARNESS_REPO_DIR:$HARNESS_REPO_DIR:ro" \
-        -v "$HARNESS_DATA_VOLUME:/var/harness" \
+        -v "$HARNESS_DATA_VOLUME:$(dirname "$LOOP_IMG")" \
         "$HARNESS_IMAGE" >/dev/null \
         || { echo "ERROR: docker run failed." >&2; return 1; }
 
-    _vm_wait_systemd || return 1
+    vm_wait_systemd_settled || return 1
 
     _vm_verify_repo_mount
 }
@@ -281,7 +269,7 @@ vm_delete() {
 
 vm_wake() {
     _vm_running || docker start "$VM_NAME" >/dev/null 2>&1 || true
-    _vm_wait_systemd || return 1
+    vm_wait_systemd_settled || return 1
     # Re-check on every wake, not only at create: the mount is re-established
     # each time the container starts, and the daemon it resolves against may
     # have changed since.
@@ -296,5 +284,5 @@ vm_wake() {
 # directory and report itself healthy.
 vm_restart() {
     docker restart "$VM_NAME" >/dev/null || return 1
-    _vm_wait_systemd
+    vm_wait_systemd_settled
 }

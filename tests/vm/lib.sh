@@ -68,6 +68,15 @@ TARGET_CONTAINERD_RELEASE="2"
 # loudly rather than passing vacuously.
 WRONG_CONTAINERD_RELEASE="1"
 
+# The runc each containerd.io build carries. This is the DIFFERENCE the release
+# guard exists to catch -- the two builds are otherwise identical -- so cases
+# 2.6a and 2.6b assert it directly rather than trusting %{RELEASE} to stand for
+# it. These are test fixtures tied to the two builds above; move them together.
+# A stale value here makes a Tier 2 case FAIL, never pass, which is why they are
+# not mirrored in tests/static-checks.sh.
+TARGET_RUNC="1.5.1"
+WRONG_RUNC="1.4.3"
+
 # Where the relocated containerd root lives, and the loopback image backing it.
 # A backend may override LOOP_IMG -- the container backend keeps the 3 GB image
 # on a named volume rather than in the container's writable layer.
@@ -136,11 +145,124 @@ esac
 # shellcheck source-path=SCRIPTDIR
 # shellcheck source=backend-orb.sh
 # shellcheck source=backend-docker.sh
+# shellcheck disable=SC1091  # the backend is chosen at runtime; `shellcheck -x` follows both source= directives above, a bare `shellcheck` cannot
 source "$HARNESS_LIB_DIR/backend-$HARNESS_BACKEND.sh"
 
-# Backwards-compatible name. The old harness called this need_orbctl; it is
-# kept so an out-of-tree caller does not break, but new code uses need_backend.
-need_orbctl() { need_backend; }
+#############################################
+# Guest-side helpers shared by both backends
+#############################################
+
+# Wait for systemd inside the guest to finish coming up.
+#
+# `is-system-running` exits non-zero for `degraded`, which is the normal state
+# for a guest with pruned units, so READ THE WORD rather than trusting the exit
+# status. /run/systemd/system exists from very early in the boot, so testing for
+# it would return while units are still starting -- data.mount among them, which
+# is the one thing this waiter exists to wait for.
+#
+# ONE implementation for both backends. The two copies this replaces had already
+# drifted: the OrbStack one stripped carriage returns and took the last line, the
+# container one did neither, so identical guest output was parsed two ways.
+vm_wait_systemd_settled() {
+    local waited=0 state
+    while [ "$waited" -lt 120 ]; do
+        state=$(vm_try "systemctl is-system-running" | tr -d '\r' | tail -1)
+        case "$state" in
+            running|degraded) return 0 ;;
+        esac
+        sleep 2
+        waited=$((waited + 2))
+    done
+    echo "ERROR: systemd in '$VM_NAME' did not settle (last state: '${state:-none}')." >&2
+    return 1
+}
+
+# Copy files from the host repo into a directory inside the guest, and VERIFY
+# every destination byte-for-byte against the host's copy.
+#
+#   vm_cp_verified <dst_dir> <src_file>...
+#
+# Both backends expose the repo inside the guest at its identical absolute path,
+# so the copy runs IN the guest and is a plain `cp` rather than a push. That is
+# exactly why verification is needed: the guest's view of that path is an
+# assumption, not a fact. A forwarded or Desktop daemon can hold an older
+# checkout at the same absolute path, OrbStack's `orbctl push` silently discards
+# an absolute destination while exiting 0, and a partial or shadowed copy exits 0
+# too. Comparing the host's digest of the SOURCE against the guest's digest of
+# the DESTINATION checks the mount and the copy in one move, per file, at every
+# transfer site -- rather than trusting one sentinel file to stand for the tree.
+#
+# All digests come back in one guest round trip. Failure is loud and fatal to the
+# caller: staging the wrong scripts means every product assertion afterwards is
+# about code nobody wrote.
+vm_cp_verified() {
+    local dst_dir="${1:-}"
+    shift || true
+    if [ -z "$dst_dir" ] || [ "$#" -eq 0 ]; then
+        echo "ERROR: vm_cp_verified needs a destination directory and at least one file." >&2
+        return 1
+    fi
+
+    # Host digests first. A source this host cannot read is a problem to name
+    # here, not a mismatch to puzzle over after the copy.
+    local f want want_list=""
+    for f in "$@"; do
+        if [ ! -f "$f" ]; then
+            echo "ERROR: vm_cp_verified: '$f' is not a readable file on this host." >&2
+            return 1
+        fi
+        if ! want=$(harness_sha256_of "$f"); then
+            echo "ERROR: vm_cp_verified: neither sha256sum nor shasum is on this host," >&2
+            echo "       so a copy into the guest cannot be verified." >&2
+            return 1
+        fi
+        want_list="$want_list$want
+"
+    done
+
+    # Remove each destination FIRST. Otherwise a failed copy leaves whatever a
+    # previous run put there and every digest below is taken against a stale file.
+    # The DIGEST marker lets the digests be picked out of whatever else the guest
+    # says on the way.
+    local quoted="" out
+    for f in "$@"; do
+        quoted="$quoted \"$f\""
+    done
+    if ! out=$(vm "set -e
+mkdir -p \"$dst_dir\"
+for f in$quoted; do rm -f \"$dst_dir/\$(basename \"\$f\")\"; done
+cp$quoted \"$dst_dir\"/
+for f in$quoted; do
+    printf 'DIGEST %s\n' \"\$(sha256sum \"$dst_dir/\$(basename \"\$f\")\" | cut -d' ' -f1)\"
+done" 2>&1); then
+        echo "ERROR: vm_cp_verified: copying into $dst_dir inside '$VM_NAME' failed." >&2
+        if [ -n "$out" ]; then printf '       %s\n' "$out" >&2; fi
+        return 1
+    fi
+
+    local got_list mismatch=0 i=0 base got
+    got_list=$(printf '%s\n' "$out" | tr -d '\r' | awk '$1 == "DIGEST" { print $2 }')
+    for f in "$@"; do
+        i=$((i + 1))
+        base="${f##*/}"
+        # want_list already ends in a newline; do not add another.
+        want=$(printf '%s' "$want_list" | sed -n "${i}p")
+        got=$(printf '%s\n' "$got_list" | sed -n "${i}p")
+        if [ -z "$got" ] || [ "$want" != "$got" ]; then
+            if [ "$mismatch" -eq 0 ]; then
+                echo "ERROR: files staged into $dst_dir inside '$VM_NAME' do not match this checkout." >&2
+            fi
+            echo "       $base: host ${want:-<unreadable>} != guest ${got:-<missing>}" >&2
+            mismatch=1
+        fi
+    done
+    if [ "$mismatch" -ne 0 ]; then
+        echo "       The guest is not reading $HARNESS_REPO_DIR from this filesystem, or" >&2
+        echo "       the copy did not complete. Refusing to run against unknown scripts." >&2
+        return 1
+    fi
+    return 0
+}
 
 require_vm() {
     need_backend
@@ -179,8 +301,13 @@ ensure_relocated_mount() {
     local loop_dir
     loop_dir="$(dirname "$LOOP_IMG")"
 
+    # $RELOCATED_ROOT is deliberately NOT created here. Creating it before the
+    # mount lands puts it on the guest's OWN root filesystem, where the mount
+    # then hides it -- which is precisely the shadow-root hazard described
+    # above, manufactured by the code that exists to prevent it. The leaf is
+    # created after the mount is verified active, at the end of this function.
     vm "set -e
-mkdir -p $loop_dir /data $RELOCATED_ROOT
+mkdir -p $loop_dir /data
 [ -f $LOOP_IMG ] || dd if=/dev/zero of=$LOOP_IMG bs=1M count=3072 status=none
 blkid $LOOP_IMG >/dev/null 2>&1 || mkfs.xfs -q -n ftype=1 $LOOP_IMG
 
@@ -284,37 +411,13 @@ require_relocated_xfs() {
     echo "  relocated root: $RELOCATED_ROOT on $src ($fs at $tgt; data.mount $active, $enabled)"
 }
 
-# Stage the in-guest manifest writer, and VERIFY it landed.
+# Stage the in-guest manifest writer.
 #
-# Both backends expose the repo inside the guest at its identical absolute
-# path, so this is a plain `cp` rather than a push. OrbStack's `orbctl push` is
-# unusable here: its destination resolves relative to the Linux user's HOME, so
-# an absolute /tmp/... destination is silently discarded while it still exits 0.
-# That is why the landed-file check below exists rather than a status check.
+# vm_cp_verified does the copy AND the content check, so the removal-first and
+# digest-compare logic that used to live here is gone rather than duplicated.
 stage_manifest_writer() {
-    local src="$HARNESS_LIB_DIR/vm-write-manifest.sh"
-    local dst="/tmp/vm-write-manifest.sh"
-    local out
-
-    # Remove the destination FIRST. Otherwise a failed copy leaves whatever a
-    # previous run put there, and every check below passes against a stale file.
-    if ! out=$(vm "rm -f $dst && cp \"$src\" $dst && chmod +x $dst" 2>&1); then
-        echo "ERROR: could not stage vm-write-manifest.sh into the VM." >&2
-        echo "       $src -> $dst" >&2
-        [ -n "$out" ] && printf '       %s\n' "$out" >&2
-        exit 1
-    fi
-
-    # Content, not just existence: both backends reach the file through a mount
-    # of the repo, and a partial or shadowed copy would exit 0.
-    local want got
-    want=$(vm_try "sha256sum \"$src\" | cut -d' ' -f1" | tr -d '\r' | tail -1)
-    got=$(vm_try  "sha256sum $dst | cut -d' ' -f1"      | tr -d '\r' | tail -1)
-    if [ -z "$want" ] || [ "$want" != "$got" ]; then
-        echo "ERROR: staged vm-write-manifest.sh does not match the source." >&2
-        echo "       source ${want:-<unreadable>} != staged ${got:-<unreadable>}" >&2
-        exit 1
-    fi
+    vm_cp_verified /tmp "$HARNESS_LIB_DIR/vm-write-manifest.sh" || exit 1
+    vm "chmod +x /tmp/vm-write-manifest.sh" || exit 1
 }
 
 # Assert a command in the VM prints exactly the expected string.

@@ -133,10 +133,13 @@ vm "/tmp/vm-write-manifest.sh $MANIFEST"
 
 echo ""
 echo "=== Staging repo scripts into the VM ==="
-vm "set -e
-rm -rf /root/scripts && mkdir -p /root/scripts
-cp $REPO_DIR/*.sh /root/scripts/
-chmod +x /root/scripts/*.sh
+# vm_cp_verified, not a bare `cp`: it compares each staged file's digest against
+# this checkout's, so a guest reading some other tree at the same absolute path
+# stops the run here instead of producing product failures about code nobody
+# wrote. It exits non-zero, and this script runs under set -e.
+vm "rm -rf /root/scripts"
+vm_cp_verified /root/scripts "$REPO_DIR"/*.sh
+vm "chmod +x /root/scripts/*.sh
 ls /root/scripts"
 
 echo ""

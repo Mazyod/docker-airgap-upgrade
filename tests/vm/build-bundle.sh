@@ -20,10 +20,11 @@ require_vm
 REPO_DIR="$(cd ../.. && pwd)"
 
 echo "=== Refreshing scripts in the VM from the repo ==="
-vm "set -e
-rm -rf /root/scripts && mkdir -p /root/scripts
-cp $REPO_DIR/*.sh /root/scripts/
-chmod +x /root/scripts/*.sh"
+# Content-verified, because the bundle this builds is what every later tier and
+# every production node runs. See vm_cp_verified in lib.sh.
+vm "rm -rf /root/scripts"
+vm_cp_verified /root/scripts "$REPO_DIR"/*.sh
+vm "chmod +x /root/scripts/*.sh"
 
 echo ""
 echo "=== Running download-docker-packages.sh (downloads ~333 MB) ==="

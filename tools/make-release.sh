@@ -110,11 +110,15 @@ if [ "$REUSE_BUNDLE" = true ]; then
     echo "  --reuse-bundle: skipping rebuild"
     vm "test -f $BUNDLE_VM" || die "no existing bundle in the VM to reuse"
 else
-    vm "set -e
-        rm -rf /root/scripts && mkdir -p /root/scripts
-        cp $REPO_DIR/*.sh /root/scripts/
-        cp $REPO_DIR/*.md /root/scripts/ 2>/dev/null || true
-        chmod +x /root/scripts/*.sh" || die "failed to stage scripts into the VM"
+    # Content-verified per file. This is the path that PUBLISHES the bundle, so
+    # "the guest is reading this checkout" has to be a fact rather than an
+    # assumption -- a stale tree at the same absolute path would ship scripts
+    # that predate the tag being released, which is the failure this whole
+    # script is built to prevent.
+    vm "rm -rf /root/scripts" || die "failed to clear /root/scripts in the VM"
+    vm_cp_verified /root/scripts "$REPO_DIR"/*.sh "$REPO_DIR"/*.md \
+        || die "failed to stage scripts into the VM"
+    vm "chmod +x /root/scripts/*.sh" || die "failed to make the staged scripts executable"
     vm 'cd /root/scripts && ./download-docker-packages.sh' >/dev/null 2>&1 \
         || die "download-docker-packages.sh failed in the VM"
     echo "  bundle rebuilt"
@@ -123,8 +127,9 @@ fi
 #############################################
 step "Generating the package manifest from RPM metadata"
 #############################################
-vm "cp $REPO_DIR/tools/vm-bundle-manifest.sh /tmp/ && chmod +x /tmp/vm-bundle-manifest.sh" \
+vm_cp_verified /tmp "$REPO_DIR/tools/vm-bundle-manifest.sh" \
     || die "failed to stage the manifest script"
+vm "chmod +x /tmp/vm-bundle-manifest.sh" || die "failed to make the manifest script executable"
 MANIFEST_MD=$(vm "/tmp/vm-bundle-manifest.sh $BUNDLE_VM $(basename "$OUT_BUNDLE")") || die "manifest generation failed"
 [ -z "$MANIFEST_MD" ] && die "manifest came back empty"
 echo "  $(printf '%s' "$MANIFEST_MD" | grep -c '^|') table rows"

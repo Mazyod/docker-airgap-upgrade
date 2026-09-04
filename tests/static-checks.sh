@@ -217,6 +217,25 @@ else
     bad "upgrade-docker.sh reads the installed containerd.io release but never checks it"
 fi
 
+# ...and the phase 9 branch must set VERIFY_FAILED. Everything above proves the
+# release is read and compared; none of it proves the comparison has any
+# consequence. Deleting `VERIFY_FAILED=1` from the else-branch leaves phase 9
+# printing a red line and exiting 0 with "UPGRADE COMPLETE" -- and no Tier 2
+# case can catch that, because every reachable scenario in the harness installs
+# the RIGHT release from a valid bundle, so the else-branch never runs there.
+# This text pin is the only thing standing between that mutation and a green
+# suite. Search a WINDOW after the call rather than the whole file: a
+# VERIFY_FAILED=1 belonging to assert_installed would otherwise satisfy it.
+# shellcheck disable=SC2016  # the literal text "$INSTALLED_CT_REL" IS the pattern
+ct9_line=$(grep -n 'containerd_release_matches "$INSTALLED_CT_REL"' upgrade-docker.sh \
+    | head -1 | cut -d: -f1)
+if [ -n "$ct9_line" ] && sed -n "${ct9_line},$((ct9_line + 8))p" upgrade-docker.sh \
+    | grep -vE '^\s*#' | grep -q 'VERIFY_FAILED=1'; then
+    ok "upgrade-docker.sh phase 9 fails the run when the installed containerd.io release is wrong"
+else
+    bad "upgrade-docker.sh phase 9 checks the installed containerd.io release but does not set VERIFY_FAILED"
+fi
+
 # Both call sites must pass the CONSTANT as the expected release. A literal
 # argument would satisfy a check that only looked for the function name, while
 # quietly expecting the wrong build.
@@ -309,14 +328,37 @@ done
 # The VM harness builds containerd RPM paths by hand. A hard-coded -1 there
 # would make Tier 2 truncate/copy a file that no longer exists, and the case
 # would fail for a reason unrelated to what it tests.
-if grep -q '^TARGET_CONTAINERD_RELEASE="'"$WANT_CONTAINERD_RELEASE"'"' tests/vm/lib.sh; then
-    ok "tests/vm/lib.sh pins TARGET_CONTAINERD_RELEASE $WANT_CONTAINERD_RELEASE"
-else
-    bad "tests/vm/lib.sh does not pin TARGET_CONTAINERD_RELEASE=\"$WANT_CONTAINERD_RELEASE\""
-fi
+#
+# All FIVE target constants, not just the release. tests/vm/lib.sh is not in
+# SCRIPTS[] -- it legitimately carries the BASELINE versions, which 1.5's
+# stale-literal sweep would flag -- so nothing else in Tier 1 looks at it. A
+# retarget that updated WANT_* and all six deliverable scripts but forgot this
+# file passed 133/133, and tools/make-release.sh sources it: the release title
+# followed automatically into being wrong.
+for spec in "TARGET_DOCKER:$WANT_DOCKER" \
+            "TARGET_CONTAINERD:$WANT_CONTAINERD" \
+            "TARGET_BUILDX:$WANT_BUILDX" \
+            "TARGET_COMPOSE:$WANT_COMPOSE" \
+            "TARGET_CONTAINERD_RELEASE:$WANT_CONTAINERD_RELEASE"; do
+    const="${spec%%:*}"
+    want="${spec#*:}"
+    got=$(grep -m1 "^$const=\"" tests/vm/lib.sh | sed "s/^$const=\"\(.*\)\".*/\1/")
+    if [ -z "$got" ]; then
+        bad "tests/vm/lib.sh has no $const constant"
+    elif [ "$got" != "$want" ]; then
+        bad "tests/vm/lib.sh $const is '$got', want '$want'"
+    else
+        ok "tests/vm/lib.sh pins $const $got"
+    fi
+done
 
+# Three spellings, not one. The old pattern required the unbraced
+# `$TARGET_CONTAINERD` form, so `${TARGET_CONTAINERD}-1.el9` and a fully
+# spelled-out `2.3.4-1.el9` both reported PASS -- the exact drift the check
+# exists to catch. $BASELINE_CONTAINERD is deliberately not covered: it names a
+# version upstream published once, where the release really is a constant.
 # shellcheck disable=SC2016  # the literal string "$TARGET_CONTAINERD" is the pattern; expanding it would search for the version instead
-vm_hardcoded=$(grep -nE 'containerd\.io-\$TARGET_CONTAINERD-[0-9]+\.' tests/vm/*.sh || true)
+vm_hardcoded=$(grep -nE 'containerd\.io-(\$\{?TARGET_CONTAINERD\}?|[0-9]+(\.[0-9]+)+)-[0-9]+\.' tests/vm/*.sh || true)
 if [ -n "$vm_hardcoded" ]; then
     bad "VM harness hard-codes a containerd.io release suffix instead of \$TARGET_CONTAINERD_RELEASE"
     printf '       %s\n' "$vm_hardcoded"
@@ -424,8 +466,12 @@ else
             errs=$(
                 RHEL_VER="$major"
                 EXPECTED_CONTAINERD_VERSION="$WANT_CONTAINERD"
-                EXPECTED_CONTAINERD_RELEASE=$(grep -m1 '^EXPECTED_CONTAINERD_RELEASE="' upgrade-docker.sh \
-                    | sed 's/^EXPECTED_CONTAINERD_RELEASE="\(.*\)".*/\1/')
+                # $UD_CT_REL, read once above from the script's own constant.
+                # Re-running the extraction here meant a changed declaration
+                # shape failed loudly up there and SILENTLY yielded an empty
+                # expectation down here -- every wrapper case then flipping to
+                # REJECT for a reason that has nothing to do with the wrapper.
+                EXPECTED_CONTAINERD_RELEASE="$UD_CT_REL"
                 PKG_ERRORS=0
                 eval "$ct_fn"
                 eval "$ct_wrapper"

@@ -336,9 +336,15 @@ would silently orphan every image and snapshot on the node.
 | Tier | Status for 29.8.0 | How |
 |---|---|---|
 | Static | **149/149** | `./tests/static-checks.sh --online` |
-| VM (real execution) | **not re-run** — last 45/45 on the 29.7.2 build | `./tests/vm/bootstrap-vm.sh && ./tests/vm/build-bundle.sh && ./tests/vm/tier2-run.sh` |
-| Negative control | **not re-run** — last 3/3 | `./tests/vm/negative-control.sh` |
+| VM (real execution) | **56/56** | `./tests/vm/bootstrap-vm.sh && ./tests/vm/build-bundle.sh && ./tests/vm/tier2-run.sh` |
+| VM config-version boundary | **30/30** | `./tests/vm/config-version-check.sh` |
+| Negative control | **3/3** | `./tests/vm/negative-control.sh` |
 | Swarm | **not run** | needs a multi-node cluster — see `docs/TEST-PLAN.md` Tier 3 |
+
+All four ran against a bundle rebuilt from this checkout, on Rocky Linux 9 via the
+Docker backend. The runc swap was verified directly on the node: `containerd.io-2.3.4-2`
+ships runc 1.5.1 and `-1` ships 1.4.3. Case 2.6a stages the real upstream `-1` RPM and
+proves phase 0 refuses it with the node untouched.
 
 The VM tier runs the real scripts against Rocky Linux 9 (x86_64, systemd) — an
 OrbStack machine on macOS, or a privileged systemd container on a Linux host with

@@ -118,6 +118,80 @@ else
 fi
 assert_untouched "2.9"
 
+# 2.6a -- the RIGHT version, the WRONG build.
+#
+# containerd.io 2.3.4 was published upstream twice. -1 and -2 carry the same
+# %{VERSION}, the same file list and the same Requires; the only difference is
+# /usr/bin/runc, 1.4.3 in -1 and 1.5.1 in -2. So every version assertion in
+# phase 0 passes for either, and only EXPECTED_CONTAINERD_RELEASE separates
+# them.
+#
+# This uses the real upstream -1 RPM rather than a hand-edited file, because a
+# doctored package would be caught by the digest check instead and this case
+# would pass for the wrong reason.
+#
+# The assertions below are STATE assertions, not an exit code. A node that is
+# refused and a node that is upgraded with the wrong runc and then fails both
+# exit non-zero; only the package versions, the services and the data tell
+# them apart.
+# If upstream ever publishes the target containerd version only once, there is
+# no other build to stage and this case has nothing to say. Fail loudly instead
+# of passing vacuously.
+if [ "$WRONG_CONTAINERD_RELEASE" = "$TARGET_CONTAINERD_RELEASE" ]; then
+    bad "2.6a WRONG_CONTAINERD_RELEASE equals the target release -- no wrong build exists to test"
+fi
+restore_pkgs
+WRONG_CT_RPM="containerd.io-$TARGET_CONTAINERD-$WRONG_CONTAINERD_RELEASE.el9.x86_64.rpm"
+vm "rm -f $PKG_DIR/containerd.io-*.rpm
+    dnf download -q --destdir=$PKG_DIR containerd.io-$TARGET_CONTAINERD-$WRONG_CONTAINERD_RELEASE.el9 >/dev/null 2>&1" >/dev/null 2>&1
+staged=$(vm_try "ls $PKG_DIR/containerd.io-*.rpm 2>/dev/null | xargs -r -n1 basename" | tail -1)
+if [ "$staged" = "$WRONG_CT_RPM" ]; then
+    ok "2.6a staged the real upstream $WRONG_CT_RPM"
+else
+    bad "2.6a could not stage $WRONG_CT_RPM (got '$staged') -- case is vacuous"
+fi
+out=$(run_upgrade)
+# The refusal must name the RELEASE, not just say "wrong version" -- an
+# operator whose bundle differs only in the release needs to be told that.
+if printf '%s' "$out" | grep -q "containerd.io release is $WRONG_CONTAINERD_RELEASE.el9"; then
+    ok "2.6a wrong containerd RELEASE rejected, and the refusal names it"
+else
+    bad "2.6a wrong containerd RELEASE NOT rejected on the release"
+    printf '%s\n' "$out" | tail -8 | sed 's/^/       /'
+fi
+# It must also say WHY the release matters, or the operator has no way to know
+# the two builds differ at all.
+if printf '%s' "$out" | grep -q "runc 1.4.3"; then
+    ok "2.6a the refusal explains the runc difference"
+else
+    bad "2.6a the refusal does not mention the runc difference"
+fi
+# And it must refuse in PHASE 0 -- before the drain, before services stop.
+if printf '%s' "$out" | grep -q "Phase 1"; then
+    bad "2.6a reached phase 1 -- the refusal came too late to be free"
+else
+    ok "2.6a refused in phase 0, before the Swarm drain"
+fi
+assert_untouched "2.6a"
+# assert_untouched covers docker-ce and docker. The containerd half is the
+# whole point of this case, so assert it explicitly rather than by implication.
+assert_vm_eq "2.6a: containerd.io still $BASELINE_CONTAINERD" \
+    "rpm -q containerd.io --queryformat '%{VERSION}'" "$BASELINE_CONTAINERD"
+# VERSION-RELEASE together, not the release alone. The baseline containerd.io
+# 2.2.1 has release "1.el9" and so does the WRONG build 2.3.4-1, so asserting
+# the release by itself passes whether the node was refused or upgraded to the
+# wrong runtime. Mutation testing caught that: it was the one assertion here
+# that stayed green while the guard was disabled.
+assert_vm_eq "2.6a: containerd.io is still $BASELINE_CONTAINERD-1.el9 exactly" \
+    "rpm -q containerd.io --queryformat '%{VERSION}-%{RELEASE}'" "$BASELINE_CONTAINERD-1.el9"
+assert_vm_eq "2.6a: containerd still active" "systemctl is-active containerd" "active"
+assert_vm_eq "2.6a: docker.socket still active" "systemctl is-active docker.socket" "active"
+# The data the guard is protecting. A refusal that cost the node its images
+# would not be a refusal worth having.
+assert_vm_eq "2.6a: canary data on the relocated root intact" \
+    "docker start survivor >/dev/null 2>&1; docker exec survivor cat /data/canary.txt" \
+    "VOLUME-CANARY-DATA"
+
 # 2.10 -- empty package directory
 restore_pkgs
 vm "rm -f $PKG_DIR/*.rpm" >/dev/null 2>&1

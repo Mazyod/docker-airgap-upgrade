@@ -57,6 +57,16 @@ TARGET_COMPOSE="5.5.1"
 # not contain and fail for a reason unrelated to what they test.
 TARGET_CONTAINERD_RELEASE="2"
 
+# The OTHER build of the same containerd version -- the one case 2.6a stages to
+# prove phase 0 refuses it. It is a real upstream RPM, not a doctored file, so
+# the case tests the release assertion rather than the digest check.
+#
+# This is a test fixture, not a target. If a future retarget lands on a
+# containerd version that upstream published only once, there is no wrong build
+# to stage and 2.6a has nothing to test -- 2.6a asserts the two differ and fails
+# loudly rather than passing vacuously.
+WRONG_CONTAINERD_RELEASE="1"
+
 # Where the relocated containerd root lives, and the loopback image backing it.
 # A backend may override LOOP_IMG -- the container backend keeps the 3 GB image
 # on a named volume rather than in the container's writable layer.

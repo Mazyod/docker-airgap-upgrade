@@ -35,6 +35,11 @@ cd "$(dirname "${BASH_SOURCE[0]}")" || exit 1
 source ./lib.sh
 
 require_vm
+# Hard precondition: the relocated containerd root must actually be on the
+# separate XFS. A3 and B7 assert that the root survives the config-version
+# migration; on a shadow root they would be asserting against a directory that
+# was never live, and would fail for a reason unrelated to containerd.
+require_relocated_xfs
 
 CONF="/etc/containerd/config.toml"
 WORK="/root/configver"

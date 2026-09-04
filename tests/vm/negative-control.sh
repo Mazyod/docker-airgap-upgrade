@@ -28,6 +28,18 @@ require_vm
 
 echo "=== Resetting to a known baseline first ==="
 ./reset-baseline.sh >/dev/null 2>&1
+
+# The relocated root is the thing this test is about, so refuse to run on a
+# baseline that does not have one.
+require_relocated_xfs
+
+# Stage the manifest writer HERE rather than assuming a previous bootstrap or
+# reset left it in /tmp. If it were missing, BEFORE_ROOT would come back empty,
+# the guard below would abort with a confusing "not in the expected
+# relocated-root state" -- and if that guard ever loosened, every comparison
+# downstream would silently be against the empty string.
+stage_manifest_writer
+
 BEFORE_SHA=$(vm_try "sha256sum /etc/containerd/config.toml | cut -d' ' -f1" | tail -1)
 BEFORE_ROOT=$(vm_try "/tmp/vm-write-manifest.sh /tmp/nc-manifest.txt >/dev/null 2>&1; sed -n 's/^CONTAINERD_ROOT=//p' /tmp/nc-manifest.txt" | tail -1)
 echo "  baseline config sha: ${BEFORE_SHA:0:16}..."

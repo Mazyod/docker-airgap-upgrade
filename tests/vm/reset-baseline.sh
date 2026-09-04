@@ -3,10 +3,11 @@
 # tests/vm/reset-baseline.sh
 # Return the VM to the S1 baseline between destructive tests.
 #
-# OrbStack has no snapshots, so this reconstructs S1 rather than restoring it:
-# packages back to the baseline versions, containerd config regenerated with
-# the relocated root, daemon.json restored, services healthy, canary data
-# recreated if missing.
+# Neither backend has snapshots, so this reconstructs S1 rather than restoring
+# it: packages back to the baseline versions, containerd config regenerated
+# with the relocated root, daemon.json restored, services healthy, canary data
+# recreated if missing. Nothing here touches a hypervisor primitive, so it is
+# identical on both backends.
 #
 # Cheaper than recreating the machine (seconds vs minutes). If you suspect the
 # VM has drifted in a way this does not cover, use:
@@ -36,14 +37,14 @@ dnf downgrade -y -q --allowerasing \
     containerd.io-$BASELINE_CONTAINERD \
     docker-buildx-plugin-$BASELINE_BUILDX docker-compose-plugin-$BASELINE_COMPOSE \
     >/dev/null 2>&1
+"
 
-# Relocated root must be mounted before containerd starts.
-if ! findmnt --target /data >/dev/null 2>&1 || [ \"\$(findmnt -n -o TARGET --target /data)\" != /data ]; then
-    mkdir -p /data
-    mount -o loop $LOOP_IMG /data
-fi
-mkdir -p $RELOCATED_ROOT
+# The relocated root must be mounted, through the ordered systemd mount unit,
+# before containerd starts. A bare `mount -o loop` here would not survive a
+# guest restart -- see lib.sh's ensure_relocated_mount().
+ensure_relocated_mount
 
+vm "set -e
 containerd config default > /etc/containerd/config.toml
 sed -i \"s|^root = .*|root = '$RELOCATED_ROOT'|\" /etc/containerd/config.toml
 
@@ -79,10 +80,15 @@ rpm -q docker-ce containerd.io | sed 's/^/  /'
 grep '^root' /etc/containerd/config.toml | sed 's/^/  /'
 echo \"  docker: \$(systemctl is-active docker)  containerd: \$(systemctl is-active containerd)\""
 
+# Refuse to declare S1 restored on anything but the separate XFS -- a reset
+# onto a shadow directory would rebuild the canary data in the wrong place and
+# hand back a green run built on a lie.
+require_relocated_xfs
+
 echo ""
 echo "=== Refreshing baseline manifest ==="
-vm "cp $(cd .. && pwd)/vm/vm-write-manifest.sh /tmp/vm-write-manifest.sh"
-vm "chmod +x /tmp/vm-write-manifest.sh && /tmp/vm-write-manifest.sh $MANIFEST"
+stage_manifest_writer
+vm "/tmp/vm-write-manifest.sh $MANIFEST"
 
 echo ""
 echo "VM is back at S1."

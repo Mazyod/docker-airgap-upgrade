@@ -26,6 +26,11 @@ cd "$(dirname "${BASH_SOURCE[0]}")" || exit 1
 source ./lib.sh
 
 require_vm
+# Hard precondition: the relocated containerd root must actually be on the
+# separate XFS. If it is not, the 2.4 assertions below are comparing shadow
+# state and would fail for a reason that has nothing to do with the scripts.
+require_relocated_xfs
+
 PHASE_ARG="${1:-all}"
 PKG_DIR="/opt/docker-offline/rhel9"
 

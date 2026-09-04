@@ -389,7 +389,14 @@ for spec in "TARGET_DOCKER:$WANT_DOCKER" \
     # rather than report a count. Read the status.
     decls=$(grep -cE "^[[:space:]]*(export[[:space:]]+|readonly[[:space:]]+)?$const=" tests/vm/lib.sh)
     grep_rc=$?
-    got=$(grep -m1 "^$const=\"" tests/vm/lib.sh | sed "s/^$const=\"\(.*\)\".*/\1/")
+    # Read the value in the SAME forms the count accepts. An extraction narrower
+    # than the count reports "no constant" for a declaration that is present and
+    # legal -- `export TARGET_DOCKER="29.8.0"`, or an indented one.
+    got=$(grep -m1 -E "^[[:space:]]*(export[[:space:]]+|readonly[[:space:]]+)?$const=" tests/vm/lib.sh \
+        | sed -E -e "s/^[[:space:]]*(export[[:space:]]+|readonly[[:space:]]+)?$const=//" \
+                 -e 's/^"([^"]*)".*$/\1/' \
+                 -e "s/^'([^']*)'.*\$/\1/" \
+                 -e 's/[[:space:]].*$//')
     if [ "$grep_rc" -gt 1 ]; then
         bad "could not read tests/vm/lib.sh while checking $const (grep exited $grep_rc)"
     elif [ "$decls" -ne 1 ]; then

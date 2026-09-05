@@ -168,6 +168,14 @@ rpm -q containerd.io --queryformat '%{VERSION}-%{RELEASE}\n'   # 2.3.4-2.el<majo
 grep '^root' /etc/containerd/config.toml   # must match what you recorded in 3.2
 
 docker ps -a                            # containers survived
+
+# DNS on a custom bridge. Needs an image already present locally that carries
+# nslookup, and a name this node's resolver can actually answer -- substitute both.
+# A failure here is only meaningful once you know the image and the tool are
+# present and the name resolves from the host.
+docker network create test-net
+docker run --rm --network test-net <local-image> nslookup <internal-name>
+docker network rm test-net
 ```
 
 From a manager:
@@ -177,6 +185,10 @@ docker node ls                          # node Ready and Active
 docker node ps <node-hostname>          # tasks scheduling again
 docker service ls                       # all replicas converged
 ```
+
+Phase 9 asserts all five installed versions itself and exits non-zero if any do not
+match, so "UPGRADE COMPLETE" already means the versions were checked. The commands
+above confirm the parts it cannot assert: the config, the containers and the cluster.
 
 ### 3.6 Reactivate (workers — from a MANAGER)
 

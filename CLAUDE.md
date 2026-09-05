@@ -210,8 +210,12 @@ Package versions (`29.8.0`, `2.3.4`, `0.37.0`, `5.5.1`, rollback `29.1.5`/`2.2.1
 - `simulate-upgrade.sh` — its own download loop, the `dnf install` pins, and the `assert_pkg` calls
 - `tests/static-checks.sh` — `WANT_DOCKER` / `WANT_CONTAINERD` / `WANT_BUILDX` / `WANT_COMPOSE` / `WANT_CONTAINERD_RELEASE`
 - `tests/vm/lib.sh` — `TARGET_*` including `TARGET_CONTAINERD_RELEASE`, plus `WRONG_CONTAINERD_RELEASE`, `TARGET_RUNC` / `WRONG_RUNC`, and `BASELINE_*` when the *starting* version moves. `tools/make-release.sh` sources this file, so the release title follows automatically — check 1.4b now compares all five `TARGET_*` against `WANT_*`, because a forgotten constant here used to pass Tier 1 and follow automatically into a wrong release title
-- `README.md` — the version table, the release-date table, and the verification section
-- `RUNBOOK.md` — the target/from header
+- `README.md` — the bundle table in "What's in the bundle", and the target version wherever it
+  is named in prose. Static check 1.4 asserts only that `WANT_DOCKER` appears somewhere in it
+- `docs/BACKGROUND.md` — the release-date table, the runc-swap section, the config-version
+  section, and the weathered-alternative list. **Nothing in Tier 1 checks this file**, so a
+  retarget that skips it goes stale silently. Edit it in the same pass as `README.md`
+- `RUNBOOK.md` — the target/from header, the phase-0 refusal table, and the verification block
 - `docs/TEST-PLAN.md` — the version references in the Tier 2 table
 - **`docs/AGENT-RUNBOOK.md` is deliberately NOT on this list.** Static check 1.14 fails if it contains any `x.y.z` literal at all, so it refers to versions as "what this run reported" and points an agent at `docker_ce_expected` / `containerd_io_release_expected` in the status file. A retarget cannot leave it stale, because there is nothing in it to go stale
 

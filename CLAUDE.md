@@ -493,7 +493,7 @@ Every script except `simulate-upgrade.sh` declares `VERSION="x.y.z"` on ~line 4 
 |---|---|
 | `upgrade-docker.sh` | 2.5.0 |
 | `rollback-docker.sh` | 2.3.0 |
-| `download-docker-packages.sh` | 2.3.0 |
+| `download-docker-packages.sh` | 2.3.1 |
 | `clean-swarm-networks.sh` | 1.3.0 |
 | `recover-dnf.sh` | 1.3.0 |
 

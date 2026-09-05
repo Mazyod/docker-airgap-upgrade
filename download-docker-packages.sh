@@ -1,7 +1,7 @@
 #!/bin/bash
 # download-docker-packages.sh
 # Run on the ONLINE RHEL 8 server to collect all packages needed for air-gapped upgrade
-VERSION="2.3.0"
+VERSION="2.3.1"
 #
 # This script downloads:
 # - Docker 29.8.0 packages for RHEL 8 and RHEL 9
@@ -247,7 +247,7 @@ fi
 # whether the upgrade works.
 echo ""
 echo "=== Including operator documentation ==="
-for doc in RUNBOOK.md README.md; do
+for doc in RUNBOOK.md README.md docs/AGENT-RUNBOOK.md; do
     if [ -f "$SCRIPT_DIR/$doc" ]; then
         cp "$SCRIPT_DIR/$doc" "$DEST_BASE/"
         echo "  ✓ $doc"

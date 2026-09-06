@@ -1,11 +1,13 @@
 #!/bin/bash
 # tests/static-checks.sh
+VERSION="1.0.0"
 # Tier 1 of docs/TEST-PLAN.md -- everything checkable without a RHEL box.
 #
 # Runs anywhere bash and shellcheck do. Proves syntax, lint, internal consistency, and
 # (with --online) that every pinned package exists upstream.
 #
-# This does NOT execute any upgrade logic. Passing this does not authorize a
+# Recovery fixtures execute extracted sections with stub commands, never a real
+# upgrade transaction or host service change. Passing this does not authorize a
 # production rollout; Tier 2 in a RHEL VM is the minimum bar for that.
 #
 # Usage:
@@ -16,6 +18,8 @@ set -u
 
 REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$REPO_DIR" || exit 1
+
+echo "Static checks $VERSION"
 
 ONLINE=false
 [ "${1:-}" = "--online" ] && ONLINE=true
@@ -1634,6 +1638,15 @@ else
 fi
 
 #############################################
+head_ "1.15  Recovery and bundle documentation fixtures"
+#############################################
+if bash tests/recovery-checks.sh; then
+    ok "recovery and required-document behavior"
+else
+    bad "recovery and required-document behavior"
+fi
+
+#############################################
 head_ "1.3  Upstream package availability"
 #############################################
 if [ "$ONLINE" = false ]; then
@@ -1664,6 +1677,6 @@ if [ "$FAIL" -gt 0 ]; then
     exit 1
 fi
 printf '%sTIER 1 PASSED%s\n' "$GREEN" "$NC"
-printf 'Reminder: this executes no upgrade logic. Tier 2 in a RHEL VM is\n'
+printf 'Reminder: host operations are stubbed. Tier 2 in a RHEL VM is\n'
 printf 'still required before any production rollout.\n'
 exit 0

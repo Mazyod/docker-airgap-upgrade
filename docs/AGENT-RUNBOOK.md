@@ -33,7 +33,10 @@ directory — `rm -rf /opt/docker-offline` first, then extract into `/opt`. The 
 an identical layout, so leftovers read as duplicate packages and the run is refused.
 
 Know whether this node is a Swarm manager or a worker, and have manager access either way.
-Workers cannot drain or inspect themselves.
+Workers cannot drain or inspect themselves. From a manager, run `docker node ls` to
+identify the topology. A single-node Swarm has no other node to run its workloads;
+a single manager with workers is a different topology. Record `docker service ls`
+before maintenance so existing replica shortfalls are not mistaken for new failures.
 
 **Record two things nothing on the node captures for you**, the availability and the containerd
 root:
@@ -54,7 +57,9 @@ absent.
 
 **Do not pre-drain an active manager.** Phase 0 validates the payload and dry-runs the rpm
 transaction *before* it drains, precisely so a bad bundle cannot leave a manager drained;
-pre-draining throws that ordering away. Let the script do it, with `--drain-self`.
+pre-draining throws that ordering away. When draining is appropriate, let the script
+do it with `--drain-self`. For an active single-node Swarm with an authorized workload
+and control-plane outage, use `--no-drain-self`; draining cannot migrate tasks elsewhere.
 
 Two node kinds need work from a manager first, and neither is an active manager:
 
@@ -97,23 +102,39 @@ The gate flags, by role and by the availability you recorded:
 |---|---|
 | Not in a Swarm | none |
 | **Worker**, drained from a manager and confirmed empty | `--assume-drained` |
-| **Manager** recorded `active` | `--drain-self --reactivate`, plus `--proceed-with-tasks` or `--no-proceed-with-tasks` |
+| **Manager** recorded `active`, with other eligible nodes | `--drain-self --reactivate`, plus `--proceed-with-tasks` or `--no-proceed-with-tasks` |
 | **Manager** already `drain` | `--reactivate` if you recorded `active`, otherwise `--no-reactivate`. The run does not re-drain or re-count tasks, so confirm it is empty yourself first |
 | **Manager** already `pause` | none. Both the drain and the reactivation are skipped on a paused node |
-| **Manager** you do not want drained | `--no-drain-self` |
+| **Manager** recorded `active`, single-node Swarm or another authorized no-drain outage | `--no-drain-self` |
 
-**Answer `--proceed-with-tasks` explicitly on any manager.** It is a *conditional* gate:
-preflight cannot tell whether the run will reach it, and reaching it with no answer refuses the
-run *after* the drain. `--no-proceed-with-tasks` is the safe answer — it stops rather than
-upgrade a node whose tasks have not migrated.
+**Answer `--proceed-with-tasks` explicitly when using `--drain-self`.** It is a
+conditional gate: an unanswered gate can stop the run after draining.
+`--no-proceed-with-tasks` stops if tasks remain assigned here with desired state
+running, or the query fails. An empty local query does not prove tasks are running
+elsewhere. This gate is not reached on an active manager using `--no-drain-self`.
 
-**Verify, then restore the availability you recorded.**
+For an **active single-node Swarm**, with the outage authorized:
 
 ```bash
+./upgrade-docker.sh --preflight --non-interactive --no-drain-self \
+    --status-file=/run/pre-single-$(date +%s).kv
+# Read the record; run the next command only when result=ready.
+./upgrade-docker.sh --non-interactive --no-drain-self \
+    --status-file=/run/up-single-$(date +%s).kv
+```
+
+**Verify runtime health, restore recorded availability, then observe workload recovery.**
+Do this after `result=completed`; failures go to section 4.
+
+```bash
+systemctl is-active containerd docker
+docker version
 rpm -q docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
 docker ps -a
-docker node ls && docker node ps <node-hostname>            # from a manager
-docker service ls                                          # from a manager: services converged?
+# From a manager, for Swarm nodes only:
+docker node ls
+docker node inspect <node-hostname> --format '{{.Spec.Availability}}'
+# Only if availability differs from what you recorded:
 docker node update --availability <the value you recorded> <node-hostname>
 ```
 
@@ -127,6 +148,29 @@ published more than once with a different `runc` inside.
 to `active`. A manager that passed `--reactivate` is already back, a worker always needs this
 done from a manager, and `node_availability_after` and `drain_performed` say what the run did.
 
+The script polls cluster-wide Swarm replica counts for up to 60 seconds when its
+manager finishes `active`, including the no-drain path. `workload_state=converged`
+means running and desired counts matched; it does not prove application health.
+`Starting` tasks and `0/1` counts just after restart can be transient. `timeout`
+means the last observation still had a mismatch; `unknown` means recovery could
+not be established. Neither changes a completed package upgrade into a failure.
+`not-checked` means no recovery observation ran (including workers and managers
+left drained/paused). Check those workloads from a manager after restoring availability.
+
+```bash
+# From a manager: repeat every 5 seconds until counts recover or the deadline expires.
+docker service ls
+docker service ps --no-trunc <service-name>
+```
+
+Use a bounded recovery window: 60 seconds initially, or a longer window agreed
+before maintenance for slow-starting workloads. Compare with the pre-upgrade state;
+distinguish tasks progressing through `Starting` from repeated failures or rejected
+tasks. At the deadline, report pending services and task errors, and inspect
+`journalctl -u docker --since '-5 minutes'` on the affected node. Do not automatically
+roll back or run network cleanup for a replica shortfall. Confirm application access
+and expected persistent data before proceeding to the next node.
+
 ## 4. The decision table
 
 Read this from the status file. Its last line is always `status_complete=1`; a file without it
@@ -135,7 +179,7 @@ is incomplete and means unknown, whatever its `result` says.
 ```bash
 SF=<the path you passed to --status-file>
 tail -1 "$SF" | grep -qx 'status_complete=1' || echo 'INCOMPLETE RECORD - treat as unknown'
-sed -n 's/^\(result\|refusal_reason\|next_action\|phase\|pkg_state\)=/\1 = /p' "$SF"
+sed -n 's/^\(result\|refusal_reason\|next_action\|phase\|pkg_state\|workload_state\|node_availability_after\)=/\1 = /p' "$SF"
 ```
 
 | `result` | `refusal_reason` | `next_action` | Do this |
@@ -144,7 +188,7 @@ sed -n 's/^\(result\|refusal_reason\|next_action\|phase\|pkg_state\)=/\1 = /p' "
 | _no `status_complete=1`_ | — | — | incomplete file; treat it as unknown |
 | `running` | — | — | no complete final record was published — a kill, a power loss, or a trap that could not write. Inspect the node before rerunning |
 | `ready` | — | `proceed` | run the real upgrade, answering every gate in `gates_required` and every applicable gate in `gates_conditional` |
-| `completed` | — | `none` | verify, then restore the availability you recorded |
+| `completed` | — | `none` | verify runtime health, restore recorded availability, then check `workload_state` and application recovery |
 | `completed` | — | `investigate` | `clean-swarm-networks.sh` only, exit **2**: the cleanup ran but `failed_items` is non-zero. **Not success** — some state was not removed |
 | `nothing-to-do` | — | `none` | move to the next node |
 | `refused` | `not-root` | `rerun-as-root` | re-invoke as root |
@@ -465,8 +509,8 @@ unanswered gate in `gates_conditional` is **reported, not refused**.
 The claim is bounded and this document will not overstate it: **preflight validates every gate
 that is certain and names the ones that are not.** A run that passes preflight can still stop on
 a conditional gate. That is safe, and the record says so, but it is not "validate everything up
-front" — which is why section three says to answer the conditional gates explicitly on any
-manager.
+front" — which is why section three says to answer the applicable conditional gates
+explicitly when draining a manager.
 
 Two of the six gates are promoted or dropped by the flags you already passed. `--drain-self`
 promotes `reactivate` from conditional to required, because the run will certainly drain and
@@ -487,7 +531,7 @@ question is never asked at all.
 |---|---|---|---|---|
 | `rerun-at-target` | All five packages already at target | Re-run the upgrade anyway? | no | **No**, unless you are deliberately repairing a node — see the relocated-root recovery below, where the answer is yes. The no branch changes nothing. Unanswered under `--non-interactive` it exits **3**, `result=nothing-to-do`, rather than refusing: its no branch does nothing at all, so a distinct code beats a refusal |
 | `allow-unverified-baseline` | Not at target, not a partial upgrade, and docker or containerd differs from the tested starting pair | Continue from this unverified starting version? | no | **No** by default. Report the versions it printed and stop. Yes only if a human has approved that specific starting version. It does **not** fire on a partial upgrade: if either core package is already at target the script proceeds without asking |
-| `drain-self` | Manager whose availability reads `active` **or** `unknown` | Drain this node now? | **yes** | Yes. `unknown` means the node inspect failed, so treat it as undrained. If you already drained this prompt does not fire at all |
+| `drain-self` | Manager whose availability reads `active` **or** `unknown` | Drain this node now? | **yes** | Yes when other eligible nodes can host the tasks. No for an authorized single-node/no-drain outage (section 3). `unknown` means inspect failed: establish the topology and availability first. An already drained or paused manager skips this gate |
 | `proceed-with-tasks` | Tasks could not be counted after the drain | Continue with upgrade anyway? | no | **No.** Check `docker node ps` from another manager first. "Could not count" is not "none" |
 | `proceed-with-tasks` | Tasks are still on the node after the drain | Continue with upgrade anyway? | no | **No.** Wait for them to migrate, confirm empty from a manager, then re-run |
 | `assume-drained` | Worker | Has this node been drained from a manager? | no | Yes **only if you drained it and saw the task list empty**. An attestation, not an instruction — answering yes drains nothing |
@@ -633,6 +677,7 @@ gives `investigate`.
 | `node_availability_before` | `active` \| `drain` \| `pause` \| `unknown` |
 | `node_availability_after` | same, or `unknown` if the run never reached reactivation |
 | `drain_performed` | `true` \| `false` — whether **this run** drained the node |
+| `workload_state` | `converged` \| `timeout` \| `unknown` \| `not-checked` — cluster-wide Swarm replica counts, not application health; see section 3 |
 | `drain_attested_by` | `flag` \| `prompt` \| `not-required` — how the drain fact reached this run |
 | `gates_required` | comma-separated names this run certainly reaches, or `unknown` |
 | `gates_conditional` | comma-separated names it may reach, or `unknown` |

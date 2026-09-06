@@ -1,6 +1,7 @@
 #!/bin/bash
 # shellcheck disable=SC2016,SC1091  # single-quoted VM commands must expand INSIDE the VM
 # tests/vm/build-bundle.sh
+VERSION="1.0.0"
 # Run the REAL download-docker-packages.sh inside the VM and record the
 # resulting artifact's checksum.
 #
@@ -19,11 +20,13 @@ source ./lib.sh
 require_vm
 REPO_DIR="$(cd ../.. && pwd)"
 
-echo "=== Refreshing scripts in the VM from the repo ==="
+echo "=== Bundle builder $VERSION: refreshing scripts and documentation ==="
 # Content-verified, because the bundle this builds is what every later tier and
 # every production node runs. See vm_cp_verified in lib.sh.
 vm "rm -rf /root/scripts"
 vm_cp_verified /root/scripts "$REPO_DIR"/*.sh
+vm_cp_verified /root/scripts "$REPO_DIR/README.md" "$REPO_DIR/RUNBOOK.md"
+vm_cp_verified /root/scripts/docs "$REPO_DIR/docs/AGENT-RUNBOOK.md"
 vm "chmod +x /root/scripts/*.sh"
 
 echo ""

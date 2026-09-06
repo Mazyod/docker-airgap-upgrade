@@ -1,6 +1,7 @@
 #!/bin/bash
 # shellcheck disable=SC2016,SC1091  # single-quoted VM commands must expand INSIDE the VM
 # tools/make-release.sh
+VERSION="1.0.0"
 # Cut a GitHub release: one tag, one artifact, one enumeration of exactly what
 # ships. This is the standing practice -- see docs/RELEASING.md.
 #
@@ -60,7 +61,7 @@ OUT_BUNDLE="$OUT_DIR/docker-upgrade-bundle-${TAG}.tar.gz"
 NOTES="$OUT_DIR/release-notes-${TAG}.md"
 
 #############################################
-step "Preflight"
+step "Release builder $VERSION: preflight"
 #############################################
 command -v gh >/dev/null 2>&1 || die "gh CLI not installed (macOS: brew install gh; Linux: see cli.github.com)"
 gh auth status >/dev/null 2>&1 || die "gh is not authenticated (gh auth login)"
@@ -130,6 +131,8 @@ else
     vm "rm -rf /root/scripts" || die "failed to clear /root/scripts in the VM"
     vm_cp_verified /root/scripts "$REPO_DIR"/*.sh "$REPO_DIR"/*.md \
         || die "failed to stage scripts into the VM"
+    vm_cp_verified /root/scripts/docs "$REPO_DIR/docs/AGENT-RUNBOOK.md" \
+        || die "failed to stage the agent runbook into the VM"
     vm "chmod +x /root/scripts/*.sh" || die "failed to make the staged scripts executable"
     vm 'cd /root/scripts && ./download-docker-packages.sh' >/dev/null 2>&1 \
         || die "download-docker-packages.sh failed in the VM"
@@ -208,6 +211,10 @@ BUILD_HOST=$(vm 'cat /etc/os-release | sed -n "s/^PRETTY_NAME=\"\(.*\)\"/\1/p"' 
     if [ -f docs/TEST-PLAN.md ]; then
         echo "## Testing"
         echo ""
+        if grep -q '^## Focused hardening checks' docs/TEST-PLAN.md; then
+            sed -n '/^## Focused hardening checks/,/^## Execution status/p' docs/TEST-PLAN.md \
+                | sed '$d' | sed 's/^## /### /'
+        fi
         sed -n '/^## Execution status/,/^## What each tier/p' docs/TEST-PLAN.md \
             | sed '$d' | sed '1s/^## Execution status/### Execution status/'
     fi

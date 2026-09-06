@@ -1,7 +1,7 @@
 #!/bin/bash
 # download-docker-packages.sh
 # Run on the ONLINE RHEL 8 server to collect all packages needed for air-gapped upgrade
-VERSION="2.3.1"
+VERSION="2.3.2"
 #
 # This script downloads:
 # - Docker 29.8.0 packages for RHEL 8 and RHEL 9
@@ -15,6 +15,16 @@ set -e
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 DEST_BASE="/opt/docker-offline"
+# A failed rebuild must not leave an older artifact looking ready to transfer.
+rm -f /opt/docker-upgrade-bundle.tar.gz
+# Check the checkout before downloading or replacing the extracted bundle.
+for required in upgrade-docker.sh rollback-docker.sh recover-dnf.sh clean-swarm-networks.sh \
+    README.md RUNBOOK.md docs/AGENT-RUNBOOK.md; do
+    if [ ! -r "$SCRIPT_DIR/$required" ]; then
+        echo "ERROR: required file $required missing or unreadable in $SCRIPT_DIR; bundle not created." >&2
+        exit 1
+    fi
+done
 rm -rf "$DEST_BASE"
 mkdir -p "$DEST_BASE"/{rhel8,rhel9,nvidia,rollback-rhel8,rollback-rhel9}
 
@@ -243,8 +253,7 @@ fi
 
 # Operator documentation travels WITH the bundle. On an air-gapped server the
 # tarball is all there is -- there is no repo to read the runbook from, and no
-# internet to fetch it. Missing docs warn rather than abort: they do not affect
-# whether the upgrade works.
+# internet to fetch it. Missing instructions make this an incomplete bundle.
 echo ""
 echo "=== Including operator documentation ==="
 for doc in RUNBOOK.md README.md docs/AGENT-RUNBOOK.md; do
@@ -252,7 +261,8 @@ for doc in RUNBOOK.md README.md docs/AGENT-RUNBOOK.md; do
         cp "$SCRIPT_DIR/$doc" "$DEST_BASE/"
         echo "  ✓ $doc"
     else
-        echo "  WARNING: $doc not found in $SCRIPT_DIR" >&2
+        echo "  ERROR: $doc not found in $SCRIPT_DIR; bundle not created." >&2
+        exit 1
     fi
 done
 
@@ -280,6 +290,7 @@ echo "  - rollback-docker.sh"
 echo "  - recover-dnf.sh"
 echo "  - clean-swarm-networks.sh"
 echo "  - MANIFEST.txt (every package by NAME and VERSION-RELEASE)"
+echo "  - README.md, RUNBOOK.md, AGENT-RUNBOOK.md"
 echo ""
 echo "On air-gapped server:"
 echo "  tar xzf docker-upgrade-bundle.tar.gz -C /opt"

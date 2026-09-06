@@ -234,3 +234,19 @@ If a future upgrade crosses a containerd **major** boundary again, the removed
 machinery (config migration, XFS ftype check, orphaned-network cleanup) is in git
 history at `upgrade-docker.sh` v1.2.3, commit `974683a` — and the negative control
 here shows exactly why phase 6 must not regenerate the config.
+
+## Focused Swarm recovery checks
+
+`bash tests/vm/recovery-check.sh` uses the existing S1 guest and bundle. It runs a
+real no-drain upgrade, a drain/reactivate rerun, and a rerun with an unschedulable
+service. A local Alpine image supplies the service fixture; deterministic delayed replica
+observations are covered by the isolated recovery checks.
+The cases assert `workload_state`, package versions, runtime health, replicas and
+persistent canary data. The script requires an initially non-Swarm guest, creates
+and removes its own single-node Swarm, and leaves packages at the target.
+
+`bash tests/vm/recovery-check.sh --mutant-no-wait` deliberately removes the wait
+from the staged script. It must exit nonzero with the `workload_state` assertion
+failing; this is the negative control, not a passing recovery run. Both variants
+stage the current upgrade script separately without replacing the bundle's script.
+These cases do not cover workers, multi-node scheduling, GPU workloads or real RHEL.

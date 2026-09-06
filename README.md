@@ -56,8 +56,8 @@ Extract into an empty directory. Leftovers from a previous bundle are refused as
 
 | Script | Version | Purpose |
 |---|---|---|
-| `download-docker-packages.sh` | 2.3.1 | Build the bundle on an online RHEL server |
-| `upgrade-docker.sh` | 2.5.0 | Upgrade a node |
+| `download-docker-packages.sh` | 2.3.2 | Build the bundle on an online RHEL server |
+| `upgrade-docker.sh` | 2.6.0 | Upgrade a node |
 | `rollback-docker.sh` | 2.3.0 | Return a node to 29.1.5 / 2.2.1 |
 | `clean-swarm-networks.sh` | 1.3.0 | Reset orphaned overlay network state |
 | `recover-dnf.sh` | 1.3.0 | Print dnf dependency recovery steps |
@@ -115,9 +115,15 @@ Tier 2 runs the real scripts on a Rocky Linux 9 guest with systemd, rpm and Dock
 containerd's root on a separate XFS filesystem holding real images and volumes. It needs
 macOS with OrbStack or Linux with a local rootful x86_64 Docker daemon.
 
+Full-suite figures below are from the previous campaign; the focused hardening
+checks and their scope are recorded in [docs/TEST-PLAN.md](docs/TEST-PLAN.md).
+
 | Suite | Result |
 |---|---|
-| `tests/static-checks.sh` | 231/231 offline, 247/247 online |
+| `tests/static-checks.sh` | 232/232 offline; previous campaign: 247/247 online |
+| `tests/recovery-checks.sh` | 22/22 isolated fixtures |
+| `tests/recovery-negative-control.sh` | 10/10 mutants rejected |
+| `tests/vm/recovery-check.sh` | 42/42 on a single-node Rocky 9 guest |
 | `tests/vm/tier2-run.sh` | 67/67 |
 | `tests/vm/tier2-run.sh agent` | 697 passed, 2 skipped |
 | `tests/vm/config-version-check.sh` | 30/30 |

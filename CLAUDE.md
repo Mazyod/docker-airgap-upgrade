@@ -349,6 +349,16 @@ one list that silently omitted them would be worse than advertising none.
 post-enumeration confirmation with nothing having seen the inventory — the exact bypass the
 enumerate-after-the-stop ordering exists to prevent.
 
+### Workload recovery is separate from package completion
+
+`workload_state` records cluster-wide Swarm replica convergence: `not-checked` until
+an observation runs, `converged` for matching counts, `timeout` for a last observed
+mismatch at the deadline, and `unknown` for an unavailable/malformed observation or
+unknown final manager availability. It does not assert application health.
+Phase 10 polls once for managers ending active, including `--no-drain-self`, and
+preserves intentional drain/pause. Queries and polling share a 60-second deadline.
+This advisory outcome does not change `result=completed` or the existing exit codes.
+
 ### The exit-code taxonomy
 
 Nothing here may change without a deliberate decision: an agent branches on these, and so do
@@ -491,9 +501,9 @@ Every script except `simulate-upgrade.sh` declares `VERSION="x.y.z"` on ~line 4 
 
 | Script | Version |
 |---|---|
-| `upgrade-docker.sh` | 2.5.0 |
+| `upgrade-docker.sh` | 2.6.0 |
 | `rollback-docker.sh` | 2.3.0 |
-| `download-docker-packages.sh` | 2.3.1 |
+| `download-docker-packages.sh` | 2.3.2 |
 | `clean-swarm-networks.sh` | 1.3.0 |
 | `recover-dnf.sh` | 1.3.0 |
 

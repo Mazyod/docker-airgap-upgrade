@@ -3,6 +3,35 @@
 **Date:** 2026-07-28
 **Scope:** the six scripts retargeted in `a65edd7`, `7df0355`, `a095c40` and later
 
+## Focused hardening checks (2026-09-06)
+
+The following checks cover upgrade script 2.6.0 and downloader 2.3.2; the full
+campaign below remains the historical result for the previous scripts.
+
+- `tests/static-checks.sh`: 232 passed offline; online URL checks were not rerun
+  because package targets did not change.
+- `tests/recovery-checks.sh`: 22 checks execute extracted production recovery,
+  downloader startup/copy, and harness staging sections against isolated fixtures.
+  Included in static check 1.15. No real host service or package operation runs.
+- `tests/recovery-negative-control.sh`: 10 deliberate regressions each produce a
+  nonzero test exit, including skipped convergence, false outcomes, lost availability
+  preservation, missing documentation, incomplete staging, and stale artifacts.
+- `tests/vm/recovery-check.sh`: dedicated real single-node coverage for no-drain,
+  drain/reactivate, and an unschedulable-service timeout. Checks the complete status
+  record, target packages, active services, replica counts and persistent canary data.
+  **42 passed, 0 failed** on the existing Rocky 9 Docker-backend guest, using the
+  existing bundle RPMs and the current script staged separately. This is focused
+  orchestration coverage, not a fresh full campaign against a newly built artifact.
+  The `--mutant-no-wait` variant deliberately removes the active-manager wait:
+  **correctly rejected with exit 1**, reporting `workload_state=not-checked` instead
+  of `converged` (12 passing assertions, 2 expected failures).
+
+The canonical `tests/vm/build-bundle.sh` also completed successfully after these
+changes. All three archived operator documents matched the staged sources by
+SHA-256. Artifact SHA-256:
+`1b036cbf5a6736df3f683c55dc7bb491f660df2d085125076ab7c38f52765cca`.
+This build was not published or used for the historical full campaign below.
+
 ## Execution status (2026-09-04, retarget to 29.8.0 / containerd.io 2.3.4-2)
 
 | Tier | Status | Evidence |
@@ -13,7 +42,7 @@
 | Tier 2 config-version boundary | **PASSED 30/30** | `tests/vm/config-version-check.sh` — cases 2.23–2.28 |
 | Tier 2 negative control | **PASSED 3/3** | `tests/vm/negative-control.sh` — mutant loses the relocated root |
 | Tier 2 agent negative control | **PASSED 24, 0 failed, 8 mutants** | `tests/vm/agent-mode-negative-control.sh` — M1a, M1b, M2, M3, M4a, M4b, M5 and M6 each reproduce the hazard their paired case exists to catch |
-| Tier 1b stubbed | not built | optional; Tier 2 covers most of its intent |
+| Tier 1b stubbed | partial, see focused checks above | Recovery and required-document fixtures exist; the remaining full-script stub scenarios are not built |
 | Tier 3 Swarm | **NOT RUN** | needs a real multi-node cluster |
 
 Every Tier 2 figure above was produced in one campaign against a bundle rebuilt from
@@ -212,8 +241,9 @@ does not prove.
   in a live cluster — and everything Tier 2 structurally cannot reach: real RHEL,
   GPU nodes, and bare metal.
 
-Tier 1 executes no upgrade logic. Tier 1b executes the orchestration but not the
-system calls underneath it. **Neither authorizes a rollout; Tier 2 on the matching
+Tier 1 includes extracted recovery/packaging sections with stub commands. It performs
+no real upgrade transaction or host service change. Full Tier 1b orchestration would
+execute the scripts with their system calls stubbed. **Neither authorizes a rollout; Tier 2 on the matching
 RHEL major is the minimum, and Tier 3 gates the node-by-node claim.**
 
 **The Tier 3 boundary, stated once so the three documents agree.** Untested
@@ -278,11 +308,11 @@ cheap, and none of it requires RHEL.
 | 1b.11 | `ctr version` never responds, restart doesn't help | **Fails before docker starts** (regression test for the false-ready bug) |
 | 1b.12 | Snapshotter unusable after restart | **Fails before docker starts** |
 | 1b.13 | Exit-trap states: fail before stop / during rpm / after rpm / after services up | Correct `PKG_STATE` and correct advice each time |
-| 1b.14 | `wait_for_services` fed `0/1`, then `1/1`; `docker service ls` failing; zero-replica services | Waits, converges, does not treat command failure as convergence |
+| 1b.14 | Active/no-drain and reactivated managers: delayed/missing/malformed replica observations; drain/pause/unknown availability | Implemented as extracted fixtures in `tests/recovery-checks.sh`: bounded advisory recovery, truthful state, preserved availability |
 | 1b.15 | Relocated root missing | **Hard abort**, no `mkdir` on `/` |
 | 1b.16 | Cleanup: inventory vs deletions, abort path, zero items, enumeration failure, partial deletion → exit 2, recovery failure | Each behaves as specified |
 | 1b.17 | Rollback: backup branches (match / differ / none / neither), multiple backups | Correct branch; all backups listed |
-| 1b.18 | Downloader: 404, missing script, corrupt RPM, empty dir | Each aborts, no bundle produced |
+| 1b.18 | Downloader: 404, missing script/document, corrupt RPM, empty dir | Required script/document startup checks, stale-artifact removal, document copy refusal and harness staging are covered by `tests/recovery-checks.sh`; other stub scenarios remain planned |
 
 ---
 

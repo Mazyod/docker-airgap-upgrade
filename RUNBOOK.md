@@ -178,23 +178,43 @@ docker run --rm --network test-net <local-image> nslookup <internal-name>
 docker network rm test-net
 ```
 
-From a manager:
-
-```bash
-docker node ls                          # node Ready and Active
-docker node ps <node-hostname>          # tasks scheduling again
-docker service ls                       # all replicas converged
-```
-
 Phase 9 asserts all five installed versions itself and exits non-zero if any do not
-match, so "UPGRADE COMPLETE" already means the versions were checked. The commands
-above confirm the parts it cannot assert: the config, the containers and the cluster.
-
-### 3.6 Reactivate (workers — from a MANAGER)
+match. "UPGRADE COMPLETE" means package versions were verified; workload recovery
+is reported separately. Confirm runtime health before restoring scheduling:
 
 ```bash
-docker node update --availability active <node-hostname>
+systemctl is-active containerd docker
 ```
+
+### 3.6 Restore availability, then verify workloads
+
+From a manager, restore the availability recorded before maintenance if it changed.
+Workers need this done from a manager. Preserve an intentional `pause` or `drain`;
+do not assume every node should become active.
+
+```bash
+docker node inspect <node-hostname> --format '{{.Spec.Availability}}'
+docker node update --availability <recorded-availability> <node-hostname>  # only if different
+docker node ls
+docker node ps <node-hostname>
+docker service ls
+```
+
+An active single-node Swarm has nowhere to migrate tasks. For an authorized workload
+and control-plane outage, use `--no-drain-self`. The script waits up to 60 seconds for
+cluster-wide replica counts on active managers, both after reactivation and without
+draining. Workers and managers left drained/paused need recovery checked from a manager.
+
+`0/1` replicas and `Starting` tasks immediately after restart can be transient. Poll
+`docker service ls` every 5 seconds within a bounded window (60 seconds initially,
+or a longer window agreed before maintenance), comparing with pre-upgrade counts.
+On timeout, inspect `docker service ps --no-trunc <service-name>` and
+`journalctl -u docker --since '-5 minutes'` on the affected node. Report stalled or
+repeatedly failing tasks; do not automatically roll back or clean networks.
+
+`workload_state` in the upgrade status record distinguishes `converged`, `timeout`,
+`unknown` and `not-checked`. Replica convergence does not prove application health:
+check application access and expected persistent data before continuing.
 
 ### 3.7 Soak
 

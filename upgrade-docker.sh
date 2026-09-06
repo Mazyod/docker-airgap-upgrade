@@ -1,7 +1,7 @@
 #!/bin/bash
 # upgrade-docker.sh
 # Run on each AIR-GAPPED server to upgrade Docker 29.1.5 → 29.8.0
-VERSION="2.5.0"
+VERSION="2.6.0"
 #
 # Prerequisites:
 # - Extract docker-upgrade-bundle.tar.gz to /opt/
@@ -568,6 +568,7 @@ status_keys() {
     status_kv node_availability_before "${NODE_AVAILABILITY:-unknown}"
     status_kv node_availability_after "$NODE_AVAILABILITY_AFTER"
     status_kv drain_performed "$DRAIN_PERFORMED"
+    status_kv workload_state "$WORKLOAD_STATE"
     status_kv tasks_remaining "${TASKS:-n/a}"
     status_kv containerd_config "${CONTAINERD_CONF:-/etc/containerd/config.toml}"
     status_kv containerd_config_version "${CONFIG_VERSION:-unknown}"
@@ -891,6 +892,7 @@ EXIT_CODE="unknown"
 SWARM_ROLE_TOKEN="unknown"
 NODE_AVAILABILITY_AFTER="unknown"
 DRAIN_PERFORMED=false
+WORKLOAD_STATE="not-checked"
 NVIDIA_RESULT="not-attempted"
 PREFLIGHT_NOTHING_TO_DO=false
 # How the drain fact reached this run. An audit afterwards can then tell a
@@ -1317,60 +1319,53 @@ verify_unit_stopped() {
 # future containerd major upgrade needs it again.
 
 wait_for_services() {
-    local max_wait=60
-    local waited=0
+    local deadline=$((SECONDS + 60)) remaining budget replicas pending
 
-    echo "Waiting for Swarm services to stabilize..."
-    while [ $waited -lt $max_wait ]; do
-        local pending
-        # `docker service ls` renders .Replicas as running/desired, so a service
-        # that has not converged looks like 0/1 or 1/3. The previous
-        # `grep -v "0/0" | grep -c "/0"` counted services whose DESIRED count
-        # was zero, which is not the question being asked and matched nothing in
-        # practice; a second bug (`|| echo "0"` appending a duplicate zero when
-        # grep found no match) masked it by forcing the full 60s wait.
-        #
-        # Count rows where running != desired -- the actual definition of
-        # "not yet converged".
-        #
-        # `docker service ls` is run on its own first: piping it straight into
-        # awk without pipefail means a FAILED docker command feeds awk nothing,
-        # awk prints 0, and "no services" becomes indistinguishable from "all
-        # converged". Keep waiting instead of declaring victory blindly.
-        local replicas
-        if ! replicas=$(docker service ls --format '{{.Replicas}}' 2>/dev/null); then
-            echo "  Waiting: 'docker service ls' not answering yet... ($waited/$max_wait seconds)"
-            sleep 5
-            waited=$((waited + 5))
-            continue
+    echo "Waiting up to 60 seconds for Swarm replica counts to converge..."
+    WORKLOAD_STATE="unknown"
+    while [ "$SECONDS" -lt "$deadline" ]; do
+        remaining=$((deadline - SECONDS))
+        # Recheck after scheduling delays: timeout 0 would disable its deadline.
+        if [ "$remaining" -le 0 ]; then break; fi
+        budget=5
+        if [ "$remaining" -lt "$budget" ]; then budget=$remaining; fi
+        # Bound the query too: a hung manager must not turn this advisory wait
+        # into an indefinite outage. Query failure is unknown, never zero tasks.
+        if replicas=$(timeout "$budget" docker service ls --format '{{.Replicas}}' 2>/dev/null); then
+            # Validate every row before claiming convergence. Empty output means
+            # no services; malformed output cannot prove healthy workloads.
+            pending=$(printf '%s\n' "$replicas" | awk '
+                NF == 0 { next }
+                $1 !~ /^[0-9]+\/[0-9]+$/ { invalid=1; next }
+                { split($1, r, "/"); if (r[1] != r[2]) n++ }
+                END { if (invalid) print "unknown"; else print n+0 }')
+            if [ "$pending" = "0" ]; then
+                WORKLOAD_STATE="converged"
+                echo "Swarm replica counts converged; application checks are still required."
+                return 0
+            elif [ "$pending" = "unknown" ]; then
+                WORKLOAD_STATE="unknown"
+                echo "  Waiting: unrecognized Swarm replica counts."
+            else
+                WORKLOAD_STATE="timeout"
+                echo "  Waiting: $pending service(s) have differing running/desired counts."
+            fi
+        else
+            WORKLOAD_STATE="unknown"
+            echo "  Waiting: 'docker service ls' not answering yet."
         fi
 
-        # Split the FIRST whitespace-delimited token, then on "/". A replicated
-        # job renders as "0/1 (0/3 completed)", which splitting the whole line
-        # on "/" turns into three fields -- so an NF==2 guard silently dropped
-        # unconverged jobs from the count. Taking $1 first handles both forms.
-        # A garbage row yields an empty second field and is skipped.
-        pending=$(printf '%s' "$replicas" |
-            awk '{ split($1, r, "/"); if (r[1] != "" && r[2] != "" && r[1] != r[2]) n++ } END { print n+0 }')
-        pending=${pending:-0}
-
-        if [ "$pending" = "0" ]; then
-            echo "All services are running."
-            return 0
-        fi
-
-        echo "  Waiting for services... ($waited/$max_wait seconds)"
-        sleep 5
-        waited=$((waited + 5))
+        remaining=$((deadline - SECONDS))
+        if [ "$remaining" -le 0 ]; then break; fi
+        budget=5
+        if [ "$remaining" -lt "$budget" ]; then budget=$remaining; fi
+        sleep "$budget"
     done
 
-    echo -e "${YELLOW}WARNING: Some services may still be starting.${NC}"
-    # `|| true`: this is the timeout path of a NON-fatal wait, reached at phase
-    # 10 when packages are installed, versions asserted, services up and the
-    # node reactivated. A failing `docker service ls` here would trip set -e and
-    # make the trap announce "UPGRADE FAILED during: phase 10" over a completely
-    # successful upgrade.
-    docker service ls || true
+    echo -e "${YELLOW}WARNING: Workload recovery is $WORKLOAD_STATE; packages were upgraded.${NC}"
+    echo "Inspect from a manager: docker service ls; docker service ps --no-trunc <service>"
+    # Advisory: timeout/unknown does not turn a completed package upgrade into
+    # a failed transaction. The run record carries the separate workload state.
     return 0
 }
 
@@ -1886,7 +1881,7 @@ if [ "$SWARM_STATE" = "active" ]; then
                         exit 1
                     fi
                 else
-                    echo "All tasks migrated successfully."
+                    echo "No tasks remain assigned here with desired state running."
                 fi
             else
                 echo -e "${YELLOW}Proceeding without draining. Services may be disrupted.${NC}"
@@ -2510,6 +2505,10 @@ CURRENT_PHASE="phase 10 (swarm reactivation)"
     if [ "$IS_MANAGER" = true ]; then
         # Manager can reactivate itself
         CURRENT_AVAILABILITY=$(docker node inspect "$SWARM_NODE_ID" --format '{{.Spec.Availability}}' 2>/dev/null || echo "unknown")
+        case "$CURRENT_AVAILABILITY" in
+            active|drain|pause) ;;
+            *) CURRENT_AVAILABILITY="unknown" ;;
+        esac
         # Recorded as soon as it is known, then overwritten if the node is
         # actually reactivated below. Assigning it only after the prompt means
         # an EOF there reports "unknown" for a value just observed.
@@ -2522,9 +2521,6 @@ CURRENT_PHASE="phase 10 (swarm reactivation)"
                 echo "Activating node..."
                 docker node update --availability active "$SWARM_NODE_ID"
                 NODE_AVAILABILITY_AFTER="active"
-
-                echo ""
-                wait_for_services
 
                 echo ""
                 echo "Node status:"
@@ -2540,8 +2536,19 @@ CURRENT_PHASE="phase 10 (swarm reactivation)"
                 echo "  docker node update --availability active $SWARM_NODE_ID"
             fi
         else
-            echo "Node is already active."
+            echo "Node availability: $CURRENT_AVAILABILITY"
         fi
+
+        # Both reactivated and no-drain managers reach this check. Leave an
+        # intentional drain/pause alone; unknown availability proves nothing.
+        case "$NODE_AVAILABILITY_AFTER" in
+            active) wait_for_services ;;
+            drain|pause) echo "Workload recovery not checked while node remains $NODE_AVAILABILITY_AFTER." ;;
+            *)
+                WORKLOAD_STATE="unknown"
+                echo -e "${YELLOW}WARNING: Node availability is unknown; inspect from a manager.${NC}"
+                ;;
+        esac
     else
         # Worker cannot reactivate itself
         echo ""
@@ -2562,6 +2569,7 @@ echo ""
 echo -e "${GREEN}==========================================${NC}"
 OPERATION_COMPLETED=true
 echo -e "${GREEN}UPGRADE COMPLETE${NC}"
+echo "Package versions verified. Workload recovery: $WORKLOAD_STATE"
 echo -e "${GREEN}==========================================${NC}"
 echo ""
 echo "Versions installed:"
